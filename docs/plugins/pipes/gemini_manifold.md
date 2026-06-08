@@ -17,6 +17,7 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 -   [x] Reasoning toggle (Reason filter function required, see [it's doc](../filters/gemini_reasoning_toggle.md))
 -   [x] Native image generation and editing (image output)
 -   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see [it's doc](../filters/gemini_manifold_companion.md))
+-   [x] Automatic PDF limit mitigation: oversized PDFs are optimized and split to fit Gemini's 50 MiB / 1000 page per-document limits.
 -   [x] Image input
 -   [x] YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
 -   [x] Video input support (other than YouTube URLs)
@@ -44,6 +45,16 @@ To install this plugin, navigate to the [Open WebUI Community page for Gemini Ma
 ## Configuration
 
 After installation, click the gear icon next to the `gemini_manifold_google_genai` function within Open WebUI. At a minimum, you must enter your Google Gemini API key. Other configurable options are also available on that settings page.
+
+### PDF limit mitigation
+
+Gemini accepts each PDF as a single document up to 50 MiB or 1000 pages. This limit applies to both inline file data and Google Files API uploads.
+
+When `PDF_LIMIT_MITIGATION` is enabled, the pipe checks every attached PDF before it is sent to Gemini. PDFs already within the limits are sent unchanged. PDFs over either limit are saved with compressed streams/object streams and page thumbnail entries removed. If the optimized PDF is still too large, or still above 1000 pages, it is split into ordered PDF attachments that each stay under the configured safety target and page limit.
+
+If splitting is needed, the request includes a short text note telling Gemini to treat the ordered PDF parts as one original document. If one individual page remains larger than Gemini's 50 MiB document limit after optimization, the pipe reports an error because sending that page would require lossy page/image downsampling.
+
+This feature requires the `pikepdf` package, which is included in this plugin's requirements.
 
 ## Usage
 
