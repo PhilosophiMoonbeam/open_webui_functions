@@ -40,6 +40,7 @@ from plugins.pipes.gemini_manifold import (
     GeminiContentBuilder,
     GeminiPDFProcessor,
     PDFProcessingError,
+    ContentBuildError,
     types as gemini_types,
 )  # gemini_types is google.genai.types
 from plugins.filters.gemini_manifold_companion import EventEmitter
@@ -1126,6 +1127,36 @@ def test_pdf_processor_splits_real_pdf_by_page_limit():
         for chunk in chunks
     ]
     assert page_counts == [2, 2, 1]
+
+
+@pytest.mark.asyncio
+async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
+    """
+    Tests that concurrent content-building failures are surfaced to the pipe
+    instead of being silently dropped.
+    """
+    pipe_instance, _ = pipe_instance_fixture
+    mock_event_emitter = MagicMock(spec=EventEmitter)
+    mock_files_api_manager = AsyncMock()
+    mock_files_api_manager.client.vertexai = False
+
+    builder = GeminiContentBuilder(
+        messages_body=[{"role": "user", "content": "hello"}],  # type: ignore
+        metadata_body={"chat_id": "local", "features": {"upload_documents": True}},  # type: ignore
+        user_data={"id": "test_user_id", "email": "test@example.com"},  # type: ignore
+        event_emitter=mock_event_emitter,
+        valves=pipe_instance.valves,
+        files_api_manager=mock_files_api_manager,
+    )
+
+    with patch.object(
+        builder,
+        "_process_message_turn",
+        new_callable=AsyncMock,
+        side_effect=PDFProcessingError("failed to process PDF"),
+    ):
+        with pytest.raises(ContentBuildError, match="failed to process PDF"):
+            await builder.build_contents()
 
 
 # endregion Test GeminiContentBuilder

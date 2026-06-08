@@ -150,6 +150,12 @@ class PDFProcessingError(Exception):
     pass
 
 
+class ContentBuildError(Exception):
+    """Raised when request content cannot be prepared for Gemini."""
+
+    pass
+
+
 class GeminiPDFProcessor:
     """
     Prepares PDFs for Gemini's per-document limits.
@@ -799,14 +805,18 @@ class GeminiContentBuilder:
 
         # 5. Filter and assemble the final contents list.
         contents: list[types.Content] = []
+        content_errors: list[Exception] = []
         for i, res in enumerate(results):
             if isinstance(res, types.Content):
                 contents.append(res)
             elif isinstance(res, Exception):
+                content_errors.append(res)
                 log.error(
                     f"An error occurred while processing message {i} concurrently.",
                     payload=res,
                 )
+        if content_errors:
+            raise ContentBuildError(str(content_errors[0])) from content_errors[0]
         return contents
 
     def _retrieve_previous_usage_data(self) -> tuple[int | None, float | None]:
@@ -1339,7 +1349,7 @@ class GeminiContentBuilder:
             error_msg = f"PDF processing failed for URI '{uri[:64]}...': {e}"
             log.error(error_msg)
             self.event_emitter.emit_toast(error_msg, "error")
-            return []
+            raise ContentBuildError(error_msg) from e
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
             return []
@@ -2315,10 +2325,21 @@ class Pipe:
                     continue 
 
                 # If we can't retry, re-raise the error to stop execution
-                log.error(f"Error during request execution (Tier: {tier}): {e}")
-                raise e
+                error_msg = (
+                    f"Gemini request failed before a model response could be "
+                    f"generated: {e}"
+                )
+                log.exception(f"Error during request execution (Tier: {tier}): {e}")
+                event_emitter.emit_status("Request failed", done=True)
+                event_emitter.emit_toast(error_msg, "error")
+                if body.get("stream", False):
+                    return self._error_completion_stream(error_msg)
+                return self._error_completion_response(error_msg)
 
-        raise ValueError("Exhausted execution options without result.")
+        error_msg = "Exhausted execution options without result."
+        if body.get("stream", False):
+            return self._error_completion_stream(error_msg)
+        return self._error_completion_response(error_msg)
 
     # region 2. Helper methods inside the Pipe class
 
@@ -2693,6 +2714,27 @@ class Pipe:
             "name": "[gemini_manifold] " + error_msg,
             "description": error_msg,
         }
+
+    @staticmethod
+    def _error_completion_response(error_msg: str) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": error_msg,
+                    }
+                }
+            ],
+            "usage": {},
+        }
+
+    @staticmethod
+    async def _error_completion_stream(
+        error_msg: str,
+    ) -> AsyncGenerator[dict | str, None]:
+        yield {"choices": [{"delta": {"content": error_msg}}]}
+        yield "data: [DONE]"
 
     @staticmethod
     def _strip_api_prefix(model_name: str) -> str:
