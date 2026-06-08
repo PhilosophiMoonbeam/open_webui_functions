@@ -54,6 +54,8 @@ When `PDF_LIMIT_MITIGATION` is enabled, the pipe checks every attached PDF befor
 
 If splitting is needed, the request includes a short text note telling Gemini to treat the ordered PDF parts as one original document. If one individual page remains larger than Gemini's 50 MiB document limit after optimization, the pipe reports an error because sending that page would require lossy page/image downsampling.
 
+Processed oversized PDFs are cached in memory for follow-up turns in the same Open WebUI process, so an active conversation does not repeatedly recompress and split the same source PDF. The cache is keyed by the original PDF content hash and expires after several hours to avoid retaining large byte arrays indefinitely.
+
 This feature requires the `pikepdf` package, which is included in this plugin's requirements.
 
 ## Usage
