@@ -130,6 +130,7 @@ ZWS = "\u200b"
 GEMINI_PDF_MAX_BYTES: Final = 50 * 1024 * 1024
 GEMINI_PDF_SAFE_TARGET_BYTES: Final = 48 * 1024 * 1024
 GEMINI_PDF_MAX_PAGES: Final = 1000
+GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS: Final = 6 * 60 * 60
 
 
 class GenaiApiError(Exception):
@@ -740,6 +741,7 @@ class GeminiContentBuilder:
         event_emitter: "EventEmitter",
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
+        pdf_mitigation_cache: SimpleMemoryCache,
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -750,6 +752,7 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
+        self.pdf_mitigation_cache = pdf_mitigation_cache
         # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
@@ -1375,10 +1378,11 @@ class GeminiContentBuilder:
             and self.valves.PDF_LIMIT_MITIGATION
             and not force_raw
         ):
-            processor = GeminiPDFProcessor()
-            processed_pdfs, page_count, was_mitigated = processor.prepare(file_bytes)
+            original_hash = xxhash.xxh64(file_bytes).hexdigest()
+            processed_pdfs, page_count, was_mitigated = (
+                await self._get_or_prepare_pdf_mitigation(file_bytes, original_hash)
+            )
             if was_mitigated:
-                original_hash = xxhash.xxh64(file_bytes).hexdigest()
                 pdf_label = source_name or owui_file_id or "attached PDF"
                 parts: list[types.Part] = []
 
@@ -1437,6 +1441,33 @@ class GeminiContentBuilder:
         base_id = owui_file_id or "anonymous"
         suffix = "optimized" if total == 1 else f"part-{index + 1:04d}-of-{total:04d}"
         return f"{base_id}:pdf:{original_hash}:{suffix}"
+
+    async def _get_or_prepare_pdf_mitigation(
+        self, file_bytes: bytes, original_hash: str
+    ) -> tuple[list[bytes], int, bool]:
+        cache_key = f"pdf_mitigation:{original_hash}"
+        cached_result: tuple[list[bytes], int, bool] | None = (
+            await self.pdf_mitigation_cache.get(cache_key)
+        )
+        if cached_result is not None:
+            log.debug(f"PDF mitigation cache HIT for source hash {original_hash}.")
+            return cached_result
+
+        log.debug(f"PDF mitigation cache MISS for source hash {original_hash}.")
+        processor = GeminiPDFProcessor()
+        result = processor.prepare(file_bytes)
+        processed_pdfs, _page_count, was_mitigated = result
+
+        if was_mitigated:
+            await self.pdf_mitigation_cache.set(
+                cache_key, result, ttl=GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS
+            )
+            log.debug(
+                f"Cached PDF mitigation result for source hash {original_hash} "
+                f"with {len(processed_pdfs)} processed PDF(s)."
+            )
+
+        return result
 
     async def _create_genai_part_from_file_data(
         self,
@@ -2159,6 +2190,7 @@ class Pipe:
         self.valves = self.Valves()
         self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
+        self.pdf_mitigation_cache = SimpleMemoryCache(serializer=NullSerializer())
         log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
@@ -3123,6 +3155,7 @@ class Pipe:
             event_emitter=event_emitter,
             valves=valves,
             files_api_manager=files_api_manager,
+            pdf_mitigation_cache=self.pdf_mitigation_cache,
         )
 
         event_emitter.emit_status("Preparing request...")
