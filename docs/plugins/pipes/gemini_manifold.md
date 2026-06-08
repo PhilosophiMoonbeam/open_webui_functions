@@ -50,11 +50,13 @@ After installation, click the gear icon next to the `gemini_manifold_google_gena
 
 Gemini accepts each PDF as a single document up to 50 MiB or 1000 pages. This limit applies to both inline file data and Google Files API uploads.
 
-When `PDF_LIMIT_MITIGATION` is enabled, the pipe checks every attached PDF before it is sent to Gemini. PDFs already within the limits are sent unchanged. PDFs over either limit are saved with compressed streams/object streams and page thumbnail entries removed. If the optimized PDF is still too large, or still above 1000 pages, it is split into ordered PDF attachments that each stay under the configured safety target and page limit.
+When `PDF_LIMIT_MITIGATION` is enabled, the pipe checks every attached PDF before it is sent to Gemini. This setting is enabled by default. PDFs already within the limits are sent unchanged. PDFs over either limit are saved with compressed streams/object streams and page thumbnail entries removed. If a PDF is already under 50 MiB but over 1000 pages, it is split directly without first rewriting the whole document. If the optimized PDF is still too large, or still above 1000 pages, it is split into ordered PDF attachments that each stay under the configured safety target and page limit.
 
 If splitting is needed, the request includes a short text note telling Gemini to treat the ordered PDF parts as one original document. If one individual page remains larger than Gemini's 50 MiB document limit after optimization, the pipe reports an error because sending that page would require lossy page/image downsampling.
 
-Processed oversized PDFs are cached in memory for follow-up turns in the same Open WebUI process, so an active conversation does not repeatedly recompress and split the same source PDF. The cache is keyed by the original PDF content hash and expires after several hours to avoid retaining large byte arrays indefinitely.
+Processed oversized PDFs are cached for follow-up turns in the same Open WebUI process, so an active conversation does not repeatedly recompress and split the same source PDF. The cache metadata is kept in memory, but optimized/split PDF parts are stored under the system temp directory and reused by path. The cache is keyed by the original PDF content hash and expires after several hours.
+
+PDF processing is serialized with a small internal semaphore to protect low-resource hosts from multiple concurrent compression jobs. When Open WebUI stores an attachment on local disk, the pipe hashes, processes, and uploads by path where possible instead of loading each mitigated PDF part into memory.
 
 This feature requires the `pikepdf` package, which is included in this plugin's requirements.
 

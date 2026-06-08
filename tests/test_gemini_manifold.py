@@ -39,6 +39,9 @@ from plugins.pipes.gemini_manifold import (
     Pipe,
     GeminiContentBuilder,
     GeminiPDFProcessor,
+    PreparedPDFPart,
+    PreparedPDFResult,
+    LocalFileSource,
     PDFProcessingError,
     ContentBuildError,
     types as gemini_types,
@@ -690,6 +693,8 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,  # Pass the new mock
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
     with patch(
@@ -762,6 +767,8 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,  # Pass the new mock
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
     # Mock part objects need 'text' attribute for new checks
@@ -874,6 +881,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     mock_misc_module.pop_system_message.return_value = (None, messages_body)
 
     # Create a mock for the new dependency and its methods
+    pipe_instance.valves.PDF_LIMIT_MITIGATION = False
     mock_files_api_manager = AsyncMock()
     mock_files_api_manager.client.vertexai = False
     mock_gemini_file = MagicMock()
@@ -892,18 +900,24 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
     # REMOVED: No longer need to create a mock Part object for text.
     # mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
 
-    # Patch _get_file_data to be async.
+    # Patch _get_file_source to be async.
     # REMOVED: The patch for `types.Part.from_text` is removed to let the real method run.
     with patch(
-        "plugins.pipes.gemini_manifold.GeminiContentBuilder._get_file_data",
+        "plugins.pipes.gemini_manifold.GeminiContentBuilder._get_file_source",
         new_callable=AsyncMock,
-        return_value=(fake_pdf_bytes, pdf_mime_type),
-    ) as mock_get_file_data:
+        return_value=LocalFileSource(
+            file_bytes=fake_pdf_bytes,
+            file_path=None,
+            mime_type=pdf_mime_type,
+        ),
+    ) as mock_get_file_source:
         # Act
         contents = await builder.build_contents()
 
@@ -911,7 +925,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         mock_chats_module.Chats.get_chat_by_id_and_user_id.assert_called_once_with(
             id="test_chat_id", user_id="test_user_id"
         )
-        mock_get_file_data.assert_awaited_once_with(pdf_file_id)
+        mock_get_file_source.assert_awaited_once_with(pdf_file_id)
 
         mock_files_api_manager.get_or_upload_file.assert_awaited_once_with(
             file_bytes=fake_pdf_bytes,
@@ -945,7 +959,9 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
 
 
 @pytest.mark.asyncio
-async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_fixture):
+async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(
+    pipe_instance_fixture, tmp_path
+):
     """
     Tests that a compressed single-PDF output is uploaded under a synthetic ID,
     avoiding stale original-file ID hash mappings.
@@ -954,6 +970,8 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
     pdf_file_id = "test-pdf-id-002"
     original_pdf_bytes = b"%PDF original oversized"
     optimized_pdf_bytes = b"%PDF optimized"
+    optimized_pdf_path = tmp_path / "optimized.pdf"
+    optimized_pdf_path.write_bytes(optimized_pdf_bytes)
     pdf_mime_type = "application/pdf"
 
     mock_event_emitter = MagicMock(spec=EventEmitter)
@@ -962,7 +980,7 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
     mock_gemini_file = MagicMock()
     mock_gemini_file.uri = "gs://fake-bucket/optimized.pdf"
     mock_gemini_file.mime_type = pdf_mime_type
-    mock_files_api_manager.get_or_upload_file.return_value = mock_gemini_file
+    mock_files_api_manager.get_or_upload_file_from_path.return_value = mock_gemini_file
 
     builder = GeminiContentBuilder(
         messages_body=[],
@@ -972,12 +990,23 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
     with patch.object(
         GeminiPDFProcessor,
-        "prepare",
-        return_value=([optimized_pdf_bytes], 12, True),
+        "prepare_to_directory",
+        return_value=PreparedPDFResult(
+            parts=[
+                PreparedPDFPart(
+                    path=str(optimized_pdf_path),
+                    size=len(optimized_pdf_bytes),
+                )
+            ],
+            page_count=12,
+            was_mitigated=True,
+        ),
     ):
         parts = await builder._create_genai_parts_from_file_data(
             file_bytes=original_pdf_bytes,
@@ -989,9 +1018,9 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
 
     assert len(parts) == 1
     assert parts[0].file_data is not None
-    mock_files_api_manager.get_or_upload_file.assert_awaited_once()
-    upload_kwargs = mock_files_api_manager.get_or_upload_file.await_args.kwargs
-    assert upload_kwargs["file_bytes"] == optimized_pdf_bytes
+    mock_files_api_manager.get_or_upload_file_from_path.assert_awaited_once()
+    upload_kwargs = mock_files_api_manager.get_or_upload_file_from_path.await_args.kwargs
+    assert upload_kwargs["file_path"] == str(optimized_pdf_path)
     assert upload_kwargs["mime_type"] == pdf_mime_type
     assert upload_kwargs["owui_file_id"].startswith(f"{pdf_file_id}:pdf:")
     assert upload_kwargs["owui_file_id"].endswith(":optimized")
@@ -1003,7 +1032,7 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
 
 
 @pytest.mark.asyncio
-async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture):
+async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp_path):
     """
     Tests that split PDFs produce an instruction text part followed by ordered
     file parts uploaded with distinct synthetic IDs.
@@ -1012,6 +1041,11 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture):
     pdf_file_id = "test-pdf-id-003"
     original_pdf_bytes = b"%PDF original huge"
     chunks = [b"%PDF chunk 1", b"%PDF chunk 2", b"%PDF chunk 3"]
+    chunk_paths = []
+    for i, chunk in enumerate(chunks):
+        chunk_path = tmp_path / f"chunk-{i + 1}.pdf"
+        chunk_path.write_bytes(chunk)
+        chunk_paths.append(chunk_path)
     pdf_mime_type = "application/pdf"
 
     mock_event_emitter = MagicMock(spec=EventEmitter)
@@ -1023,7 +1057,7 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture):
         mock_file.uri = f"gs://fake-bucket/chunk-{i + 1}.pdf"
         mock_file.mime_type = pdf_mime_type
         mock_gemini_files.append(mock_file)
-    mock_files_api_manager.get_or_upload_file.side_effect = mock_gemini_files
+    mock_files_api_manager.get_or_upload_file_from_path.side_effect = mock_gemini_files
 
     builder = GeminiContentBuilder(
         messages_body=[],
@@ -1033,9 +1067,22 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture):
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
-    with patch.object(GeminiPDFProcessor, "prepare", return_value=(chunks, 2401, True)):
+    with patch.object(
+        GeminiPDFProcessor,
+        "prepare_to_directory",
+        return_value=PreparedPDFResult(
+            parts=[
+                PreparedPDFPart(path=str(path), size=len(chunk))
+                for path, chunk in zip(chunk_paths, chunks, strict=True)
+            ],
+            page_count=2401,
+            was_mitigated=True,
+        ),
+    ):
         parts = await builder._create_genai_parts_from_file_data(
             file_bytes=original_pdf_bytes,
             mime_type=pdf_mime_type,
@@ -1053,10 +1100,10 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture):
         "gs://fake-bucket/chunk-2.pdf",
         "gs://fake-bucket/chunk-3.pdf",
     ]
-    assert mock_files_api_manager.get_or_upload_file.await_count == 3
+    assert mock_files_api_manager.get_or_upload_file_from_path.await_count == 3
     upload_ids = [
         await_call.kwargs["owui_file_id"]
-        for await_call in mock_files_api_manager.get_or_upload_file.await_args_list
+        for await_call in mock_files_api_manager.get_or_upload_file_from_path.await_args_list
     ]
     assert upload_ids[0].endswith(":part-0001-of-0003")
     assert upload_ids[1].endswith(":part-0002-of-0003")
@@ -1069,7 +1116,9 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture):
 
 
 @pytest.mark.asyncio
-async def test_create_genai_parts_reuses_pdf_mitigation_cache(pipe_instance_fixture):
+async def test_create_genai_parts_reuses_pdf_mitigation_cache(
+    pipe_instance_fixture, tmp_path
+):
     """
     Tests that repeated processing of the same oversized PDF skips expensive
     compression/splitting and reuses the cached mitigation result.
@@ -1078,6 +1127,11 @@ async def test_create_genai_parts_reuses_pdf_mitigation_cache(pipe_instance_fixt
     pdf_file_id = "test-pdf-id-004"
     original_pdf_bytes = b"%PDF original huge repeated"
     chunks = [b"%PDF cached chunk 1", b"%PDF cached chunk 2"]
+    chunk_paths = []
+    for i, chunk in enumerate(chunks):
+        chunk_path = tmp_path / f"cached-chunk-{i + 1}.pdf"
+        chunk_path.write_bytes(chunk)
+        chunk_paths.append(chunk_path)
     pdf_mime_type = "application/pdf"
 
     mock_event_emitter = MagicMock(spec=EventEmitter)
@@ -1090,7 +1144,7 @@ async def test_create_genai_parts_reuses_pdf_mitigation_cache(pipe_instance_fixt
         mock_file.uri = f"gs://fake-bucket/cache-call-{i + 1}.pdf"
         mock_file.mime_type = pdf_mime_type
         uploaded_files.append(mock_file)
-    mock_files_api_manager.get_or_upload_file.side_effect = uploaded_files
+    mock_files_api_manager.get_or_upload_file_from_path.side_effect = uploaded_files
 
     builder = GeminiContentBuilder(
         messages_body=[],
@@ -1100,12 +1154,21 @@ async def test_create_genai_parts_reuses_pdf_mitigation_cache(pipe_instance_fixt
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
     with patch.object(
         GeminiPDFProcessor,
-        "prepare",
-        return_value=(chunks, 1200, True),
+        "prepare_to_directory",
+        return_value=PreparedPDFResult(
+            parts=[
+                PreparedPDFPart(path=str(path), size=len(chunk))
+                for path, chunk in zip(chunk_paths, chunks, strict=True)
+            ],
+            page_count=1200,
+            was_mitigated=True,
+        ),
     ) as mock_prepare:
         first_parts = await builder._create_genai_parts_from_file_data(
             file_bytes=original_pdf_bytes,
@@ -1122,15 +1185,15 @@ async def test_create_genai_parts_reuses_pdf_mitigation_cache(pipe_instance_fixt
             source_name="repeated.pdf",
         )
 
-    mock_prepare.assert_called_once_with(original_pdf_bytes)
+    assert mock_prepare.call_count == 1
     assert len(first_parts) == 3
     assert len(second_parts) == 3
-    assert mock_files_api_manager.get_or_upload_file.await_count == 4
-    uploaded_bytes = [
-        await_call.kwargs["file_bytes"]
-        for await_call in mock_files_api_manager.get_or_upload_file.await_args_list
+    assert mock_files_api_manager.get_or_upload_file_from_path.await_count == 4
+    uploaded_paths = [
+        await_call.kwargs["file_path"]
+        for await_call in mock_files_api_manager.get_or_upload_file_from_path.await_args_list
     ]
-    assert uploaded_bytes == chunks + chunks
+    assert uploaded_paths == [str(path) for path in chunk_paths] * 2
 
 
 def test_pdf_processor_rejects_single_page_over_limit(monkeypatch):
@@ -1171,7 +1234,7 @@ def test_pdf_processor_rejects_single_page_over_limit(monkeypatch):
         processor._split_pdf(MagicMock(), b"%PDF fake")
 
 
-def test_pdf_processor_splits_real_pdf_by_page_limit():
+def test_pdf_processor_splits_real_pdf_by_page_limit(tmp_path):
     """
     Tests page-count mitigation against real PDF bytes.
     """
@@ -1179,22 +1242,27 @@ def test_pdf_processor_splits_real_pdf_by_page_limit():
     source_pdf = pikepdf.Pdf.new()
     for _ in range(5):
         source_pdf.add_blank_page(page_size=(72, 72))
-    buffer = io.BytesIO()
-    source_pdf.save(buffer)
+    source_path = tmp_path / "source.pdf"
+    source_pdf.save(source_path)
 
     processor = GeminiPDFProcessor(
         max_bytes=1024 * 1024,
         target_bytes=1024 * 1024,
         max_pages=2,
     )
-    chunks, page_count, was_mitigated = processor.prepare(buffer.getvalue())
+    with patch.object(
+        processor,
+        "_optimize_pdf_to_path",
+        side_effect=AssertionError("page-count-only split should not optimize first"),
+    ):
+        result = processor.prepare_to_directory(str(source_path), str(tmp_path / "out"))
 
-    assert page_count == 5
-    assert was_mitigated is True
-    assert len(chunks) == 3
+    assert result.page_count == 5
+    assert result.was_mitigated is True
+    assert len(result.parts) == 3
     page_counts = [
-        processor._count_pages(pikepdf, chunk)
-        for chunk in chunks
+        processor._count_pages_from_path(pikepdf, part.path)
+        for part in result.parts
     ]
     assert page_counts == [2, 2, 1]
 
@@ -1218,6 +1286,8 @@ async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
         valves=pipe_instance.valves,
         files_api_manager=mock_files_api_manager,
         pdf_mitigation_cache=pipe_instance.pdf_mitigation_cache,
+        pdf_mitigation_locks=pipe_instance.pdf_mitigation_locks,
+        pdf_processing_semaphore=pipe_instance.pdf_processing_semaphore,
     )
 
     with patch.object(
