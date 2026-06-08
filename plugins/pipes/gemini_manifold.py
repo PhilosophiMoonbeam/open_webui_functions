@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==1.74.0
+requirements: google-genai==1.74.0, pikepdf
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
@@ -127,6 +127,9 @@ SPECIAL_TAGS_TO_DISABLE = [
     "|begin_of_solution|",
 ]
 ZWS = "\u200b"
+GEMINI_PDF_MAX_BYTES: Final = 50 * 1024 * 1024
+GEMINI_PDF_SAFE_TARGET_BYTES: Final = 48 * 1024 * 1024
+GEMINI_PDF_MAX_PAGES: Final = 1000
 
 
 class GenaiApiError(Exception):
@@ -139,6 +142,155 @@ class FilesAPIError(Exception):
     """Custom exception for errors during Files API operations."""
 
     pass
+
+
+class PDFProcessingError(Exception):
+    """Raised when a PDF cannot be prepared within Gemini API limits."""
+
+    pass
+
+
+class GeminiPDFProcessor:
+    """
+    Prepares PDFs for Gemini's per-document limits.
+
+    The processor keeps the PDF as a PDF. It removes page thumbnail entries and
+    saves with compressed streams/object streams, then splits by page range when
+    either the byte or page limit still requires it.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int = GEMINI_PDF_MAX_BYTES,
+        target_bytes: int = GEMINI_PDF_SAFE_TARGET_BYTES,
+        max_pages: int = GEMINI_PDF_MAX_PAGES,
+    ):
+        self.max_bytes = max_bytes
+        self.target_bytes = min(target_bytes, max_bytes)
+        self.max_pages = max_pages
+
+    def prepare(self, file_bytes: bytes) -> tuple[list[bytes], int, bool]:
+        pikepdf = self._get_pikepdf()
+        page_count = self._count_pages(pikepdf, file_bytes)
+
+        if len(file_bytes) <= self.max_bytes and page_count <= self.max_pages:
+            return [file_bytes], page_count, False
+
+        optimized_bytes = self._optimize_pdf(pikepdf, file_bytes)
+        optimized_page_count = self._count_pages(pikepdf, optimized_bytes)
+
+        if (
+            len(optimized_bytes) <= self.max_bytes
+            and optimized_page_count <= self.max_pages
+        ):
+            return [optimized_bytes], optimized_page_count, True
+
+        chunks = self._split_pdf(pikepdf, optimized_bytes)
+        return chunks, optimized_page_count, True
+
+    @staticmethod
+    def _get_pikepdf() -> Any:
+        try:
+            import pikepdf
+        except ImportError as e:
+            raise PDFProcessingError(
+                "PDF mitigation requires the 'pikepdf' package. "
+                "Install the plugin requirements and try again."
+            ) from e
+        return pikepdf
+
+    @staticmethod
+    def _open_pdf(pikepdf: Any, file_bytes: bytes) -> Any:
+        try:
+            return pikepdf.open(io.BytesIO(file_bytes))
+        except Exception as e:
+            raise PDFProcessingError(f"Could not open PDF for processing: {e}") from e
+
+    def _count_pages(self, pikepdf: Any, file_bytes: bytes) -> int:
+        with self._open_pdf(pikepdf, file_bytes) as pdf:
+            return len(pdf.pages)
+
+    def _optimize_pdf(self, pikepdf: Any, file_bytes: bytes) -> bytes:
+        with self._open_pdf(pikepdf, file_bytes) as pdf:
+            self._remove_page_thumbnails(pikepdf, pdf)
+            return self._save_pdf(pikepdf, pdf)
+
+    @staticmethod
+    def _remove_page_thumbnails(pikepdf: Any, pdf: Any) -> int:
+        removed = 0
+        thumb_name = pikepdf.Name("/Thumb")
+        for page in pdf.pages:
+            if thumb_name in page.obj:
+                del page.obj[thumb_name]
+                removed += 1
+        return removed
+
+    @staticmethod
+    def _save_pdf(pikepdf: Any, pdf: Any) -> bytes:
+        buffer = io.BytesIO()
+        save_kwargs = {
+            "compress_streams": True,
+            "object_stream_mode": pikepdf.ObjectStreamMode.generate,
+            "recompress_flate": True,
+        }
+        try:
+            pdf.save(buffer, **save_kwargs)
+        except TypeError:
+            save_kwargs.pop("recompress_flate", None)
+            buffer = io.BytesIO()
+            pdf.save(buffer, **save_kwargs)
+        return buffer.getvalue()
+
+    def _split_pdf(self, pikepdf: Any, file_bytes: bytes) -> list[bytes]:
+        with self._open_pdf(pikepdf, file_bytes) as pdf:
+            total_pages = len(pdf.pages)
+            chunks: list[bytes] = []
+            start = 0
+
+            while start < total_pages:
+                remaining_pages = total_pages - start
+                high = min(self.max_pages, remaining_pages)
+                best_chunk: bytes | None = None
+                best_page_count = 0
+                low = 1
+
+                while low <= high:
+                    page_count = (low + high) // 2
+                    candidate = self._save_page_range(
+                        pikepdf, pdf, start, start + page_count
+                    )
+
+                    if len(candidate) <= self.target_bytes:
+                        best_chunk = candidate
+                        best_page_count = page_count
+                        low = page_count + 1
+                    else:
+                        high = page_count - 1
+
+                if best_chunk is None:
+                    single_page = self._save_page_range(pikepdf, pdf, start, start + 1)
+                    if len(single_page) > self.max_bytes:
+                        raise PDFProcessingError(
+                            "A single PDF page remains larger than Gemini's 50 MB "
+                            "per-document limit after compression. This PDF cannot "
+                            "be sent without lossy page/image downsampling."
+                        )
+                    best_chunk = single_page
+                    best_page_count = 1
+
+                chunks.append(best_chunk)
+                start += best_page_count
+
+        return chunks
+
+    def _save_page_range(
+        self, pikepdf: Any, source_pdf: Any, start: int, stop: int
+    ) -> bytes:
+        chunk_pdf = pikepdf.Pdf.new()
+        chunk_pdf.pages.extend(source_pdf.pages[start:stop])
+        self._remove_page_thumbnails(pikepdf, chunk_pdf)
+        return self._save_pdf(pikepdf, chunk_pdf)
 
 
 class UploadStatusManager:
@@ -874,14 +1026,21 @@ class GeminiContentBuilder:
                     # just the UUID, which isn't fetchable on its own.
                     if file_id := file.get("id"):
                         uri = f"/api/v1/files/{file_id}/content"
-                        upload_tasks.append(self._genai_part_from_uri(uri, status_queue))
+                        upload_tasks.append(
+                            self._genai_parts_from_uri(
+                                uri,
+                                status_queue,
+                                source_name=file.get("name"),
+                            )
+                        )
                     else:
                         log.warning("Could not determine ID for file in DB.", payload=file)
 
                 if upload_tasks:
                     log.info(f"Processing {len(upload_tasks)} file(s) from database.")
                     results = await asyncio.gather(*upload_tasks)
-                    user_parts.extend(part for part in results if part)
+                    for result in results:
+                        user_parts.extend(result)
 
         # Now, process the content from the message payload.
         user_content = message.get("content")
@@ -912,8 +1071,9 @@ class GeminiContentBuilder:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
                 if uri := c.get("image_url", {}).get("url"):
-                    if part := await self._genai_part_from_uri(uri, status_queue):
-                        user_parts.append(part)
+                    user_parts.extend(
+                        await self._genai_parts_from_uri(uri, status_queue)
+                    )
 
         return user_parts
 
@@ -1099,8 +1259,8 @@ class GeminiContentBuilder:
                 continue
 
             # Delegate all URI processing to the unified helper
-            if media_part := await self._genai_part_from_uri(uri, status_queue):
-                parts.append(media_part)
+            media_parts = await self._genai_parts_from_uri(uri, status_queue)
+            parts.extend(media_parts)
 
             last_pos = match.end()
 
@@ -1114,17 +1274,20 @@ class GeminiContentBuilder:
 
         return parts
 
-    async def _genai_part_from_uri(
-        self, uri: str, status_queue: asyncio.Queue
-    ) -> types.Part | None:
+    async def _genai_parts_from_uri(
+        self,
+        uri: str,
+        status_queue: asyncio.Queue,
+        source_name: str | None = None,
+    ) -> list[types.Part]:
         """
-        Processes any resource URI and returns a genai.types.Part.
+        Processes any resource URI and returns zero or more genai.types.Part objects.
         This is the central dispatcher for all media processing, handling data URIs,
         local API file paths, and YouTube URLs.
         """
         if not uri:
             log.warning("Received an empty URI, skipping.")
-            return None
+            return []
 
         try:
             file_bytes: bytes | None = None
@@ -1145,34 +1308,125 @@ class GeminiContentBuilder:
                 file_bytes, mime_type = await self._get_file_data(file_id)
             elif "youtube.com/" in uri or "youtu.be/" in uri:
                 log.info(f"Found YouTube URL: {uri}")
-                return self._genai_part_from_youtube_uri(uri)
+                part = self._genai_part_from_youtube_uri(uri)
+                return [part] if part else []
             # TODO: Google Cloud Storage bucket support.
             # elif uri.startswith("gs://"): ...
             else:
                 warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
                 log.warning(warn_msg)
                 self.event_emitter.emit_toast(warn_msg, "warning")
-                return None
+                return []
 
             # Step 2: If we have bytes, create the Part using the modularized helper
             if file_bytes and mime_type:
-                return await self._create_genai_part_from_file_data(
+                return await self._create_genai_parts_from_file_data(
                     file_bytes=file_bytes,
                     mime_type=mime_type,
                     owui_file_id=owui_file_id,
                     status_queue=status_queue,
+                    source_name=source_name,
                 )
 
-            return None  # Return None if bytes/mime_type could not be determined
+            return []  # Return empty if bytes/mime_type could not be determined
 
         except FilesAPIError as e:
             error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
             log.error(error_msg)
             self.event_emitter.emit_toast(error_msg, "error")
-            return None
+            return []
+        except PDFProcessingError as e:
+            error_msg = f"PDF processing failed for URI '{uri[:64]}...': {e}"
+            log.error(error_msg)
+            self.event_emitter.emit_toast(error_msg, "error")
+            return []
         except Exception:
             log.exception(f"Error processing URI: {uri[:64]}[...]")
-            return None
+            return []
+
+    async def _genai_part_from_uri(
+        self, uri: str, status_queue: asyncio.Queue
+    ) -> types.Part | None:
+        """Compatibility wrapper for callers that only expect the first part."""
+        parts = await self._genai_parts_from_uri(uri, status_queue)
+        return parts[0] if parts else None
+
+    async def _create_genai_parts_from_file_data(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        owui_file_id: str | None,
+        status_queue: asyncio.Queue,
+        force_raw: bool = False,
+        source_name: str | None = None,
+    ) -> list[types.Part]:
+        if (
+            mime_type == "application/pdf"
+            and self.valves.PDF_LIMIT_MITIGATION
+            and not force_raw
+        ):
+            processor = GeminiPDFProcessor()
+            processed_pdfs, page_count, was_mitigated = processor.prepare(file_bytes)
+            if was_mitigated:
+                original_hash = xxhash.xxh64(file_bytes).hexdigest()
+                pdf_label = source_name or owui_file_id or "attached PDF"
+                parts: list[types.Part] = []
+
+                if len(processed_pdfs) > 1:
+                    parts.append(
+                        types.Part.from_text(
+                            text=(
+                                f"PDF '{pdf_label}' was optimized and split into "
+                                f"{len(processed_pdfs)} consecutive attachments "
+                                f"({page_count} pages total) to fit Gemini API limits. "
+                                "Process the PDF parts in order as one original document."
+                            )
+                        )
+                    )
+                    self.event_emitter.emit_status(
+                        f"Optimized and split PDF into {len(processed_pdfs)} parts.",
+                        done=True,
+                        indent_level=1,
+                    )
+                else:
+                    self.event_emitter.emit_status(
+                        "Optimized PDF to fit Gemini API limits.",
+                        done=True,
+                        indent_level=1,
+                    )
+
+                for i, pdf_bytes in enumerate(processed_pdfs):
+                    synthetic_id = self._synthetic_pdf_part_id(
+                        owui_file_id, original_hash, i, len(processed_pdfs)
+                    )
+                    parts.append(
+                        await self._create_genai_part_from_file_data(
+                            file_bytes=pdf_bytes,
+                            mime_type=mime_type,
+                            owui_file_id=synthetic_id,
+                            status_queue=status_queue,
+                            force_raw=force_raw,
+                        )
+                    )
+                return parts
+
+        return [
+            await self._create_genai_part_from_file_data(
+                file_bytes=file_bytes,
+                mime_type=mime_type,
+                owui_file_id=owui_file_id,
+                status_queue=status_queue,
+                force_raw=force_raw,
+            )
+        ]
+
+    @staticmethod
+    def _synthetic_pdf_part_id(
+        owui_file_id: str | None, original_hash: str, index: int, total: int
+    ) -> str:
+        base_id = owui_file_id or "anonymous"
+        suffix = "optimized" if total == 1 else f"part-{index + 1:04d}-of-{total:04d}"
+        return f"{base_id}:pdf:{original_hash}:{suffix}"
 
     async def _create_genai_part_from_file_data(
         self,
@@ -1669,6 +1923,13 @@ class Pipe:
             If disabled, files are sent as raw bytes in the request.
             Default value is True.""",
         )
+        PDF_LIMIT_MITIGATION: bool = Field(
+            default=True,
+            description="""Whether to automatically compress and split PDFs that exceed Gemini's PDF limits.
+            Gemini accepts PDFs up to 50 MiB or 1000 pages per document. When enabled, oversized PDFs are optimized
+            and split into ordered sub-documents before being sent to Gemini.
+            Default value is True.""",
+        )
         PARSE_YOUTUBE_URLS: bool = Field(
             default=True,
             description="""Whether to parse YouTube URLs from user messages and provide them as context to the model.
@@ -1824,6 +2085,11 @@ class Pipe:
             default=None,
             description="""Override the default setting for using the Google Files API.
             Set to True to force use, False to disable.
+            Default is None (use the admin's setting).""",
+        )
+        PDF_LIMIT_MITIGATION: bool | None | Literal[""] = Field(
+            default=None,
+            description="""Override automatic PDF compression and splitting for oversized PDFs.
             Default is None (use the admin's setting).""",
         )
         PARSE_YOUTUBE_URLS: bool | None | Literal[""] = Field(
