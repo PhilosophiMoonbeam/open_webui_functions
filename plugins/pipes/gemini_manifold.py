@@ -1945,7 +1945,7 @@ class GeminiContentBuilder:
     ) -> str:
         page_map = "\n".join(
             (
-                f"- Attachment {i}: original document pages "
+                f"- PDF '{pdf_label}', attachment {i}: original document pages "
                 f"{part.start_page}-{part.end_page}"
             )
             for i, part in enumerate(parts, start=1)

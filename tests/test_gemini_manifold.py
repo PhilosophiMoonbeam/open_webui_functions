@@ -1102,8 +1102,14 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
     assert parts[0].text is not None
     assert "very-large.pdf" in parts[0].text
     assert "3 consecutive attachments" in parts[0].text
-    assert "Attachment 1: original document pages 1-46" in parts[0].text
-    assert "Attachment 2: original document pages 47-92" in parts[0].text
+    assert (
+        "PDF 'very-large.pdf', attachment 1: original document pages 1-46"
+        in parts[0].text
+    )
+    assert (
+        "PDF 'very-large.pdf', attachment 2: original document pages 47-92"
+        in parts[0].text
+    )
     assert "do not restart page numbering at 1" in parts[0].text
     assert [part.file_data.file_uri for part in parts[1:]] == [  # type: ignore[union-attr]
         "gs://fake-bucket/chunk-1.pdf",
