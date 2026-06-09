@@ -1002,6 +1002,8 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(
                 PreparedPDFPart(
                     path=str(optimized_pdf_path),
                     size=len(optimized_pdf_bytes),
+                    start_page=1,
+                    end_page=12,
                 )
             ],
             page_count=12,
@@ -1076,8 +1078,13 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
         "prepare_to_directory",
         return_value=PreparedPDFResult(
             parts=[
-                PreparedPDFPart(path=str(path), size=len(chunk))
-                for path, chunk in zip(chunk_paths, chunks, strict=True)
+                PreparedPDFPart(
+                    path=str(path),
+                    size=len(chunk),
+                    start_page=(i * 46) + 1,
+                    end_page=(i + 1) * 46,
+                )
+                for i, (path, chunk) in enumerate(zip(chunk_paths, chunks, strict=True))
             ],
             page_count=2401,
             was_mitigated=True,
@@ -1095,6 +1102,9 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
     assert parts[0].text is not None
     assert "very-large.pdf" in parts[0].text
     assert "3 consecutive attachments" in parts[0].text
+    assert "Attachment 1: original document pages 1-46" in parts[0].text
+    assert "Attachment 2: original document pages 47-92" in parts[0].text
+    assert "do not restart page numbering at 1" in parts[0].text
     assert [part.file_data.file_uri for part in parts[1:]] == [  # type: ignore[union-attr]
         "gs://fake-bucket/chunk-1.pdf",
         "gs://fake-bucket/chunk-2.pdf",
@@ -1163,8 +1173,13 @@ async def test_create_genai_parts_reuses_pdf_mitigation_cache(
         "prepare_to_directory",
         return_value=PreparedPDFResult(
             parts=[
-                PreparedPDFPart(path=str(path), size=len(chunk))
-                for path, chunk in zip(chunk_paths, chunks, strict=True)
+                PreparedPDFPart(
+                    path=str(path),
+                    size=len(chunk),
+                    start_page=(i * 600) + 1,
+                    end_page=(i + 1) * 600,
+                )
+                for i, (path, chunk) in enumerate(zip(chunk_paths, chunks, strict=True))
             ],
             page_count=1200,
             was_mitigated=True,
@@ -1265,6 +1280,12 @@ def test_pdf_processor_splits_real_pdf_by_page_limit(tmp_path):
         for part in result.parts
     ]
     assert page_counts == [2, 2, 1]
+    assert [(part.start_page, part.end_page) for part in result.parts] == [
+        (1, 2),
+        (3, 4),
+        (5, 5),
+    ]
+    assert "pages-000001-000002" in result.parts[0].path
 
 
 @pytest.mark.asyncio
