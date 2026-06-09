@@ -144,6 +144,8 @@ GEMINI_PDF_PROCESSING_CONCURRENCY: Final = 1
 class PreparedPDFPart:
     path: str
     size: int
+    start_page: int
+    end_page: int
 
 
 @dataclass(frozen=True)
@@ -263,7 +265,14 @@ class GeminiPDFProcessor:
 
         if optimized_size <= self.max_bytes and optimized_page_count <= self.max_pages:
             return PreparedPDFResult(
-                [PreparedPDFPart(path=optimized_path, size=optimized_size)],
+                [
+                    PreparedPDFPart(
+                        path=optimized_path,
+                        size=optimized_size,
+                        start_page=1,
+                        end_page=optimized_page_count,
+                    )
+                ],
                 optimized_page_count,
                 True,
             )
@@ -431,19 +440,27 @@ class GeminiPDFProcessor:
                 page_count = min(self.max_pages, estimated_pages, remaining_pages)
 
                 while True:
-                    candidate_path = os.path.join(
-                        output_dir, f"part-{len(parts) + 1:04d}.pdf"
-                    )
+                    part_number = len(parts) + 1
+                    start_page = start + 1
+                    end_page = start + page_count
+                    candidate_path = os.path.join(output_dir, f"part-{part_number:04d}.tmp.pdf")
                     self._save_page_range_to_path(
                         pikepdf, pdf, start, start + page_count, candidate_path
                     )
                     candidate_size = os.path.getsize(candidate_path)
 
                     if candidate_size <= self.target_bytes:
+                        final_path = os.path.join(
+                            output_dir,
+                            f"part-{part_number:04d}-pages-{start_page:06d}-{end_page:06d}.pdf",
+                        )
+                        os.replace(candidate_path, final_path)
                         parts.append(
                             PreparedPDFPart(
-                                path=candidate_path,
+                                path=final_path,
                                 size=candidate_size,
+                                start_page=start_page,
+                                end_page=end_page,
                             )
                         )
                         start += page_count
@@ -471,10 +488,17 @@ class GeminiPDFProcessor:
                                 "per-document limit after compression. This PDF cannot "
                                 "be sent without lossy page/image downsampling."
                             )
+                        final_path = os.path.join(
+                            output_dir,
+                            f"part-{part_number:04d}-pages-{start_page:06d}-{end_page:06d}.pdf",
+                        )
+                        os.replace(candidate_path, final_path)
                         parts.append(
                             PreparedPDFPart(
-                                path=candidate_path,
+                                path=final_path,
                                 size=candidate_size,
+                                start_page=start_page,
+                                end_page=end_page,
                             )
                         )
                         start += 1
@@ -1855,11 +1879,10 @@ class GeminiContentBuilder:
                 if len(result.parts) > 1:
                     parts.append(
                         types.Part.from_text(
-                            text=(
-                                f"PDF '{pdf_label}' was optimized and split into "
-                                f"{len(result.parts)} consecutive attachments "
-                                f"({page_count} pages total) to fit Gemini API limits. "
-                                "Process the PDF parts in order as one original document."
+                            text=self._pdf_split_instruction_text(
+                                pdf_label,
+                                result.parts,
+                                page_count,
                             )
                         )
                     )
@@ -1913,6 +1936,29 @@ class GeminiContentBuilder:
                 force_raw=force_raw,
             )
         ]
+
+    @staticmethod
+    def _pdf_split_instruction_text(
+        pdf_label: str,
+        parts: list[PreparedPDFPart],
+        page_count: int,
+    ) -> str:
+        page_map = "\n".join(
+            (
+                f"- Attachment {i}: original document pages "
+                f"{part.start_page}-{part.end_page}"
+            )
+            for i, part in enumerate(parts, start=1)
+        )
+        return (
+            f"PDF '{pdf_label}' was optimized and split into {len(parts)} "
+            f"consecutive attachments ({page_count} pages total) to fit Gemini "
+            "API limits. Process the PDF parts in order as one original document. "
+            "When referencing or citing pages, use the original document page "
+            "numbers from this absolute page map; do not restart page numbering "
+            "at 1 for each attachment.\n"
+            f"{page_map}"
+        )
 
     @staticmethod
     def _synthetic_pdf_part_id(
