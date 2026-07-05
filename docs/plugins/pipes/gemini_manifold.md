@@ -57,7 +57,7 @@ The optional `reasoning_effort` custom parameter can still override the configur
 
 Image generation models use `IMAGE_OUTPUT_FORMAT` to request either `Images & Text` or `Images only`. The pipe maps this to Gemini `response_modalities` as `["TEXT", "IMAGE"]` or `["IMAGE"]`.
 
-`IMAGE_RESOLUTION` and `IMAGE_ASPECT_RATIO` are checked against each model's `image_config` entry in `gemini_models.yaml`. Unsupported values are skipped for that model instead of being sent to Gemini. Current Gemini 3.1 Flash Image entries support `512`, `1K`, `2K`, and `4K`, while Gemini 3.1 Flash Lite Image is limited to `1K`.
+`IMAGE_RESOLUTION` and `IMAGE_ASPECT_RATIO` are checked against each model's `image_config` entry in `gemini_models.yaml`. Unsupported resolutions are skipped for that model instead of being sent to Gemini. Unsupported aspect ratios use the nearest supported ratio, and the pipe emits a status message describing the substitution. Current Gemini 3.1 Flash Image entries support `512`, `1K`, `2K`, and `4K`, while Gemini 3.1 Flash Lite Image is limited to `1K`.
 
 ### PDF limit mitigation
 

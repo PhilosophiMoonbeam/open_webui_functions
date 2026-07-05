@@ -2824,7 +2824,7 @@ class Pipe:
         ] = Field(
             default="16:9",
             description="""Aspect ratio for image generation.
-            Unsupported ratios are skipped for models that do not list them in gemini_models.yaml.
+            Unsupported ratios use the nearest supported ratio listed for the model in gemini_models.yaml.
             Default value is 16:9.""",
         )
 
@@ -2999,7 +2999,7 @@ class Pipe:
         ) = Field(
             default=None,
             description="""Aspect ratio for image generation.
-            Default value is None (use the admin's setting). Possible values: 1:1, 1:4, 1:8, 2:3, 3:2, 3:4, 4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9""",
+            Default value is None (use the admin's setting). Unsupported ratios use the nearest supported ratio listed for the model in gemini_models.yaml. Possible values: 1:1, 1:4, 1:8, 2:3, 3:2, 3:4, 4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -3745,6 +3745,79 @@ class Pipe:
         return False
 
     @staticmethod
+    def _parse_aspect_ratio(aspect_ratio: str) -> float | None:
+        try:
+            width_str, height_str = aspect_ratio.split(":", 1)
+            width = float(width_str)
+            height = float(height_str)
+            if width <= 0 or height <= 0:
+                return None
+            return width / height
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _nearest_supported_aspect_ratio(
+        cls,
+        requested_ratio: str,
+        supported_ratios: list[str],
+    ) -> str | None:
+        requested_value = cls._parse_aspect_ratio(requested_ratio)
+        if requested_value is None:
+            return None
+
+        candidates: list[tuple[float, str]] = []
+        for supported_ratio in supported_ratios:
+            supported_value = cls._parse_aspect_ratio(supported_ratio)
+            if supported_value is None:
+                continue
+
+            # Compare multiplicative distance so portrait and landscape ratios
+            # are treated symmetrically around the requested composition.
+            distance = abs(
+                max(requested_value, supported_value)
+                / min(requested_value, supported_value)
+                - 1
+            )
+            candidates.append((distance, supported_ratio))
+
+        if not candidates:
+            return None
+
+        return min(candidates, key=lambda candidate: candidate[0])[1]
+
+    @classmethod
+    def _resolve_image_aspect_ratio(
+        cls,
+        model_id: str,
+        requested_ratio: str,
+        supported_ratios: Any,
+    ) -> tuple[str | None, str | None]:
+        if not isinstance(supported_ratios, list) or not supported_ratios:
+            return requested_ratio, None
+
+        if requested_ratio in supported_ratios:
+            return requested_ratio, None
+
+        nearest_ratio = cls._nearest_supported_aspect_ratio(
+            requested_ratio,
+            [ratio for ratio in supported_ratios if isinstance(ratio, str)],
+        )
+        if nearest_ratio is None:
+            log.warning(
+                f"Skipping image aspect ratio '{requested_ratio}' for model '{model_id}' "
+                f"because supported values are: {supported_ratios}."
+            )
+            return None, None
+
+        fallback_message = (
+            f"Aspect ratio {requested_ratio} is not supported by {model_id}; "
+            f"using nearest supported ratio {nearest_ratio}."
+        )
+        log.warning(fallback_message)
+        return nearest_ratio, fallback_message
+
+    @staticmethod
     def _should_force_non_streaming_for_image_generation(
         use_streaming_api: bool,
         valves: "Pipe.Valves",
@@ -3771,6 +3844,7 @@ class Pipe:
         """Assembles the GenerateContentConfig for a Gemini API request."""
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
+        __metadata__.pop("image_aspect_ratio_fallback_status", None)
 
         log.debug(
             "Features extracted from metadata (UI toggles and config):",
@@ -3942,16 +4016,23 @@ class Pipe:
                     gen_content_conf.image_config = types.ImageConfig()
                 gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
 
-            if valves.IMAGE_ASPECT_RATIO and self._is_image_option_supported(
-                model_id,
-                "aspect ratio",
-                valves.IMAGE_ASPECT_RATIO,
-                supported_aspect_ratios,
-            ):
-                log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
+            aspect_ratio = None
+            if valves.IMAGE_ASPECT_RATIO:
+                aspect_ratio, fallback_message = self._resolve_image_aspect_ratio(
+                    model_id,
+                    valves.IMAGE_ASPECT_RATIO,
+                    supported_aspect_ratios,
+                )
+                if fallback_message:
+                    __metadata__["image_aspect_ratio_fallback_status"] = (
+                        fallback_message
+                    )
+
+            if aspect_ratio:
+                log.debug(f"Setting image aspect ratio to {aspect_ratio}")
                 if not gen_content_conf.image_config:
                     gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.aspect_ratio = valves.IMAGE_ASPECT_RATIO
+                gen_content_conf.image_config.aspect_ratio = aspect_ratio
 
         gen_content_conf.tools = []
 
@@ -4147,6 +4228,12 @@ class Pipe:
             body, __metadata__, valves, model_config
         )
         gen_content_conf.system_instruction = builder.system_prompt
+
+        if fallback_status := __metadata__.pop(
+            "image_aspect_ratio_fallback_status",
+            None,
+        ):
+            event_emitter.emit_status(fallback_status)
 
         model_id = __metadata__.get("canonical_model_id", "")
 

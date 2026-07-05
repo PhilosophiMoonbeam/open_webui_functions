@@ -771,7 +771,7 @@ async def test_build_config_image_only_and_thinking_level_for_lite_image_model(
 
 
 @pytest.mark.asyncio
-async def test_build_config_skips_unsupported_image_aspect_ratio(
+async def test_build_config_uses_nearest_supported_image_aspect_ratio(
     pipe_instance_fixture,
 ):
     pipe, _ = pipe_instance_fixture
@@ -822,7 +822,30 @@ async def test_build_config_skips_unsupported_image_aspect_ratio(
         )
 
     assert config.image_config is not None
-    assert config.image_config.aspect_ratio is None
+    assert config.image_config.aspect_ratio == "9:16"
+    assert metadata["image_aspect_ratio_fallback_status"] == (
+        "Aspect ratio 1:4 is not supported by gemini-3-pro-image; "
+        "using nearest supported ratio 9:16."
+    )
+
+
+def test_nearest_supported_aspect_ratio_preserves_orientation(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    supported_ratios = [
+        "1:1",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:3",
+        "4:5",
+        "5:4",
+        "9:16",
+        "16:9",
+        "21:9",
+    ]
+
+    assert pipe._nearest_supported_aspect_ratio("1:8", supported_ratios) == "9:16"
+    assert pipe._nearest_supported_aspect_ratio("8:1", supported_ratios) == "21:9"
 
 
 @pytest.mark.asyncio
