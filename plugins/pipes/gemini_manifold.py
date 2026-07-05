@@ -156,6 +156,12 @@ class PreparedPDFResult:
 
 
 @dataclass(frozen=True)
+class PDFMitigationOutcome:
+    original_hash: str
+    result: PreparedPDFResult
+
+
+@dataclass(frozen=True)
 class LocalFileSource:
     file_bytes: bytes | None
     file_path: str | None
@@ -239,7 +245,9 @@ class GeminiPDFProcessor:
         source_size: int | None = None,
     ) -> PreparedPDFResult:
         pikepdf = self._get_pikepdf()
-        source_size = source_size if source_size is not None else os.path.getsize(source_path)
+        source_size = (
+            source_size if source_size is not None else os.path.getsize(source_path)
+        )
         page_count = self._count_pages_from_path(pikepdf, source_path)
 
         if source_size <= self.max_bytes and page_count <= self.max_pages:
@@ -443,7 +451,9 @@ class GeminiPDFProcessor:
                     part_number = len(parts) + 1
                     start_page = start + 1
                     end_page = start + page_count
-                    candidate_path = os.path.join(output_dir, f"part-{part_number:04d}.tmp.pdf")
+                    candidate_path = os.path.join(
+                        output_dir, f"part-{part_number:04d}.tmp.pdf"
+                    )
                     self._save_page_range_to_path(
                         pikepdf, pdf, start, start + page_count, candidate_path
                     )
@@ -1149,6 +1159,186 @@ class FilesAPIManager:
         )
 
 
+class PDFMitigationManager:
+    """Coordinates PDF source files, cache entries, and serialized processing."""
+
+    def __init__(
+        self,
+        *,
+        cache: SimpleMemoryCache | None = None,
+        processing_semaphore: asyncio.Semaphore | None = None,
+    ):
+        self.cache = cache or SimpleMemoryCache(serializer=NullSerializer())
+        self.locks: dict[str, asyncio.Lock] = {}
+        self.processing_semaphore = processing_semaphore or asyncio.Semaphore(
+            GEMINI_PDF_PROCESSING_CONCURRENCY
+        )
+
+    async def prepare(
+        self,
+        *,
+        file_bytes: bytes | None,
+        file_path: str | None,
+    ) -> PDFMitigationOutcome | None:
+        if file_path:
+            original_hash = await asyncio.to_thread(
+                FilesAPIManager._hash_file_path, file_path
+            )
+            return PDFMitigationOutcome(
+                original_hash=original_hash,
+                result=await self._get_or_prepare(
+                    file_path,
+                    original_hash,
+                    source_size=os.path.getsize(file_path),
+                ),
+            )
+
+        if not file_bytes:
+            return None
+
+        original_hash = xxhash.xxh64(file_bytes).hexdigest()
+        cached_result = await self._get_cached_result(original_hash)
+        if cached_result:
+            return PDFMitigationOutcome(
+                original_hash=original_hash,
+                result=cached_result,
+            )
+
+        source_path = self._write_temp_source(original_hash, file_bytes)
+        try:
+            result = await self._get_or_prepare(
+                source_path,
+                original_hash,
+                source_size=len(file_bytes),
+            )
+        finally:
+            self._remove_temp_source(source_path)
+
+        return PDFMitigationOutcome(original_hash=original_hash, result=result)
+
+    async def _get_or_prepare(
+        self,
+        source_path: str,
+        original_hash: str,
+        *,
+        source_size: int,
+    ) -> PreparedPDFResult:
+        cached_result = await self._get_cached_result(original_hash)
+        if cached_result:
+            return cached_result
+
+        log.debug(f"PDF mitigation cache MISS for source hash {original_hash}.")
+        lock = self.locks.setdefault(original_hash, asyncio.Lock())
+        async with lock:
+            cached_result = await self._get_cached_result(original_hash)
+            if cached_result:
+                log.debug(
+                    f"PDF mitigation cache HIT for source hash {original_hash} after lock."
+                )
+                return cached_result
+
+            cache_key = self._cache_key(original_hash)
+            cache_dir = self._cache_dir(original_hash)
+            self._cleanup_stale_cache_dirs()
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            processor = GeminiPDFProcessor()
+            async with self.processing_semaphore:
+                result = await asyncio.to_thread(
+                    processor.prepare_to_directory,
+                    source_path,
+                    str(cache_dir),
+                    source_size=source_size,
+                )
+
+            if result.was_mitigated:
+                await self.cache.set(
+                    cache_key,
+                    result,
+                    ttl=GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS,
+                )
+                log.debug(
+                    f"Cached PDF mitigation result for source hash {original_hash} "
+                    f"with {len(result.parts)} processed PDF(s)."
+                )
+            elif cache_dir.exists():
+                shutil.rmtree(cache_dir)
+
+            return result
+
+    async def _get_cached_result(self, original_hash: str) -> PreparedPDFResult | None:
+        cached_result = await self.cache.get(self._cache_key(original_hash))
+        if self._cached_result_is_valid(cached_result):
+            log.debug(f"PDF mitigation cache HIT for source hash {original_hash}.")
+            return cached_result
+        return None
+
+    @staticmethod
+    def _cache_key(original_hash: str) -> str:
+        return f"pdf_mitigation:{original_hash}"
+
+    @staticmethod
+    def _cached_result_is_valid(value: Any) -> bool:
+        if not isinstance(value, PreparedPDFResult):
+            return False
+        if not value.was_mitigated:
+            return True
+        return bool(value.parts) and all(
+            os.path.exists(part.path) for part in value.parts
+        )
+
+    @staticmethod
+    def _cache_root() -> Path:
+        return Path(tempfile.gettempdir()) / GEMINI_PDF_MITIGATION_CACHE_DIR_NAME
+
+    def _cache_dir(self, original_hash: str) -> Path:
+        return self._cache_root() / original_hash
+
+    def _cleanup_stale_cache_dirs(self) -> None:
+        cache_root = self._cache_root()
+        if not cache_root.exists():
+            return
+        cutoff = time.time() - GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS
+        for path in cache_root.iterdir():
+            try:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path)
+                elif (
+                    path.is_file()
+                    and path.name.startswith("source-")
+                    and path.stat().st_mtime < cutoff
+                ):
+                    path.unlink()
+            except Exception:
+                log.exception(
+                    f"Could not clean stale PDF mitigation cache path {path}."
+                )
+
+    @staticmethod
+    def _write_temp_source(original_hash: str, file_bytes: bytes) -> str:
+        temp_dir = PDFMitigationManager._cache_root()
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f"source-{original_hash}-",
+            suffix=".pdf",
+            dir=temp_dir,
+        )
+        with os.fdopen(fd, "wb") as file:
+            file.write(file_bytes)
+        return temp_path
+
+    @staticmethod
+    def _remove_temp_source(source_path: str) -> None:
+        try:
+            os.remove(source_path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            log.exception(f"Could not remove temporary PDF source {source_path}.")
+
+
 class GeminiContentBuilder:
     """Builds a list of `google.genai.types.Content` objects from the OWUI's body payload."""
 
@@ -1160,9 +1350,7 @@ class GeminiContentBuilder:
         event_emitter: "EventEmitter",
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
-        pdf_mitigation_cache: SimpleMemoryCache,
-        pdf_mitigation_locks: dict[str, asyncio.Lock],
-        pdf_processing_semaphore: asyncio.Semaphore,
+        pdf_mitigation_manager: PDFMitigationManager,
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -1173,9 +1361,7 @@ class GeminiContentBuilder:
         self.event_emitter = event_emitter
         self.valves = valves
         self.files_api_manager = files_api_manager
-        self.pdf_mitigation_cache = pdf_mitigation_cache
-        self.pdf_mitigation_locks = pdf_mitigation_locks
-        self.pdf_processing_semaphore = pdf_processing_semaphore
+        self.pdf_mitigation_manager = pdf_mitigation_manager
         # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
@@ -1839,38 +2025,15 @@ class GeminiContentBuilder:
             and self.valves.PDF_LIMIT_MITIGATION
             and not force_raw
         ):
-            if file_path:
-                original_hash = await asyncio.to_thread(
-                    FilesAPIManager._hash_file_path, file_path
-                )
-                source_path = file_path
-                source_size = os.path.getsize(file_path)
-                remove_source_after_prepare = False
-            elif file_bytes:
-                original_hash = xxhash.xxh64(file_bytes).hexdigest()
-                source_path = self._write_temp_pdf_source(original_hash, file_bytes)
-                source_size = len(file_bytes)
-                remove_source_after_prepare = True
-            else:
+            outcome = await self.pdf_mitigation_manager.prepare(
+                file_bytes=file_bytes,
+                file_path=file_path,
+            )
+            if outcome is None:
                 return []
 
-            try:
-                result = await self._get_or_prepare_pdf_mitigation(
-                    source_path,
-                    original_hash,
-                    source_size=source_size,
-                )
-            finally:
-                if remove_source_after_prepare:
-                    try:
-                        os.remove(source_path)
-                    except FileNotFoundError:
-                        pass
-                    except Exception:
-                        log.exception(
-                            f"Could not remove temporary PDF source {source_path}."
-                        )
-
+            original_hash = outcome.original_hash
+            result = outcome.result
             page_count = result.page_count
             if result.was_mitigated:
                 pdf_label = source_name or owui_file_id or "attached PDF"
@@ -1967,103 +2130,6 @@ class GeminiContentBuilder:
         base_id = owui_file_id or "anonymous"
         suffix = "optimized" if total == 1 else f"part-{index + 1:04d}-of-{total:04d}"
         return f"{base_id}:pdf:{original_hash}:{suffix}"
-
-    async def _get_or_prepare_pdf_mitigation(
-        self,
-        source_path: str,
-        original_hash: str,
-        *,
-        source_size: int,
-    ) -> PreparedPDFResult:
-        cache_key = f"pdf_mitigation:{original_hash}"
-        cached_result = await self.pdf_mitigation_cache.get(cache_key)
-        if self._cached_pdf_result_is_valid(cached_result):
-            log.debug(f"PDF mitigation cache HIT for source hash {original_hash}.")
-            return cached_result
-
-        log.debug(f"PDF mitigation cache MISS for source hash {original_hash}.")
-        lock = self.pdf_mitigation_locks.setdefault(original_hash, asyncio.Lock())
-        try:
-            async with lock:
-                cached_result = await self.pdf_mitigation_cache.get(cache_key)
-                if self._cached_pdf_result_is_valid(cached_result):
-                    log.debug(
-                        f"PDF mitigation cache HIT for source hash {original_hash} after lock."
-                    )
-                    return cached_result
-
-                cache_dir = self._pdf_mitigation_cache_dir(original_hash)
-                self._cleanup_stale_pdf_cache_dirs()
-                if cache_dir.exists():
-                    shutil.rmtree(cache_dir)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-
-                processor = GeminiPDFProcessor()
-                async with self.pdf_processing_semaphore:
-                    result = await asyncio.to_thread(
-                        processor.prepare_to_directory,
-                        source_path,
-                        str(cache_dir),
-                        source_size=source_size,
-                    )
-
-                if result.was_mitigated:
-                    await self.pdf_mitigation_cache.set(
-                        cache_key,
-                        result,
-                        ttl=GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS,
-                    )
-                    log.debug(
-                        f"Cached PDF mitigation result for source hash {original_hash} "
-                        f"with {len(result.parts)} processed PDF(s)."
-                    )
-                elif cache_dir.exists():
-                    shutil.rmtree(cache_dir)
-
-                return result
-        finally:
-            if original_hash in self.pdf_mitigation_locks:
-                del self.pdf_mitigation_locks[original_hash]
-
-    @staticmethod
-    def _cached_pdf_result_is_valid(value: Any) -> bool:
-        if not isinstance(value, PreparedPDFResult):
-            return False
-        if not value.was_mitigated:
-            return True
-        return bool(value.parts) and all(os.path.exists(part.path) for part in value.parts)
-
-    @staticmethod
-    def _pdf_mitigation_cache_root() -> Path:
-        return Path(tempfile.gettempdir()) / GEMINI_PDF_MITIGATION_CACHE_DIR_NAME
-
-    def _pdf_mitigation_cache_dir(self, original_hash: str) -> Path:
-        return self._pdf_mitigation_cache_root() / original_hash
-
-    def _cleanup_stale_pdf_cache_dirs(self) -> None:
-        cache_root = self._pdf_mitigation_cache_root()
-        if not cache_root.exists():
-            return
-        cutoff = time.time() - GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS
-        for path in cache_root.iterdir():
-            try:
-                if path.is_dir() and path.stat().st_mtime < cutoff:
-                    shutil.rmtree(path)
-            except Exception:
-                log.exception(f"Could not clean stale PDF mitigation cache path {path}.")
-
-    @staticmethod
-    def _write_temp_pdf_source(original_hash: str, file_bytes: bytes) -> str:
-        temp_dir = Path(tempfile.gettempdir()) / GEMINI_PDF_MITIGATION_CACHE_DIR_NAME
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(
-            prefix=f"source-{original_hash}-",
-            suffix=".pdf",
-            dir=temp_dir,
-        )
-        with os.fdopen(fd, "wb") as file:
-            file.write(file_bytes)
-        return temp_path
 
     async def _create_genai_part_from_file_data(
         self,
@@ -2917,11 +2983,7 @@ class Pipe:
         self.valves = self.Valves()
         self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
-        self.pdf_mitigation_cache = SimpleMemoryCache(serializer=NullSerializer())
-        self.pdf_mitigation_locks: dict[str, asyncio.Lock] = {}
-        self.pdf_processing_semaphore = asyncio.Semaphore(
-            GEMINI_PDF_PROCESSING_CONCURRENCY
-        )
+        self.pdf_mitigation_manager = PDFMitigationManager()
         log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
@@ -3886,9 +3948,7 @@ class Pipe:
             event_emitter=event_emitter,
             valves=valves,
             files_api_manager=files_api_manager,
-            pdf_mitigation_cache=self.pdf_mitigation_cache,
-            pdf_mitigation_locks=self.pdf_mitigation_locks,
-            pdf_processing_semaphore=self.pdf_processing_semaphore,
+            pdf_mitigation_manager=self.pdf_mitigation_manager,
         )
 
         event_emitter.emit_status("Preparing request...")
