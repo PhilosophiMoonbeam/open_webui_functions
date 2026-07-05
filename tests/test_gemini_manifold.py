@@ -771,6 +771,61 @@ async def test_build_config_image_only_and_thinking_level_for_lite_image_model(
 
 
 @pytest.mark.asyncio
+async def test_build_config_skips_unsupported_image_aspect_ratio(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    model_id = "gemini-3-pro-image"
+    pipe.valves.IMAGE_ASPECT_RATIO = "1:4"
+
+    model_config = {
+        model_id: {
+            "capabilities": {"thinking": True, "image_generation": True},
+            "thinking_config": {
+                "mode": "level",
+                "default_level": "high",
+                "supported_levels": ["low", "high"],
+            },
+            "image_config": {
+                "supported_resolutions": ["1K", "2K", "4K"],
+                "supported_aspect_ratios": [
+                    "1:1",
+                    "2:3",
+                    "3:2",
+                    "3:4",
+                    "4:3",
+                    "4:5",
+                    "5:4",
+                    "9:16",
+                    "16:9",
+                    "21:9",
+                ],
+            },
+        }
+    }
+    metadata = {
+        "canonical_model_id": model_id,
+        "features": {},
+        "merged_custom_params": {},
+    }
+
+    with patch.object(
+        pipe,
+        "_get_toggleable_feature_status",
+        AsyncMock(return_value=(False, False)),
+    ):
+        config = await pipe._build_gen_content_config(
+            body={},
+            __metadata__=metadata,
+            valves=pipe.valves,
+            config=model_config,
+        )
+
+    assert config.image_config is not None
+    assert config.image_config.aspect_ratio is None
+
+
+@pytest.mark.asyncio
 async def test_build_config_budget_thinking_model_keeps_budget_path(
     pipe_instance_fixture,
 ):
