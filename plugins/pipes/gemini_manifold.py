@@ -7,7 +7,7 @@ author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
 version: 2.1.0
-requirements: google-genai==2.8.0, pikepdf
+requirements: google-genai==2.10.0, pikepdf
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
@@ -3744,6 +3744,19 @@ class Pipe:
         )
         return False
 
+    @staticmethod
+    def _should_force_non_streaming_for_image_generation(
+        use_streaming_api: bool,
+        valves: "Pipe.Valves",
+        model_id: str,
+        model_config: dict,
+    ) -> bool:
+        return (
+            use_streaming_api
+            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
+            and Pipe._is_image_model(model_id, model_config)
+        )
+
     # endregion 2.2 Model retrival from Google API
 
     # region 2.3 GenerateContentConfig assembly
@@ -4166,10 +4179,8 @@ class Pipe:
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
         # during the transfer of the generated image bytes. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
-        if (
-            use_streaming_api
-            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            and self._is_image_model(model_id, model_config)
+        if self._should_force_non_streaming_for_image_generation(
+            use_streaming_api, valves, model_id, model_config
         ):
             log.info(
                 f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
@@ -4871,7 +4882,10 @@ class Pipe:
             return None
 
         # Dump the raw token usage details, excluding any fields that are None.
-        token_details = response.usage_metadata.model_dump(exclude_none=True)
+        token_details = response.usage_metadata.model_dump(
+            exclude_none=True,
+            mode="json",
+        )
 
         is_paid_api = metadata.get("is_paid_api", True)
         model_id = metadata.get("canonical_model_id", "")

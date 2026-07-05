@@ -764,6 +764,11 @@ async def test_build_config_image_only_and_thinking_level_for_lite_image_model(
     assert config.image_config.image_size is None
     assert config.image_config.aspect_ratio == "16:9"
 
+    json_dump = config.model_dump(exclude_none=True, mode="json", by_alias=True)
+    assert json_dump["responseModalities"] == ["IMAGE"]
+    assert json_dump["thinkingConfig"]["thinkingLevel"] == "HIGH"
+    assert json_dump["imageConfig"]["aspectRatio"] == "16:9"
+
 
 @pytest.mark.asyncio
 async def test_build_config_budget_thinking_model_keeps_budget_path(
@@ -801,6 +806,38 @@ async def test_build_config_budget_thinking_model_keeps_budget_path(
     assert config.thinking_config is not None
     assert config.thinking_config.thinking_budget == -1
     assert config.thinking_config.thinking_level is None
+
+
+def test_high_resolution_image_generation_forces_non_streaming(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    pipe.valves.IMAGE_RESOLUTION = "2K"
+    model_id = "gemini-3.1-flash-image"
+    model_config = {
+        model_id: {
+            "capabilities": {"image_generation": True},
+        }
+    }
+
+    assert pipe._should_force_non_streaming_for_image_generation(
+        use_streaming_api=True,
+        valves=pipe.valves,
+        model_id=model_id,
+        model_config=model_config,
+    )
+    assert not pipe._should_force_non_streaming_for_image_generation(
+        use_streaming_api=False,
+        valves=pipe.valves,
+        model_id=model_id,
+        model_config=model_config,
+    )
+
+    pipe.valves.IMAGE_RESOLUTION = "1K"
+    assert not pipe._should_force_non_streaming_for_image_generation(
+        use_streaming_api=True,
+        valves=pipe.valves,
+        model_id=model_id,
+        model_config=model_config,
+    )
 
 
 # endregion Test GenerateContentConfig assembly
@@ -1454,6 +1491,65 @@ async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
 
 
 # endregion Test GeminiContentBuilder
+
+
+# region Test usage data
+def test_usage_data_counts_image_tokens_with_genai_enum_modalities(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    model_id = "gemini-3.1-flash-image"
+    response = gemini_types.GenerateContentResponse(
+        usage_metadata=gemini_types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=100,
+            candidates_token_count=30,
+            candidates_tokens_details=[
+                gemini_types.ModalityTokenCount(
+                    modality=gemini_types.MediaModality.TEXT,
+                    token_count=10,
+                ),
+                gemini_types.ModalityTokenCount(
+                    modality=gemini_types.MediaModality.IMAGE,
+                    token_count=20,
+                ),
+            ],
+            total_token_count=130,
+        )
+    )
+    app_state = MagicMock()
+    app_state._state = {
+        "gemini_model_config": {
+            model_id: {
+                "pricing": {
+                    "input": [{"up_to_tokens": None, "price_per_million": 0.50}],
+                    "output": [{"up_to_tokens": None, "price_per_million": 3.00}],
+                    "image_output": [
+                        {"up_to_tokens": None, "price_per_million": 60.00}
+                    ],
+                }
+            }
+        }
+    }
+
+    usage = pipe._get_usage_data(
+        response=response,
+        app_state=app_state,
+        metadata={"is_paid_api": True, "canonical_model_id": model_id},
+        start_time=0,
+    )
+
+    assert usage is not None
+    assert usage["token_details"]["candidates_tokens_details"] == [
+        {"modality": "TEXT", "token_count": 10},
+        {"modality": "IMAGE", "token_count": 20},
+    ]
+    assert usage["cost_details"]["input_cost"] == 0.00005
+    assert usage["cost_details"]["output_cost"] == 0.00003
+    assert usage["cost_details"]["image_output_cost"] == 0.0012
+    assert usage["cost_details"]["total_cost"] == 0.00128
+
+
+# endregion Test usage data
 
 
 def teardown_module(module):
