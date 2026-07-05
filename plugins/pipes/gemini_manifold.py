@@ -2738,6 +2738,12 @@ class Pipe:
 
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
+        THINKING_LEVEL: Literal["model_default", "minimal", "low", "medium", "high"] = Field(
+            default="model_default",
+            description="""Thinking level for Gemini models that use level-based thinking controls.
+            Use model_default to let the API choose the model's default level. This setting is ignored by models that use THINKING_BUDGET.
+            Default value is model_default.""",
+        )
         SHOW_THINKING_SUMMARY: bool = Field(
             default=True,
             description="""Whether to show the thinking summary in the response.
@@ -2788,25 +2794,37 @@ class Pipe:
             description="""Select logging level. Use `docker logs -f open-webui` to view logs.
             Default value is INFO.""",
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
+        IMAGE_OUTPUT_FORMAT: Literal["Images & Text", "Images only"] = Field(
+            default="Images & Text",
+            description="""Output format for image generation models.
+            Use 'Images & Text' to request interleaved text and images, or 'Images only' to request only image output.
+            Default value is Images & Text.""",
+        )
+        IMAGE_RESOLUTION: Literal["512", "1K", "2K", "4K"] = Field(
             default="1K",
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            description="""Resolution for image generation.
+            Model support varies: Gemini 3.1 Flash Image supports 512, 1K, 2K, and 4K; Gemini 3 Pro Image supports 1K, 2K, and 4K; Gemini 3.1 Flash Lite Image and 2.5 Flash Image support 1K.
             Default value is 1K.""",
         )
         IMAGE_ASPECT_RATIO: Literal[
             "1:1",
+            "1:4",
+            "1:8",
             "2:3",
             "3:2",
             "3:4",
+            "4:1",
             "4:3",
             "4:5",
             "5:4",
+            "8:1",
             "9:16",
             "16:9",
             "21:9",
         ] = Field(
             default="16:9",
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            description="""Aspect ratio for image generation.
+            Unsupported ratios are skipped for models that do not list them in gemini_models.yaml.
             Default value is 16:9.""",
         )
 
@@ -2904,6 +2922,15 @@ class Pipe:
 
             See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
         )
+        THINKING_LEVEL: (
+            Literal["model_default", "minimal", "low", "medium", "high"]
+            | None
+            | Literal[""]
+        ) = Field(
+            default=None,
+            description="""Thinking level for Gemini models that use level-based thinking controls.
+            Default value is None (use the admin's setting). Possible values: model_default, minimal, low, medium, high.""",
+        )
         SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
             default=None,
             description="""Whether to show the thinking summary in the response.
@@ -2938,20 +2965,31 @@ class Pipe:
             Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
+        IMAGE_OUTPUT_FORMAT: (
+            Literal["Images & Text", "Images only"] | None | Literal[""]
+        ) = Field(
             default=None,
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
-            Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
+            description="""Output format for image generation models.
+            Possible values: Images & Text, Images only.""",
+        )
+        IMAGE_RESOLUTION: Literal["512", "1K", "2K", "4K"] | None | Literal[""] = Field(
+            default=None,
+            description="""Resolution for image generation.
+            Default value is None (use the admin's setting). Possible values: 512, 1K, 2K, 4K""",
         )
         IMAGE_ASPECT_RATIO: (
             Literal[
                 "1:1",
+                "1:4",
+                "1:8",
                 "2:3",
                 "3:2",
                 "3:4",
+                "4:1",
                 "4:3",
                 "4:5",
                 "5:4",
+                "8:1",
                 "9:16",
                 "16:9",
                 "21:9",
@@ -2960,8 +2998,8 @@ class Pipe:
             | Literal[""]
         ) = Field(
             default=None,
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
-            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
+            description="""Aspect ratio for image generation.
+            Default value is None (use the admin's setting). Possible values: 1:1, 1:4, 1:8, 2:3, 3:2, 3:4, 4:1, 4:3, 4:5, 5:4, 8:1, 9:16, 16:9, 21:9""",
         )
 
         @field_validator("THINKING_BUDGET", mode="after")
@@ -3624,6 +3662,88 @@ class Pipe:
 
         return False
 
+    @staticmethod
+    def _get_model_entry(model_id: str, config: dict) -> dict[str, Any]:
+        """Return the model's YAML entry, or an empty mapping if it is unknown."""
+        entry = config.get(model_id)
+        return entry if isinstance(entry, dict) else {}
+
+    @staticmethod
+    def _get_supported_thinking_levels(model_entry: dict[str, Any]) -> list[str]:
+        thinking_config = model_entry.get("thinking_config", {})
+        if not isinstance(thinking_config, dict):
+            return []
+
+        supported_levels = thinking_config.get("supported_levels", [])
+        if not isinstance(supported_levels, list):
+            return []
+
+        return [
+            str(level).lower()
+            for level in supported_levels
+            if isinstance(level, str) and level
+        ]
+
+    @staticmethod
+    def _get_thinking_level_enum(level: str) -> types.ThinkingLevel | None:
+        enum_name = level.upper()
+        if enum_name in types.ThinkingLevel.__members__:
+            return types.ThinkingLevel[enum_name]
+        return None
+
+    @classmethod
+    def _apply_thinking_level(
+        cls,
+        thinking_conf: types.ThinkingConfig,
+        requested_level: str,
+        supported_levels: list[str],
+        source: str,
+    ) -> bool:
+        level = requested_level.strip().lower()
+        if supported_levels and level not in supported_levels:
+            log.warning(
+                f"Requested thinking level '{requested_level}' from {source} is not supported "
+                f"by this model. Supported levels: {supported_levels}. Keeping model default."
+            )
+            return False
+
+        thinking_level = cls._get_thinking_level_enum(level)
+        if thinking_level is None:
+            log.warning(
+                f"Requested thinking level '{requested_level}' from {source} is not supported "
+                "by the installed google-genai SDK. Keeping model default."
+            )
+            return False
+
+        log.info(f"Setting thinking level from {source}: {level}.")
+        thinking_conf.thinking_level = thinking_level
+        thinking_conf.thinking_budget = None
+        return True
+
+    @staticmethod
+    def _get_model_image_config(model_entry: dict[str, Any]) -> dict[str, Any]:
+        image_config = model_entry.get("image_config", {})
+        return image_config if isinstance(image_config, dict) else {}
+
+    @staticmethod
+    def _is_image_option_supported(
+        model_id: str,
+        option_name: str,
+        option_value: str,
+        supported_values: Any,
+    ) -> bool:
+        if not isinstance(supported_values, list) or not supported_values:
+            return True
+
+        if option_value in supported_values:
+            return True
+
+        log.warning(
+            f"Skipping image {option_name} '{option_value}' for model '{model_id}' "
+            f"because supported values are: {supported_values}."
+        )
+        return False
+
     # endregion 2.2 Model retrival from Google API
 
     # region 2.3 GenerateContentConfig assembly
@@ -3651,24 +3771,45 @@ class Pipe:
         thinking_conf = None
         # We are ensured to have a valid model ID at this point.
         model_id: str = __metadata__.get("canonical_model_id", "")
+        model_entry = self._get_model_entry(model_id, config)
         is_thinking_model = False
-        if model_id in config:
-            is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
+        if model_entry:
+            is_thinking_model = model_entry.get("capabilities", {}).get("thinking", False)
 
         log.debug(
             f"Model '{model_id}' is classified as a reasoning model: {bool(is_thinking_model)}. "
         )
 
         if is_thinking_model:
-            # Start with the default thinking configuration from valves.
-            log.info(
-                f"Setting thinking config defaults: budget={valves.THINKING_BUDGET}, "
-                f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
-            )
+            thinking_spec = model_entry.get("thinking_config", {})
+            if not isinstance(thinking_spec, dict):
+                thinking_spec = {}
+
+            thinking_mode = thinking_spec.get("mode", "budget")
+            supported_levels = self._get_supported_thinking_levels(model_entry)
             thinking_conf = types.ThinkingConfig(
-                thinking_budget=valves.THINKING_BUDGET,
                 include_thoughts=valves.SHOW_THINKING_SUMMARY,
             )
+
+            if thinking_mode == "level":
+                log.info(
+                    f"Setting thinking config defaults: level={valves.THINKING_LEVEL}, "
+                    f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
+                )
+                if valves.THINKING_LEVEL != "model_default":
+                    self._apply_thinking_level(
+                        thinking_conf,
+                        valves.THINKING_LEVEL,
+                        supported_levels,
+                        "THINKING_LEVEL valve",
+                    )
+            else:
+                # Start with the default thinking configuration from valves.
+                log.info(
+                    f"Setting thinking config defaults: budget={valves.THINKING_BUDGET}, "
+                    f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
+                )
+                thinking_conf.thinking_budget = valves.THINKING_BUDGET
 
             # Override defaults with custom 'reasoning_effort' parameter if present.
             merged_params = __metadata__.get("merged_custom_params", {})
@@ -3680,28 +3821,28 @@ class Pipe:
                 try:
                     # Attempt to parse as a number (for thinking_budget).
                     budget = round(float(reasoning_effort))
-                    log.info(
-                        f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
-                    )
-                    thinking_conf.thinking_budget = budget
-                    thinking_conf.thinking_level = (
-                        None  # Budget and level are mutually exclusive.
-                    )
+                    if thinking_mode == "level":
+                        log.warning(
+                            f"Ignoring numeric `reasoning_effort` value '{reasoning_effort}' "
+                            f"for model '{model_id}' because it uses level-based thinking."
+                        )
+                    else:
+                        log.info(
+                            f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
+                        )
+                        thinking_conf.thinking_budget = budget
+                        thinking_conf.thinking_level = (
+                            None  # Budget and level are mutually exclusive.
+                        )
                 except (ValueError, TypeError):
                     # If it's not a number, treat it as a thinking_level string.
                     if isinstance(reasoning_effort, str):
-                        effort_level_str = reasoning_effort.upper()
-                        if effort_level_str in types.ThinkingLevel.__members__:
-                            log.info(
-                                f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
-                            )
-                            thinking_conf.thinking_level = types.ThinkingLevel[
-                                effort_level_str
-                            ]
-                            thinking_conf.thinking_budget = (
-                                None  # Budget and level are mutually exclusive.
-                            )
-                        else:
+                        if not self._apply_thinking_level(
+                            thinking_conf,
+                            reasoning_effort,
+                            supported_levels,
+                            "`reasoning_effort`",
+                        ):
                             log.warning(
                                 f"Invalid `reasoning_effort` string value: '{reasoning_effort}'. "
                                 f"Valid values are {list(types.ThinkingLevel.__members__.keys())}. "
@@ -3721,14 +3862,32 @@ class Pipe:
                 # This toggle is only applicable to flash/lite models, which support a budget of 0.
                 is_reasoning_toggleable = "flash" in model_id or "lite" in model_id
                 if is_reasoning_toggleable:
-                    log.info(
-                        f"Model '{model_id}' supports disabling reasoning, and it is toggled OFF in the UI. "
-                        "Overwriting `thinking_budget` to 0 to disable reasoning."
-                    )
-                    thinking_conf.thinking_budget = 0
-                    thinking_conf.thinking_level = (
-                        None  # Ensure level is cleared when budget is forced to 0.
-                    )
+                    if thinking_mode == "level":
+                        if "minimal" in supported_levels:
+                            log.info(
+                                f"Model '{model_id}' uses level-based thinking and reasoning is toggled OFF. "
+                                "Using minimal thinking level."
+                            )
+                            self._apply_thinking_level(
+                                thinking_conf,
+                                "minimal",
+                                supported_levels,
+                                "reasoning toggle",
+                            )
+                        else:
+                            log.warning(
+                                f"Reasoning toggle is OFF, but model '{model_id}' does not support a known "
+                                "disable or minimal-thinking setting. Keeping model default."
+                            )
+                    else:
+                        log.info(
+                            f"Model '{model_id}' supports disabling reasoning, and it is toggled OFF in the UI. "
+                            "Overwriting `thinking_budget` to 0 to disable reasoning."
+                        )
+                        thinking_conf.thinking_budget = 0
+                        thinking_conf.thinking_level = (
+                            None  # Ensure level is cleared when budget is forced to 0.
+                        )
 
         # TODO: Take defaults from the general front-end config.
         # system_instruction is intentionally left unset here. It will be set by the caller.
@@ -3750,16 +3909,32 @@ class Pipe:
             return gen_content_conf
 
         if self._is_image_model(model_id, config):
-            gen_content_conf.response_modalities.append("IMAGE")
-            if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
+            if valves.IMAGE_OUTPUT_FORMAT == "Images only":
+                gen_content_conf.response_modalities = ["IMAGE"]
+            else:
+                gen_content_conf.response_modalities = ["TEXT", "IMAGE"]
+
+            image_config = self._get_model_image_config(model_entry)
+            supported_resolutions = image_config.get("supported_resolutions", [])
+            supported_aspect_ratios = image_config.get("supported_aspect_ratios", [])
+
+            if valves.IMAGE_RESOLUTION and self._is_image_option_supported(
+                model_id,
+                "resolution",
+                valves.IMAGE_RESOLUTION,
+                supported_resolutions,
+            ):
                 log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
                 if not gen_content_conf.image_config:
                     gen_content_conf.image_config = types.ImageConfig()
                 gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
 
-            if (
-                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
-            ) and valves.IMAGE_ASPECT_RATIO:
+            if valves.IMAGE_ASPECT_RATIO and self._is_image_option_supported(
+                model_id,
+                "aspect ratio",
+                valves.IMAGE_ASPECT_RATIO,
+                supported_aspect_ratios,
+            ):
                 log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
                 if not gen_content_conf.image_config:
                     gen_content_conf.image_config = types.ImageConfig()
@@ -3987,15 +4162,14 @@ class Pipe:
         is_streaming_request = body.get("stream", True)
         use_streaming_api = is_streaming_request
 
-        # If a high-resolution image is requested with the gemini-3-pro-image model,
+        # If a high-resolution image is requested with an image generation model,
         # the Google GenAI SDK's streaming method often raises a "chunk too big" error
         # during the transfer of the generated image bytes. We avoid this by forcing
         # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
         if (
             use_streaming_api
             and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            # FIXME: Nano Banana 2 supports resolutions too now.
-            and "gemini-3-pro-image" in model_id
+            and self._is_image_model(model_id, model_config)
         ):
             log.info(
                 f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "

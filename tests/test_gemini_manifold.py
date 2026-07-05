@@ -659,6 +659,153 @@ async def test_paid_api_toggle_selects_correct_key(
 # endregion Test _get_genai_models
 
 
+# region Test GenerateContentConfig assembly
+@pytest.mark.asyncio
+async def test_build_config_level_thinking_model_does_not_send_dynamic_budget(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    model_id = "gemini-3.1-flash-image"
+    pipe.valves.THINKING_BUDGET = -1
+    pipe.valves.THINKING_LEVEL = "model_default"
+    pipe.valves.IMAGE_RESOLUTION = "512"
+    pipe.valves.IMAGE_ASPECT_RATIO = "1:4"
+
+    model_config = {
+        model_id: {
+            "capabilities": {"thinking": True, "image_generation": True},
+            "thinking_config": {
+                "mode": "level",
+                "default_level": "minimal",
+                "supported_levels": ["minimal", "high"],
+            },
+            "image_config": {
+                "supported_resolutions": ["512", "1K", "2K", "4K"],
+                "supported_aspect_ratios": ["1:1", "1:4", "16:9"],
+            },
+        }
+    }
+    metadata = {
+        "canonical_model_id": model_id,
+        "features": {},
+        "merged_custom_params": {},
+    }
+
+    with patch.object(
+        pipe,
+        "_get_toggleable_feature_status",
+        AsyncMock(return_value=(False, False)),
+    ):
+        config = await pipe._build_gen_content_config(
+            body={},
+            __metadata__=metadata,
+            valves=pipe.valves,
+            config=model_config,
+        )
+
+    assert config.response_modalities == ["TEXT", "IMAGE"]
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget is None
+    assert config.thinking_config.thinking_level is None
+    assert config.image_config is not None
+    assert config.image_config.image_size == "512"
+    assert config.image_config.aspect_ratio == "1:4"
+
+
+@pytest.mark.asyncio
+async def test_build_config_image_only_and_thinking_level_for_lite_image_model(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    model_id = "gemini-3.1-flash-lite-image"
+    pipe.valves.IMAGE_OUTPUT_FORMAT = "Images only"
+    pipe.valves.THINKING_LEVEL = "high"
+    pipe.valves.THINKING_BUDGET = 8192
+    pipe.valves.IMAGE_RESOLUTION = "4K"
+    pipe.valves.IMAGE_ASPECT_RATIO = "16:9"
+
+    model_config = {
+        model_id: {
+            "capabilities": {"thinking": True, "image_generation": True},
+            "thinking_config": {
+                "mode": "level",
+                "default_level": "minimal",
+                "supported_levels": ["minimal", "high"],
+            },
+            "image_config": {
+                "supported_resolutions": ["1K"],
+                "supported_aspect_ratios": ["1:1", "16:9"],
+            },
+        }
+    }
+    metadata = {
+        "canonical_model_id": model_id,
+        "features": {},
+        "merged_custom_params": {},
+    }
+
+    with patch.object(
+        pipe,
+        "_get_toggleable_feature_status",
+        AsyncMock(return_value=(False, False)),
+    ):
+        config = await pipe._build_gen_content_config(
+            body={},
+            __metadata__=metadata,
+            valves=pipe.valves,
+            config=model_config,
+        )
+
+    assert config.response_modalities == ["IMAGE"]
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget is None
+    assert config.thinking_config.thinking_level == gemini_types.ThinkingLevel.HIGH
+    assert config.image_config is not None
+    assert config.image_config.image_size is None
+    assert config.image_config.aspect_ratio == "16:9"
+
+
+@pytest.mark.asyncio
+async def test_build_config_budget_thinking_model_keeps_budget_path(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    model_id = "gemini-2.5-flash"
+    pipe.valves.THINKING_BUDGET = -1
+    pipe.valves.THINKING_LEVEL = "high"
+
+    model_config = {
+        model_id: {
+            "capabilities": {"thinking": True, "image_generation": False},
+        }
+    }
+    metadata = {
+        "canonical_model_id": model_id,
+        "features": {},
+        "merged_custom_params": {},
+    }
+
+    with patch.object(
+        pipe,
+        "_get_toggleable_feature_status",
+        AsyncMock(return_value=(False, False)),
+    ):
+        config = await pipe._build_gen_content_config(
+            body={},
+            __metadata__=metadata,
+            valves=pipe.valves,
+            config=model_config,
+        )
+
+    assert config.response_modalities == ["TEXT"]
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget == -1
+    assert config.thinking_config.thinking_level is None
+
+
+# endregion Test GenerateContentConfig assembly
+
+
 # region Test GeminiContentBuilder
 @pytest.mark.asyncio
 async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):

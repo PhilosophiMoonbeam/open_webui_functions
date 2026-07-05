@@ -29,6 +29,10 @@ gemini-3.5-flash:
     structured_outputs: true
     thinking: true
     url_context: true
+  thinking_config:
+    mode: level
+    default_level: medium
+    supported_levels: [minimal, low, medium, high]
   pricing:
     free_tier: true
     excluded_features: [search_grounding, grounding_google_maps]
@@ -65,6 +69,10 @@ gemini-3.1-flash-lite:
     structured_outputs: true
     thinking: true
     url_context: true
+  thinking_config:
+    mode: level
+    default_level: minimal
+    supported_levels: [minimal, low, medium, high]
   pricing:
     free_tier: true
     excluded_features: [search_grounding]
@@ -113,6 +121,88 @@ gemini-3.1-flash-lite-preview:
     caching:
       - up_to_tokens: null
         price_per_million: 0.025
+gemini-3.1-flash-lite-image:
+  description: "Nano Banana Lite is an ultra-low latency, cost-effective image generation and editing model optimized for high-volume interactive use cases."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-06"
+  supported_data_types:
+    inputs: [Text, Image]
+    outputs: [Text, Image]
+  tokens:
+    input: 65536
+    output: 4096
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: true
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: false
+    structured_outputs: false
+    thinking: true
+    url_context: false
+  thinking_config:
+    mode: level
+    default_level: minimal
+    supported_levels: [minimal, high]
+  image_config:
+    supported_resolutions: ["1K"]
+    supported_aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.25
+    output:
+      - up_to_tokens: null
+        price_per_million: 1.50
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 30.00
+gemini-3.1-flash-image:
+  description: "Nano Banana 2 provides high-quality image generation and conversational editing at a mainstream price point and low latency."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2026-02"
+  supported_data_types:
+    inputs: [Text, Image, PDF]
+    outputs: [Text, Image]
+  tokens:
+    input: 131072
+    output: 32768
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: false
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: true
+    structured_outputs: false
+    thinking: true
+    url_context: false
+  thinking_config:
+    mode: level
+    default_level: minimal
+    supported_levels: [minimal, high]
+  image_config:
+    supported_resolutions: ["512", "1K", "2K", "4K"]
+    supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 0.50
+    output:
+      - up_to_tokens: null
+        price_per_million: 3.00
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 60.00
 gemini-3.1-flash-image-preview:
   description: "Designed for speed and efficiency, the Gemini 3.1 Flash Image generation model is effective for quick, interactive responses and high throughput."
   knowledge_cutoff: "2025-01"
@@ -137,13 +227,20 @@ gemini-3.1-flash-image-preview:
     structured_outputs: false
     thinking: true
     url_context: false
+  thinking_config:
+    mode: level
+    default_level: minimal
+    supported_levels: [minimal, high]
+  image_config:
+    supported_resolutions: ["512", "1K", "2K", "4K"]
+    supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
-        price_per_million: 0.25
+        price_per_million: 0.50
     output:
       - up_to_tokens: null
-        price_per_million: 1.50
+        price_per_million: 3.00
     image_output:
       - up_to_tokens: null
         price_per_million: 60.00
@@ -171,6 +268,10 @@ gemini-3-flash-preview:
     structured_outputs: true
     thinking: true
     url_context: true
+  thinking_config:
+    mode: level
+    default_level: high
+    supported_levels: [minimal, low, medium, high]
   pricing:
     free_tier: true
     excluded_features: [search_grounding]
@@ -207,6 +308,10 @@ gemini-3-pro-preview:
     structured_outputs: true
     thinking: true
     url_context: true
+  thinking_config:
+    mode: level
+    default_level: high
+    supported_levels: [low, high]
   pricing:
     input:
       - up_to_tokens: 200000
@@ -248,6 +353,10 @@ gemini-3.1-pro-preview:
     structured_outputs: true
     thinking: true
     url_context: true
+  thinking_config:
+    mode: level
+    default_level: high
+    supported_levels: [low, medium, high]
   pricing:
     input:
       - up_to_tokens: 200000
@@ -306,6 +415,47 @@ gemini-3.1-pro-preview-customtools:
       - up_to_tokens: null
         price_per_million: 0.40
 
+gemini-3-pro-image:
+  description: "Nano Banana Pro is a reasoning-driven image generation and editing model for professional asset production, complex instructions, and grounded visual outputs."
+  knowledge_cutoff: "2025-01"
+  latest_update: "2025-11"
+  supported_data_types:
+    inputs: [Text, Image]
+    outputs: [Text, Image]
+  tokens:
+    input: 65536
+    output: 32768
+  capabilities:
+    audio_generation: false
+    batch_api: true
+    caching: false
+    code_execution: false
+    file_search: false
+    function_calling: false
+    grounding_google_maps: false
+    image_generation: true
+    live_api: false
+    search_grounding: true
+    structured_outputs: true
+    thinking: true
+    url_context: false
+  thinking_config:
+    mode: level
+    default_level: high
+    supported_levels: [low, high]
+  image_config:
+    supported_resolutions: ["1K", "2K", "4K"]
+    supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+  pricing:
+    input:
+      - up_to_tokens: null
+        price_per_million: 2.00
+    output:
+      - up_to_tokens: null
+        price_per_million: 12.00
+    image_output:
+      - up_to_tokens: null
+        price_per_million: 120.00
 gemini-3-pro-image-preview:
   description: "Image generation model. Designed for professional asset production and complex instructions. Features real-world grounding using Google Search and can generate images up to 4K resolution."
   knowledge_cutoff: "2025-01"
@@ -330,6 +480,13 @@ gemini-3-pro-image-preview:
     structured_outputs: true
     thinking: true
     url_context: false
+  thinking_config:
+    mode: level
+    default_level: high
+    supported_levels: [low, high]
+  image_config:
+    supported_resolutions: ["1K", "2K", "4K"]
+    supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null
@@ -439,6 +596,9 @@ gemini-2.5-flash-image:
     structured_outputs: true
     thinking: false
     url_context: false
+  image_config:
+    supported_resolutions: ["1K"]
+    supported_aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
   pricing:
     input:
       - up_to_tokens: null

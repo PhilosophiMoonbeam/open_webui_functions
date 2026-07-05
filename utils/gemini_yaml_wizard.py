@@ -89,7 +89,24 @@ def generate_yaml_entry(data):
     structured_outputs: {str(data['caps']['structured_outputs']).lower()}
     thinking: {str(data['caps']['thinking']).lower()}
     url_context: {str(data['caps']['url_context']).lower()}
-{pricing_section}"""
+"""
+
+    if data.get('thinking_config'):
+        thinking_config = data['thinking_config']
+        entry += f"""  thinking_config:
+    mode: {thinking_config['mode']}
+    default_level: {thinking_config['default_level']}
+    supported_levels: {format_list(thinking_config['supported_levels'])}
+"""
+
+    if data.get('image_config'):
+        image_config = data['image_config']
+        entry += f"""  image_config:
+    supported_resolutions: {format_list(image_config['supported_resolutions'])}
+    supported_aspect_ratios: {format_list(image_config['supported_aspect_ratios'])}
+"""
+
+    entry += pricing_section
 
     if data['pricing'].get('caching'):
         entry += f"""
@@ -142,6 +159,35 @@ def main():
         "url_context": get_bool_input("URL Context", False),
     }
 
+    thinking_config = None
+    if caps['thinking']:
+        if get_bool_input("Use level-based thinking config", False):
+            supported_levels = get_list_input(
+                "Supported Thinking Levels",
+                ["minimal", "low", "medium", "high"],
+            )
+            default_level = get_input("Default Thinking Level", default=supported_levels[0])
+            thinking_config = {
+                "mode": "level",
+                "default_level": default_level,
+                "supported_levels": supported_levels,
+            }
+
+    image_config = None
+    if caps['image_generation']:
+        supported_resolutions = get_list_input(
+            "Supported Image Resolutions",
+            ["1K"],
+        )
+        supported_aspect_ratios = get_list_input(
+            "Supported Image Aspect Ratios",
+            ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+        )
+        image_config = {
+            "supported_resolutions": supported_resolutions,
+            "supported_aspect_ratios": supported_aspect_ratios,
+        }
+
     print("\n--- Pricing ---")
     free_tier = get_bool_input("Free Tier Available", True)
     excluded_features = []
@@ -184,6 +230,8 @@ def main():
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "caps": caps,
+        "thinking_config": thinking_config,
+        "image_config": image_config,
         "pricing": pricing
     }
 

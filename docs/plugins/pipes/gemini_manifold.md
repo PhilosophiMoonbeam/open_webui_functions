@@ -14,6 +14,7 @@ Here's a breakdown of implemented and planned features for the Gemini Manifold p
 
 -   [x] Display thinking summary
 -   [x] Thinking budget
+-   [x] Thinking level for Gemini models that use level-based controls
 -   [x] Reasoning toggle (Reason filter function required, see [it's doc](../filters/gemini_reasoning_toggle.md))
 -   [x] Native image generation and editing (image output)
 -   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see [it's doc](../filters/gemini_manifold_companion.md))
@@ -45,6 +46,18 @@ To install this plugin, navigate to the [Open WebUI Community page for Gemini Ma
 ## Configuration
 
 After installation, click the gear icon next to the `gemini_manifold_google_genai` function within Open WebUI. At a minimum, you must enter your Google Gemini API key. Other configurable options are also available on that settings page.
+
+### Thinking controls
+
+Gemini model families do not all use the same thinking control. Budget-based models use `THINKING_BUDGET`, including `-1` for API-managed dynamic thinking. Models marked with `thinking_config.mode: level` in `gemini_models.yaml` use `THINKING_LEVEL` instead. For those level-based models, the pipe does not send `THINKING_BUDGET`, so a global budget such as `-1` will not interfere with models that expect values like `minimal` or `high`.
+
+The optional `reasoning_effort` custom parameter can still override the configured default. Numeric values are treated as budgets only for budget-based models. String values such as `minimal`, `low`, `medium`, or `high` are treated as thinking levels when the target model supports them.
+
+### Image generation controls
+
+Image generation models use `IMAGE_OUTPUT_FORMAT` to request either `Images & Text` or `Images only`. The pipe maps this to Gemini `response_modalities` as `["TEXT", "IMAGE"]` or `["IMAGE"]`.
+
+`IMAGE_RESOLUTION` and `IMAGE_ASPECT_RATIO` are checked against each model's `image_config` entry in `gemini_models.yaml`. Unsupported values are skipped for that model instead of being sent to Gemini. Current Gemini 3.1 Flash Image entries support `512`, `1K`, `2K`, and `4K`, while Gemini 3.1 Flash Lite Image is limited to `1K`.
 
 ### PDF limit mitigation
 
