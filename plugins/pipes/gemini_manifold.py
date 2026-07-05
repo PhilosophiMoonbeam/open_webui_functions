@@ -3824,11 +3824,7 @@ class Pipe:
         model_id: str,
         model_config: dict,
     ) -> bool:
-        return (
-            use_streaming_api
-            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            and Pipe._is_image_model(model_id, model_config)
-        )
+        return use_streaming_api and Pipe._is_image_model(model_id, model_config)
 
     # endregion 2.2 Model retrival from Google API
 
@@ -4288,15 +4284,14 @@ class Pipe:
         is_streaming_request = body.get("stream", True)
         use_streaming_api = is_streaming_request
 
-        # If a high-resolution image is requested with an image generation model,
-        # the Google GenAI SDK's streaming method often raises a "chunk too big" error
-        # during the transfer of the generated image bytes. We avoid this by forcing
-        # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
+        # The Google GenAI SDK's streaming method can raise "chunk too big" while
+        # reading generated image bytes. Avoid the transport limit by using a
+        # non-streaming SDK call, while still yielding the result as a stream to OWUI.
         if self._should_force_non_streaming_for_image_generation(
             use_streaming_api, valves, model_id, model_config
         ):
             log.info(
-                f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
+                "Forcing non-streaming SDK call for image generation "
                 "to avoid GenAI SDK 'chunk too big' errors."
             )
             use_streaming_api = False

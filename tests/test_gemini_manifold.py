@@ -904,9 +904,9 @@ async def test_build_config_budget_thinking_model_keeps_budget_path(
     assert config.thinking_config.thinking_level is None
 
 
-def test_high_resolution_image_generation_forces_non_streaming(pipe_instance_fixture):
+def test_image_generation_forces_non_streaming(pipe_instance_fixture):
     pipe, _ = pipe_instance_fixture
-    pipe.valves.IMAGE_RESOLUTION = "2K"
+    pipe.valves.IMAGE_RESOLUTION = "1K"
     model_id = "gemini-3.1-flash-image"
     model_config = {
         model_id: {
@@ -927,11 +927,14 @@ def test_high_resolution_image_generation_forces_non_streaming(pipe_instance_fix
         model_config=model_config,
     )
 
-    pipe.valves.IMAGE_RESOLUTION = "1K"
+    text_model_id = "gemini-3.1-flash"
+    model_config[text_model_id] = {
+        "capabilities": {"image_generation": False},
+    }
     assert not pipe._should_force_non_streaming_for_image_generation(
         use_streaming_api=True,
         valves=pipe.valves,
-        model_id=model_id,
+        model_id=text_model_id,
         model_config=model_config,
     )
 
