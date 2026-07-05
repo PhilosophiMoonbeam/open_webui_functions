@@ -1,11 +1,13 @@
 from typing import cast
 from aiocache.base import BaseCache
+from pathlib import Path
 import pytest
 import pytest_asyncio
 from unittest.mock import patch, MagicMock, AsyncMock, call, ANY
 import sys
 import asyncio
 import io
+import yaml
 
 # --- Mock problematic Open WebUI modules BEFORE they are imported by your plugin ---
 mock_chats_module = MagicMock()
@@ -70,6 +72,14 @@ USER_GEMINI_BASE_URL = "https://user.specific.gemini.api.com"
 USER_VERTEX_PROJECT = "user_specific_vertex_project"
 USER_VERTEX_LOCATION = "user_specific_vertex_location"
 # endregion Test Constants
+
+
+def test_gemini_models_yaml_omits_promoted_flash_image_preview():
+    config_path = Path(__file__).resolve().parents[1] / "plugins/pipes/gemini_models.yaml"
+    model_config = yaml.safe_load(config_path.read_text())
+
+    assert "gemini-3.1-flash-image" in model_config
+    assert "gemini-3.1-flash-image-preview" not in model_config
 
 
 # region Fixtures
@@ -669,7 +679,7 @@ async def test_build_config_level_thinking_model_does_not_send_dynamic_budget(
     pipe.valves.THINKING_BUDGET = -1
     pipe.valves.THINKING_LEVEL = "model_default"
     pipe.valves.IMAGE_RESOLUTION = "512"
-    pipe.valves.IMAGE_ASPECT_RATIO = "1:4"
+    pipe.valves.IMAGE_ASPECT_RATIO = "4:5"
 
     model_config = {
         model_id: {
@@ -681,7 +691,7 @@ async def test_build_config_level_thinking_model_does_not_send_dynamic_budget(
             },
             "image_config": {
                 "supported_resolutions": ["512", "1K", "2K", "4K"],
-                "supported_aspect_ratios": ["1:1", "1:4", "16:9"],
+                "supported_aspect_ratios": ["1:1", "4:5", "16:9"],
             },
         }
     }
@@ -709,7 +719,15 @@ async def test_build_config_level_thinking_model_does_not_send_dynamic_budget(
     assert config.thinking_config.thinking_level is None
     assert config.image_config is not None
     assert config.image_config.image_size == "512"
-    assert config.image_config.aspect_ratio == "1:4"
+    assert config.image_config.aspect_ratio == "4:5"
+    assert metadata["image_generation_config_status"] == (
+        "Requesting image output with aspect ratio 4:5 and resolution 512."
+    )
+
+    json_dump = config.model_dump(exclude_none=True, mode="json", by_alias=True)
+    assert json_dump["responseModalities"] == ["TEXT", "IMAGE"]
+    assert json_dump["imageConfig"]["imageSize"] == "512"
+    assert json_dump["imageConfig"]["aspectRatio"] == "4:5"
 
 
 @pytest.mark.asyncio

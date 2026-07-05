@@ -203,47 +203,6 @@ gemini-3.1-flash-image:
     image_output:
       - up_to_tokens: null
         price_per_million: 60.00
-gemini-3.1-flash-image-preview:
-  description: "Designed for speed and efficiency, the Gemini 3.1 Flash Image generation model is effective for quick, interactive responses and high throughput."
-  knowledge_cutoff: "2025-01"
-  latest_update: "2026-02"
-  supported_data_types:
-    inputs: [Text, Image, PDF]
-    outputs: [Text, Image]
-  tokens:
-    input: 131072
-    output: 32768
-  capabilities:
-    audio_generation: false
-    batch_api: true
-    caching: false
-    code_execution: false
-    file_search: false
-    function_calling: false
-    grounding_google_maps: false
-    image_generation: true
-    live_api: false
-    search_grounding: true
-    structured_outputs: false
-    thinking: true
-    url_context: false
-  thinking_config:
-    mode: level
-    default_level: minimal
-    supported_levels: [minimal, high]
-  image_config:
-    supported_resolutions: ["512", "1K", "2K", "4K"]
-    supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
-  pricing:
-    input:
-      - up_to_tokens: null
-        price_per_million: 0.50
-    output:
-      - up_to_tokens: null
-        price_per_million: 3.00
-    image_output:
-      - up_to_tokens: null
-        price_per_million: 60.00
 gemini-3-flash-preview:
   description: "Our most intelligent model built for speed, combining frontier intelligence with superior search and grounding."
   knowledge_cutoff: "2025-01"

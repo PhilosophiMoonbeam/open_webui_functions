@@ -3845,6 +3845,7 @@ class Pipe:
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
         __metadata__.pop("image_aspect_ratio_fallback_status", None)
+        __metadata__.pop("image_generation_config_status", None)
 
         log.debug(
             "Features extracted from metadata (UI toggles and config):",
@@ -4033,6 +4034,26 @@ class Pipe:
                 if not gen_content_conf.image_config:
                     gen_content_conf.image_config = types.ImageConfig()
                 gen_content_conf.image_config.aspect_ratio = aspect_ratio
+
+            if gen_content_conf.image_config:
+                image_config_status_parts = []
+                if gen_content_conf.image_config.aspect_ratio:
+                    image_config_status_parts.append(
+                        f"aspect ratio {gen_content_conf.image_config.aspect_ratio}"
+                    )
+                if gen_content_conf.image_config.image_size:
+                    image_config_status_parts.append(
+                        f"resolution {gen_content_conf.image_config.image_size}"
+                    )
+                if image_config_status_parts:
+                    image_config_status = (
+                        "Requesting image output with "
+                        f"{' and '.join(image_config_status_parts)}."
+                    )
+                    log.info(image_config_status)
+                    __metadata__["image_generation_config_status"] = (
+                        image_config_status
+                    )
 
         gen_content_conf.tools = []
 
@@ -4234,6 +4255,11 @@ class Pipe:
             None,
         ):
             event_emitter.emit_status(fallback_status)
+        if image_config_status := __metadata__.pop(
+            "image_generation_config_status",
+            None,
+        ):
+            event_emitter.emit_status(image_config_status)
 
         model_id = __metadata__.get("canonical_model_id", "")
 
