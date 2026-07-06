@@ -29,8 +29,6 @@ RECOMMENDED_COMPANION_VERSION = "2.1.0"
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
-from google.cloud import storage
-from google.api_core import exceptions
 
 import time
 import copy
@@ -981,6 +979,76 @@ class FilesAPIManager:
 
         return (expiration_time - now_utc).total_seconds()
 
+    @staticmethod
+    def _is_already_exists_error(error: Exception) -> bool:
+        if not isinstance(error, genai_errors.ClientError):
+            return False
+        return error.code == 409 or getattr(error, "status", "") == "ALREADY_EXISTS"
+
+    async def _cache_active_file(
+        self, content_hash: str, active_file: types.File
+    ) -> None:
+        ttl_seconds = self._calculate_ttl(active_file.expiration_time)
+        file_cache_key = self._get_file_cache_key(content_hash)
+        await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
+        log.debug(
+            f"Cached file object for hash {content_hash} with TTL: {ttl_seconds}s."
+        )
+
+    async def _recover_after_upload_conflict(
+        self,
+        content_hash: str,
+        deterministic_name: str,
+        owui_file_id: str | None,
+        *,
+        attempts: int = 5,
+        retry_delay: float = 0.5,
+    ) -> types.File:
+        """
+        Recover when deterministic create reports ALREADY_EXISTS.
+
+        The Files API can reject create with 409 for a deterministic name even
+        after the preceding stateless GET did not return the file. Treat the
+        conflict as an idempotent success path by fetching the existing object,
+        allowing a short retry window for service-side consistency.
+        """
+        log.info(
+            f"Upload conflict for {deterministic_name}; attempting to reuse existing file."
+        )
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                file = await self.client.aio.files.get(name=deterministic_name)
+                if not file.name:
+                    raise FilesAPIError(
+                        f"Conflict recovery for {deterministic_name} returned a file without a name."
+                    )
+
+                if file.state == types.FileState.ACTIVE:
+                    active_file = file
+                else:
+                    active_file = await self._poll_for_active_state(
+                        file.name, owui_file_id
+                    )
+
+                await self._cache_active_file(content_hash, active_file)
+                return active_file
+            except FilesAPIError:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt == attempts:
+                    break
+                log.debug(
+                    f"Conflict recovery GET for {deterministic_name} failed "
+                    f"on attempt {attempt}/{attempts}; retrying."
+                )
+                await asyncio.sleep(retry_delay)
+
+        raise FilesAPIError(
+            f"Upload conflict recovery failed for {deterministic_name}: {last_error}"
+        ) from last_error
+
     async def _upload_and_process_file(
         self,
         content_hash: str,
@@ -1030,15 +1098,20 @@ class FilesAPIManager:
                 )
                 log.debug(f"File {active_file.name} is now ACTIVE.")
 
-            # Calculate TTL and set in the main file cache using the content hash as the key.
-            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            file_cache_key = self._get_file_cache_key(content_hash)
-            await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
-            log.debug(
-                f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
-            )
+            await self._cache_active_file(content_hash, active_file)
 
             return active_file
+        except genai_errors.ClientError as e:
+            if self._is_already_exists_error(e):
+                return await self._recover_after_upload_conflict(
+                    content_hash, deterministic_name, owui_file_id
+                )
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            self.event_emitter.emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
             self.event_emitter.emit_toast(
@@ -1098,14 +1171,20 @@ class FilesAPIManager:
                 )
                 log.debug(f"File {active_file.name} is now ACTIVE.")
 
-            ttl_seconds = self._calculate_ttl(active_file.expiration_time)
-            file_cache_key = self._get_file_cache_key(content_hash)
-            await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
-            log.debug(
-                f"Cached new file object for hash {content_hash} with TTL: {ttl_seconds}s."
-            )
+            await self._cache_active_file(content_hash, active_file)
 
             return active_file
+        except genai_errors.ClientError as e:
+            if self._is_already_exists_error(e):
+                return await self._recover_after_upload_conflict(
+                    content_hash, deterministic_name, owui_file_id
+                )
+            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            self.event_emitter.emit_toast(
+                "Upload failed for a file. Please check connection and try again.",
+                "error",
+            )
+            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
         except Exception as e:
             log.exception(f"File upload or processing failed for {deterministic_name}.")
             self.event_emitter.emit_toast(
@@ -2408,9 +2487,11 @@ class GeminiContentBuilder:
     @staticmethod
     async def _get_file_source(file_id: str) -> LocalFileSource | None:
         """
-        Retrieves file metadata and returns a path when Open WebUI stores the
-        file locally. GCS-backed files are downloaded to a temp file so large
-        PDFs can still be processed without keeping duplicate chunk bytes.
+        Retrieves file metadata and resolves it through Open WebUI storage.
+
+        Open WebUI stores provider-specific paths in the database. Use
+        Storage.get_file() just like the Files API content route, so local, S3,
+        GCS, and Azure storage all resolve to a readable local path.
         """
         if not file_id:
             log.warning("file_id is empty. Cannot continue.")
@@ -2444,44 +2525,11 @@ class GeminiContentBuilder:
             )
             return None
 
-        if file_path.startswith("gs://"):
-            try:
-                if len(file_path.split("/", 3)) < 4:
-                    raise ValueError(
-                        f"Invalid GCS path: '{file_path}'. "
-                        "Path must be in the format 'gs://bucket-name/object-name'."
-                    )
-
-                storage_client = storage.Client()
-                bucket_name, blob_name = file_path.removeprefix("gs://").split("/", 1)
-                bucket = storage_client.bucket(bucket_name)
-                blob = bucket.blob(blob_name)
-
-                suffix = mimetypes.guess_extension(content_type) or ".bin"
-                fd, temp_path = tempfile.mkstemp(
-                    prefix=f"owui-{file_id}-",
-                    suffix=suffix,
-                    dir=tempfile.gettempdir(),
-                )
-                os.close(fd)
-                await asyncio.to_thread(blob.download_to_filename, temp_path)
-                return LocalFileSource(
-                    file_bytes=None,
-                    file_path=temp_path,
-                    mime_type=content_type,
-                    is_temp=True,
-                )
-            except exceptions.NotFound:
-                log.exception(f"GCS object not found at {file_path}")
-                raise
-            except Exception:
-                log.exception(f"An error occurred while reading from GCS: {file_path}")
-                raise
-
-        if os.path.exists(file_path):
+        resolved_path = await GeminiContentBuilder._resolve_owui_storage_path(file_path)
+        if resolved_path:
             return LocalFileSource(
                 file_bytes=None,
-                file_path=file_path,
+                file_path=resolved_path,
                 mime_type=content_type,
             )
 
@@ -2489,9 +2537,24 @@ class GeminiContentBuilder:
         return LocalFileSource(file_bytes=None, file_path=None, mime_type=content_type)
 
     @staticmethod
+    async def _resolve_owui_storage_path(file_path: str) -> str | None:
+        if os.path.exists(file_path):
+            return file_path
+
+        try:
+            resolved_path = await asyncio.to_thread(Storage.get_file, file_path)
+        except Exception:
+            log.exception(f"Open WebUI storage failed to resolve file path: {file_path}")
+            return None
+
+        if resolved_path and os.path.exists(resolved_path):
+            return resolved_path
+        return None
+
+    @staticmethod
     async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
         """
-        Asynchronously retrieves file metadata from the database and its content from disk.
+        Asynchronously retrieves file metadata from the database and its content.
         """
         # TODO: Emit toasts on unexpected conditions.
         if not file_id:
@@ -2529,43 +2592,20 @@ class GeminiContentBuilder:
             )
             return None, None
 
-        if file_path.startswith("gs://"):
-            try:
-                # Initialize the GCS client
-                storage_client = storage.Client()
+        resolved_path = await GeminiContentBuilder._resolve_owui_storage_path(file_path)
+        if not resolved_path:
+            log.warning(f"File {file_path} could not be resolved through Open WebUI storage.")
+            return None, content_type
 
-                # Parse the GCS path
-                # The path should be in the format "gs://bucket-name/object-name"
-                if len(file_path.split("/", 3)) < 4:
-                    raise ValueError(
-                        f"Invalid GCS path: '{file_path}'. "
-                        "Path must be in the format 'gs://bucket-name/object-name'."
-                    )
-
-                bucket_name, blob_name = file_path.removeprefix("gs://").split("/", 1)
-
-                # Get the bucket and blob (file object)
-                bucket = storage_client.bucket(bucket_name)
-                blob = bucket.blob(blob_name)
-
-                # Download the file's content as bytes
-                print(f"Reading from GCS: {file_path}")
-                return blob.download_as_bytes(), content_type
-            except exceptions.NotFound:
-                print(f"Error: GCS object not found at {file_path}")
-                raise
-            except Exception as e:
-                print(f"An error occurred while reading from GCS: {e}")
-                raise
         try:
-            async with aiofiles.open(file_path, "rb") as file:
+            async with aiofiles.open(resolved_path, "rb") as file:
                 file_data = await file.read()
             return file_data, content_type
         except FileNotFoundError:
-            log.exception(f"File {file_path} not found on disk.")
+            log.exception(f"File {resolved_path} not found on disk.")
             return None, content_type
         except Exception:
-            log.exception(f"Error processing file {file_path}")
+            log.exception(f"Error processing file {resolved_path}")
             return None, content_type
 
     @staticmethod

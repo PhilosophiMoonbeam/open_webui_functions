@@ -1,5 +1,7 @@
 from typing import cast
 from aiocache.base import BaseCache
+from aiocache.backends.memory import SimpleMemoryCache
+from aiocache.serializers import NullSerializer
 import pytest
 import pytest_asyncio
 from unittest.mock import patch, MagicMock, AsyncMock, call, ANY
@@ -37,6 +39,7 @@ sys.modules["open_webui.utils.misc"] = mock_misc_module
 
 from plugins.pipes.gemini_manifold import (
     Pipe,
+    FilesAPIManager,
     GeminiContentBuilder,
     GeminiPDFProcessor,
     PDFMitigationManager,
@@ -46,6 +49,7 @@ from plugins.pipes.gemini_manifold import (
     LocalFileSource,
     PDFProcessingError,
     ContentBuildError,
+    genai_errors,
     types as gemini_types,
 )  # gemini_types is google.genai.types
 from plugins.filters.gemini_manifold_companion import EventEmitter
@@ -659,7 +663,182 @@ async def test_paid_api_toggle_selects_correct_key(
 # endregion Test _get_genai_models
 
 
+# region Test FilesAPIManager
+def _client_error(code: int, status: str, message: str) -> genai_errors.ClientError:
+    return genai_errors.ClientError(
+        code,
+        {"error": {"code": code, "message": message, "status": status}},
+    )
+
+
+def _mock_files_client():
+    client = MagicMock()
+    client._api_client.api_key = "test-api-key"
+    client.vertexai = False
+    client.aio.files.get = AsyncMock()
+    client.aio.files.upload = AsyncMock()
+    return client
+
+
+@pytest.mark.asyncio
+async def test_files_api_manager_recovers_when_byte_upload_already_exists():
+    client = _mock_files_client()
+    existing_file = gemini_types.File(
+        name="files/owui-existing",
+        uri="https://generativelanguage.googleapis.com/v1beta/files/owui-existing",
+        mime_type="application/pdf",
+        state=gemini_types.FileState.ACTIVE,
+    )
+    client.aio.files.get.side_effect = [
+        _client_error(403, "PERMISSION_DENIED", "not found"),
+        existing_file,
+    ]
+    client.aio.files.upload.side_effect = _client_error(
+        409, "ALREADY_EXISTS", "owui-existing already exists."
+    )
+    event_emitter = MagicMock(spec=EventEmitter)
+    manager = FilesAPIManager(
+        client=client,
+        file_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        event_emitter=event_emitter,
+    )
+
+    result = await manager.get_or_upload_file(
+        file_bytes=b"%PDF duplicate",
+        mime_type="application/pdf",
+        owui_file_id="owui-file-id",
+    )
+
+    assert result is existing_file
+    assert client.aio.files.upload.await_count == 1
+    assert client.aio.files.get.await_count == 2
+    event_emitter.emit_toast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_files_api_manager_recovers_when_path_upload_already_exists(tmp_path):
+    client = _mock_files_client()
+    existing_file = gemini_types.File(
+        name="files/owui-existing-path",
+        uri="https://generativelanguage.googleapis.com/v1beta/files/owui-existing-path",
+        mime_type="application/pdf",
+        state=gemini_types.FileState.ACTIVE,
+    )
+    client.aio.files.get.side_effect = [
+        _client_error(404, "NOT_FOUND", "not found"),
+        existing_file,
+    ]
+    client.aio.files.upload.side_effect = _client_error(
+        409, "ALREADY_EXISTS", "owui-existing-path already exists."
+    )
+    pdf_path = tmp_path / "duplicate.pdf"
+    pdf_path.write_bytes(b"%PDF duplicate from path")
+    event_emitter = MagicMock(spec=EventEmitter)
+    manager = FilesAPIManager(
+        client=client,
+        file_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        event_emitter=event_emitter,
+    )
+
+    result = await manager.get_or_upload_file_from_path(
+        file_path=str(pdf_path),
+        mime_type="application/pdf",
+        owui_file_id="owui-file-id:path",
+    )
+
+    assert result is existing_file
+    assert client.aio.files.upload.await_count == 1
+    assert client.aio.files.get.await_count == 2
+    event_emitter.emit_toast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_files_api_manager_retries_upload_conflict_recovery_get():
+    client = _mock_files_client()
+    existing_file = gemini_types.File(
+        name="files/owui-eventual",
+        uri="https://generativelanguage.googleapis.com/v1beta/files/owui-eventual",
+        mime_type="application/pdf",
+        state=gemini_types.FileState.ACTIVE,
+    )
+    client.aio.files.get.side_effect = [
+        _client_error(404, "NOT_FOUND", "not found yet"),
+        existing_file,
+    ]
+    event_emitter = MagicMock(spec=EventEmitter)
+    manager = FilesAPIManager(
+        client=client,
+        file_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        event_emitter=event_emitter,
+    )
+
+    result = await manager._recover_after_upload_conflict(
+        content_hash="eventual-hash",
+        deterministic_name="files/owui-eventual",
+        owui_file_id="owui-file-id",
+        attempts=2,
+        retry_delay=0,
+    )
+
+    assert result is existing_file
+    assert client.aio.files.get.await_count == 2
+    event_emitter.emit_toast.assert_not_called()
+
+
+# endregion Test FilesAPIManager
+
+
 # region Test GeminiContentBuilder
+@pytest.mark.asyncio
+async def test_get_file_source_resolves_open_webui_storage_path(tmp_path):
+    mock_files_module.reset_mock()
+    mock_storage_module.reset_mock()
+    local_path = tmp_path / "stored.pdf"
+    local_path.write_bytes(b"%PDF stored")
+    file_model = MagicMock()
+    file_model.path = "s3://bucket/uploads/stored.pdf"
+    file_model.meta = {"content_type": "application/pdf"}
+    mock_files_module.Files.get_file_by_id = AsyncMock(return_value=file_model)
+    mock_storage_module.Storage.get_file.return_value = str(local_path)
+
+    source = await GeminiContentBuilder._get_file_source("stored-file-id")
+
+    assert source is not None
+    assert source.file_path == str(local_path)
+    assert source.file_bytes is None
+    assert source.mime_type == "application/pdf"
+    mock_files_module.Files.get_file_by_id.assert_awaited_once_with("stored-file-id")
+    mock_storage_module.Storage.get_file.assert_called_once_with(
+        "s3://bucket/uploads/stored.pdf"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_file_data_resolves_open_webui_storage_path(tmp_path):
+    mock_files_module.reset_mock()
+    mock_storage_module.reset_mock()
+    local_path = tmp_path / "history.pdf"
+    file_bytes = b"%PDF history"
+    local_path.write_bytes(file_bytes)
+    file_model = MagicMock()
+    file_model.path = "https://account.blob.core.windows.net/container/history.pdf"
+    file_model.meta = {"content_type": "application/pdf"}
+    mock_files_module.Files.get_file_by_id = AsyncMock(return_value=file_model)
+    mock_storage_module.Storage.get_file.return_value = str(local_path)
+
+    data, mime_type = await GeminiContentBuilder._get_file_data("history-file-id")
+
+    assert data == file_bytes
+    assert mime_type == "application/pdf"
+    mock_files_module.Files.get_file_by_id.assert_awaited_once_with("history-file-id")
+    mock_storage_module.Storage.get_file.assert_called_once_with(
+        "https://account.blob.core.windows.net/container/history.pdf"
+    )
+
+
 @pytest.mark.asyncio
 async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
     """
@@ -952,6 +1131,130 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         assert text_part.text == user_text_content
 
         mock_event_emitter.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_builder_build_contents_with_multiple_pdf_attachments(
+    pipe_instance_fixture,
+):
+    """
+    Tests that a user turn with multiple attached PDFs preserves every file part.
+    """
+    mock_chats_module.reset_mock()
+    mock_misc_module.reset_mock()
+
+    pipe_instance, _ = pipe_instance_fixture
+    pipe_instance.valves.PDF_LIMIT_MITIGATION = False
+
+    user_text_content = "Compare these PDFs."
+    pdf_mime_type = "application/pdf"
+    first_pdf_id = "first-pdf-id"
+    second_pdf_id = "second-pdf-id"
+    messages_body = [{"role": "user", "content": user_text_content}]
+    mock_event_emitter = MagicMock(spec=EventEmitter)
+    mock_event_emitter.start_time = 1234567890.0
+    mock_user_data = {
+        "id": "test_user_id",
+        "email": "test@example.com",
+        "name": "Test User",
+        "role": "user",
+    }
+
+    mock_chat_from_db = MagicMock()
+    mock_chat_from_db.chat = {
+        "history": {
+            "currentId": "current-user-message",
+            "messages": {
+                "current-user-message": {
+                    "id": "current-user-message",
+                    "parentId": None,
+                    "role": "user",
+                    "content": user_text_content,
+                    "files": [
+                        {
+                            "id": first_pdf_id,
+                            "name": "first.pdf",
+                            "type": "file",
+                            "content_type": pdf_mime_type,
+                        },
+                        {
+                            "id": second_pdf_id,
+                            "name": "second.pdf",
+                            "type": "file",
+                            "content_type": pdf_mime_type,
+                        },
+                    ],
+                },
+            },
+        }
+    }
+    mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = mock_chat_from_db
+    mock_misc_module.pop_system_message.return_value = (None, messages_body)
+
+    mock_files_api_manager = AsyncMock()
+    mock_files_api_manager.client.vertexai = False
+    first_gemini_file = MagicMock()
+    first_gemini_file.uri = "gs://fake-bucket/first.pdf"
+    first_gemini_file.mime_type = pdf_mime_type
+    second_gemini_file = MagicMock()
+    second_gemini_file.uri = "gs://fake-bucket/second.pdf"
+    second_gemini_file.mime_type = pdf_mime_type
+    mock_files_api_manager.get_or_upload_file.side_effect = [
+        first_gemini_file,
+        second_gemini_file,
+    ]
+
+    builder = GeminiContentBuilder(
+        messages_body=messages_body,  # type: ignore
+        metadata_body={
+            "chat_id": "test_chat_id",
+            "features": {"upload_documents": True},  # type: ignore
+        },
+        user_data=mock_user_data,  # type: ignore
+        event_emitter=mock_event_emitter,
+        valves=pipe_instance.valves,
+        files_api_manager=mock_files_api_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+
+    with patch(
+        "plugins.pipes.gemini_manifold.GeminiContentBuilder._get_file_source",
+        new_callable=AsyncMock,
+        side_effect=[
+            LocalFileSource(
+                file_bytes=b"%PDF first",
+                file_path=None,
+                mime_type=pdf_mime_type,
+            ),
+            LocalFileSource(
+                file_bytes=b"%PDF second",
+                file_path=None,
+                mime_type=pdf_mime_type,
+            ),
+        ],
+    ) as mock_get_file_source:
+        contents = await builder.build_contents()
+
+    assert len(contents) == 1
+    user_content_obj = contents[0]
+    assert user_content_obj.parts is not None
+    assert len(user_content_obj.parts) == 3
+    assert [
+        part.file_data.file_uri for part in user_content_obj.parts[:2]  # type: ignore[union-attr]
+    ] == [
+        first_gemini_file.uri,
+        second_gemini_file.uri,
+    ]
+    assert user_content_obj.parts[2].text == user_text_content
+    assert mock_get_file_source.await_args_list == [
+        call(first_pdf_id),
+        call(second_pdf_id),
+    ]
+    assert mock_files_api_manager.get_or_upload_file.await_count == 2
+    assert [
+        await_call.kwargs["owui_file_id"]
+        for await_call in mock_files_api_manager.get_or_upload_file.await_args_list
+    ] == [first_pdf_id, second_pdf_id]
 
 
 @pytest.mark.asyncio
