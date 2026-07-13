@@ -15,26 +15,24 @@ VERSION = "2.1.0"
 # set the feature back to False so Open WebUI does not run it's own logic and then
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
+import asyncio
 import copy
 import functools
 import json
-from google.genai import types
-
 import sys
 import time
-import asyncio
 import urllib.request
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Literal, cast
+
 import aiohttp
-from fastapi import Request
-from fastapi.datastructures import State
-from loguru import logger
-from pydantic import BaseModel, Field
 import pydantic_core
 import yaml
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TYPE_CHECKING, cast
-
-from open_webui.models.functions import Functions
+from fastapi import Request
+from fastapi.datastructures import State
+from google.genai import types
+from loguru import logger
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -73,17 +71,15 @@ class EventEmitter:
         self.is_abandoned: bool = False
         self._idle_timeout = idle_timeout
 
-        self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
-        self._toast_queue: asyncio.Queue["Event | None"] = asyncio.Queue()
+        self._queue: asyncio.Queue[Event | None] = asyncio.Queue()
+        self._toast_queue: asyncio.Queue[Event | None] = asyncio.Queue()
 
         self._worker_task: asyncio.Task | None = None
         self._toast_worker_task: asyncio.Task | None = None
 
         if self._emitter is not None:
             self._worker_task = asyncio.create_task(self._process_queue(self._queue))
-            self._toast_worker_task = asyncio.create_task(
-                self._process_queue(self._toast_queue)
-            )
+            self._toast_worker_task = asyncio.create_task(self._process_queue(self._toast_queue))
 
     async def _process_queue(self, queue: asyncio.Queue["Event | None"]) -> None:
         """
@@ -146,7 +142,7 @@ class EventEmitter:
         msg: str,
         type: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
-        event: "NotificationEvent" = {
+        event: NotificationEvent = {
             "type": "notification",
             "data": {"type": type, "content": msg},
         }
@@ -172,14 +168,13 @@ class EventEmitter:
             description = f"{description} (+{elapsed:.2f}s)"
 
         final_hidden = hidden or (
-            self.status_mode in ("hidden_compact", "hidden_detailed")
-            and is_successful_finish
+            self.status_mode in ("hidden_compact", "hidden_detailed") and is_successful_finish
         )
 
         if not final_hidden and indent_level > 0:
             description = f"{'- ' * indent_level}{description}"
 
-        event: "StatusEvent" = {
+        event: StatusEvent = {
             "type": "status",
             "data": {"description": description, "done": done, "hidden": final_hidden},
         }
@@ -200,14 +195,14 @@ class EventEmitter:
         if usage is not None:
             data["usage"] = usage
 
-        event: "ChatCompletionEvent" = {
+        event: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": cast(Any, data),
         }
         self._enqueue(event)
 
     def emit_sources(self, source_data: "Source") -> None:
-        event: "CitationEvent" = {
+        event: CitationEvent = {
             "type": "source",
             "data": {
                 "source": source_data["source"],
@@ -224,7 +219,7 @@ class EventEmitter:
     def emit_grounding_queries(self, queries: list[str]) -> None:
         if not queries:
             return
-        event: "StatusEvent" = {
+        event: StatusEvent = {
             "type": "status",
             "data": {
                 "action": "web_search_queries_generated",
@@ -236,7 +231,6 @@ class EventEmitter:
 
 
 class Filter:
-
     class Valves(BaseModel):
         USE_PERMISSIVE_SAFETY: bool = Field(
             default=False,
@@ -278,11 +272,11 @@ class Filter:
             • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
             • visible: All status visible. • visible_timed: Visible with timestamps.""",
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
 
     # TODO: Support user settting through UserValves.
@@ -311,9 +305,7 @@ class Filter:
         # the memory footprint doesn't grow indefinitely over time.
         self._cleanup_event_emitters(app_state)
 
-        emitter = EventEmitter(
-            __event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR
-        )
+        emitter = EventEmitter(__event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR)
         self._store_data_in_state(
             app_state,
             __metadata__,
@@ -325,9 +317,7 @@ class Filter:
         log.debug("Loading model configuration...")
         model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
         app_state._state["gemini_model_config"] = model_config
-        log.debug(
-            f"Stored model config in app state with {len(model_config)} model(s)."
-        )
+        log.debug(f"Stored model config in app state with {len(model_config)} model(s).")
 
         # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
@@ -337,9 +327,7 @@ class Filter:
             )
             self._add_log_handler()
 
-        log.debug(
-            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
-        )
+        log.debug(f"inlet method has been called. Gemini Manifold Companion version is {VERSION}")
 
         canonical_model_name, is_manifold = self._get_model_name(body)
 
@@ -360,7 +348,7 @@ class Filter:
         log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
 
         features = body.get("features", {})
-        log.debug(f"body.features:", payload=features)
+        log.debug("body.features:", payload=features)
 
         # Ensure features field exists
         metadata = body.get("metadata")
@@ -376,9 +364,7 @@ class Filter:
 
         if is_grounding_model:
             web_search_enabled = (
-                features.get("web_search", False)
-                if isinstance(features, dict)
-                else False
+                features.get("web_search", False) if isinstance(features, dict) else False
             )
             if web_search_enabled:
                 log.info(
@@ -389,9 +375,7 @@ class Filter:
                 metadata_features["google_search_tool"] = True
         if is_code_exec_model:
             code_execution_enabled = (
-                features.get("code_interpreter", False)
-                if isinstance(features, dict)
-                else False
+                features.get("code_interpreter", False) if isinstance(features, dict) else False
             )
             if code_execution_enabled:
                 log.info(
@@ -402,9 +386,7 @@ class Filter:
                 metadata_features["google_code_execution"] = True
         if self.valves.USE_PERMISSIVE_SAFETY:
             log.info("Adding permissive safety settings to body.metadata")
-            metadata["safety_settings"] = self._get_permissive_safety_settings(
-                canonical_model_name
-            )
+            metadata["safety_settings"] = self._get_permissive_safety_settings(canonical_model_name)
         if self.valves.BYPASS_BACKEND_RAG:
             if __metadata__["chat_id"] == "local":
                 # TODO toast notification
@@ -419,15 +401,11 @@ class Filter:
                     "BYPASS_BACKEND_RAG is enabled, bypassing Open WebUI RAG to let the Manifold pipe handle documents."
                 )
                 if files := body.get("files"):
-                    log.info(
-                        f"Removing {len(files)} files from the Open WebUI RAG pipeline."
-                    )
+                    log.info(f"Removing {len(files)} files from the Open WebUI RAG pipeline.")
                     body["files"] = []
                 metadata_features["upload_documents"] = True
         else:
-            log.info(
-                "BYPASS_BACKEND_RAG is disabled. Open WebUI's RAG will be used if applicable."
-            )
+            log.info("BYPASS_BACKEND_RAG is disabled. Open WebUI's RAG will be used if applicable.")
             metadata_features["upload_documents"] = False
 
         # TODO: Filter out the citation markers here.
@@ -456,15 +434,13 @@ class Filter:
 
         log.debug(f"Checking for attributes for message {message_id} in request state.")
 
-        stored_metadata: types.GroundingMetadata | None = (
-            self._get_and_clear_data_from_state(
-                app_state, chat_id, message_id, "grounding", True
-            )
+        stored_metadata: types.GroundingMetadata | None = self._get_and_clear_data_from_state(
+            app_state, chat_id, message_id, "grounding", True
         )
-        # FIXME: can this be None?
-        emitter: EventEmitter = self._get_and_clear_data_from_state(
+        stored_emitter: EventEmitter | None = self._get_and_clear_data_from_state(
             app_state, chat_id, message_id, "gemini_event_emitter", True
         )
+        emitter = stored_emitter or EventEmitter(__event_emitter__)
 
         if stored_metadata:
             log.info("Found grounding metadata, processing citations.")
@@ -513,9 +489,7 @@ class Filter:
                     supports=gs_supports,
                     emitter=emitter,
                 )
-                emitter.emit_status(
-                    "This response was grounded with a Google tool", done=True
-                )
+                emitter.emit_status("This response was grounded with a Google tool", done=True)
             else:
                 msg = "Grounding metadata was found but it's missing grounding supports or chunks. The response is likely not grounded."
                 log.info(msg)
@@ -565,9 +539,7 @@ class Filter:
                 last_end_thought_tag_idx != -1
                 and last_end_thought_tag_idx >= len(THOUGHT_START_TAG) - 1
             ):
-                thought_block_end_offset = last_end_thought_tag_idx + len(
-                    THOUGHT_END_TAG
-                )
+                thought_block_end_offset = last_end_thought_tag_idx + len(THOUGHT_END_TAG)
                 thought_prefix = raw_str[:thought_block_end_offset]
                 content_for_citation_processing = raw_str[thought_block_end_offset:]
                 log.info(
@@ -586,17 +558,11 @@ class Filter:
 
         if content_for_citation_processing:
             try:
-                modified_content_bytes = bytearray(
-                    content_for_citation_processing.encode("utf-8")
-                )
+                modified_content_bytes = bytearray(content_for_citation_processing.encode("utf-8"))
                 for support in reversed(supports):
                     segment = support.segment
                     indices = support.grounding_chunk_indices
-                    if not (
-                        indices is not None
-                        and segment
-                        and segment.end_index is not None
-                    ):
+                    if not (indices is not None and segment and segment.end_index is not None):
                         log.debug(f"Skipping support due to missing data: {support}")
                         continue
                     end_pos = segment.end_index
@@ -610,9 +576,7 @@ class Filter:
                     citation_markers = "".join(f"[{index + 1}]" for index in indices)
                     encoded_citation_markers = citation_markers.encode("utf-8")
                     modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
-                processed_content_part_with_markers = modified_content_bytes.decode(
-                    "utf-8"
-                )
+                processed_content_part_with_markers = modified_content_bytes.decode("utf-8")
             except Exception as e:
                 log.error(
                     f"Error injecting citation markers into content: {e}. "
@@ -654,11 +618,9 @@ class Filter:
                     timeout=timeout,
                 ) as response:
                     final_url = str(response.url)
-                    log.debug(
-                        f"Resolved URL '{url}' to '{final_url}' after {attempt} retries"
-                    )
+                    log.debug(f"Resolved URL '{url}' to '{final_url}' after {attempt} retries")
                     return final_url, True
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            except (TimeoutError, aiohttp.ClientError) as e:
                 if attempt == max_retries:
                     log.error(
                         f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
@@ -703,9 +665,7 @@ class Filter:
         urls_to_resolve = [
             uri
             for _, uri in initial_metadatas
-            if uri.startswith(
-                "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
-            )
+            if uri.startswith("https://vertexaisearch.cloud.google.com/grounding-api-redirect/")
         ]
         resolved_uris_map = {}
 
@@ -721,7 +681,7 @@ class Filter:
                 log.info("URL resolution completed.")
 
                 resolved_uris = [res[0] for res in results]
-                resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
+                resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris, strict=False))
 
                 success_count = sum(1 for _, success in results if success)
                 final_status_msg = (
@@ -736,9 +696,8 @@ class Filter:
                 resolved_uris_map = {url: url for url in urls_to_resolve}
                 emitter.emit_status("URL resolution failed", done=True)
 
-        source_metadatas_template: list["SourceMetadata"] = [
-            {"source": None, "original_url": None, "supports": []}
-            for _ in grounding_chunks
+        source_metadatas_template: list[SourceMetadata] = [
+            {"source": None, "original_url": None, "supports": []} for _ in grounding_chunks
         ]
         populated_metadatas = [m.copy() for m in source_metadatas_template]
 
@@ -766,7 +725,7 @@ class Filter:
                 chunk_index_to_segments[index].append(segment)
                 populated_metadatas[index]["supports"].append(support.model_dump())  # type: ignore
 
-        valid_source_metadatas: list["SourceMetadata"] = []
+        valid_source_metadatas: list[SourceMetadata] = []
         doc_list: list[str] = []
 
         for i, meta in enumerate(populated_metadatas):
@@ -805,7 +764,7 @@ class Filter:
 
                 doc_list.append("\n".join(content_parts))
 
-        sources_list: list["Source"] = []
+        sources_list: list[Source] = []
         if valid_source_metadatas:
             sources_list.append(
                 {
@@ -827,9 +786,7 @@ class Filter:
 
     # region 1.3 Get permissive safety settings
 
-    def _get_permissive_safety_settings(
-        self, model_name: str
-    ) -> list[types.SafetySetting]:
+    def _get_permissive_safety_settings(self, model_name: str) -> list[types.SafetySetting]:
         """Get safety settings based on model name and permissive setting."""
 
         # Settings supported by most models
@@ -882,7 +839,7 @@ class Filter:
     @functools.lru_cache(maxsize=1)
     def _load_model_config(config_path: str) -> dict:
         """Loads the model configuration from a URL.
-        
+
         Uses LRU cache to avoid reloading the same configuration repeatedly.
         Cache is tied to the config_path argument.
         """
@@ -892,7 +849,9 @@ class Filter:
 
         try:
             if not (config_path.startswith("http://") or config_path.startswith("https://")):
-                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
+                log.error(
+                    f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}"
+                )
                 return {}
 
             log.debug(f"Loading model configuration from: {config_path}")
@@ -911,17 +870,19 @@ class Filter:
     @staticmethod
     def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
         """Check if a model supports a specific capability based on YAML config.
-        
+
         Args:
             model_id: The canonical model id (without prefixes)
             config: The loaded YAML configuration dict
             capability: The capability to check (e.g., "search_grounding", "code_execution")
-            
+
         Returns:
             True if the model supports the capability, False otherwise
         """
         if model_id not in config:
-            log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
+            log.debug(
+                f"Model '{model_id}' not found in config, capability '{capability}' check returns False."
+            )
             return False
 
         model_config = config[model_id]
@@ -955,14 +916,12 @@ class Filter:
             "stream_options",
         }
 
-        custom_param_keys = [key for key in body.keys() if key not in known_body_keys]
+        custom_param_keys = [key for key in body if key not in known_body_keys]
         for key in custom_param_keys:
             chat_control_params[key] = body[key]
 
         if custom_param_keys:
-            log.debug(
-                f"Found and preserved custom chat control parameters: {custom_param_keys}"
-            )
+            log.debug(f"Found and preserved custom chat control parameters: {custom_param_keys}")
 
         return chat_control_params
 
@@ -983,9 +942,7 @@ class Filter:
         ]
 
         for key in abandoned_keys:
-            log.warning(
-                f"Garbage Collector: Removing abandoned EventEmitter from app state: {key}"
-            )
+            log.warning(f"Garbage Collector: Removing abandoned EventEmitter from app state: {key}")
             # Removing the reference allows the Python GC to reclaim the EventEmitter instance
             # and its internal queue resources.
             del app_state._state[key]
@@ -1008,9 +965,7 @@ class Filter:
         message_id = __metadata__.get("message_id")
 
         if not chat_id or not message_id:
-            log.warning(
-                "Skipping state storage: chat_id or message_id missing from metadata."
-            )
+            log.warning("Skipping state storage: chat_id or message_id missing from metadata.")
             return
 
         for key_suffix, value in data.items():
@@ -1043,13 +998,9 @@ class Filter:
                 delattr(app_state, key)
             except AttributeError:
                 # This case is unlikely but handles a race condition where the attribute might already be gone.
-                log.warning(
-                    f"State key '{key}' was already gone before deletion attempt."
-                )
+                log.warning(f"State key '{key}' was already gone before deletion attempt.")
         else:
-            log.debug(
-                f"Retrieved data from app state for key '{key}' without clearing it."
-            )
+            log.debug(f"Retrieved data from app state for key '{key}' without clearing it.")
         return value
 
     def _get_first_candidate(
@@ -1089,9 +1040,7 @@ class Filter:
         # If metadata exists, attempt to extract the base_model_id
         if metadata := body.get("metadata"):
             # Safely navigate the nested structure: metadata -> model -> info -> base_model_id
-            base_model_name = (
-                metadata.get("model", {}).get("info", {}).get("base_model_id", None)
-            )
+            base_model_name = metadata.get("model", {}).get("info", {}).get("base_model_id", None)
             # If a base model ID is found, it overrides the initially requested name
             if base_model_name:
                 effective_model_name = base_model_name
@@ -1103,9 +1052,7 @@ class Filter:
 
         # 4. Create the canonical model name by removing the manifold prefix
         # from the effective model name.
-        canonical_model_name = effective_model_name.replace(
-            "gemini_manifold_google_genai.", ""
-        )
+        canonical_model_name = effective_model_name.replace("gemini_manifold_google_genai.", "")
 
         # 5. Log the relevant names for debugging purposes
         log.debug(
@@ -1155,17 +1102,13 @@ class Filter:
         elif isinstance(data, dict):
             # Process dictionary items, creating a new dict
             return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
+                k: self._truncate_long_strings(v, max_len, truncation_marker, truncation_enabled)
                 for k, v in data.items()
             }
         elif isinstance(data, list):
             # Process list items, creating a new list
             return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
+                self._truncate_long_strings(item, max_len, truncation_marker, truncation_enabled)
                 for item in data
             ]
         else:
@@ -1214,12 +1157,8 @@ class Filter:
                 )
 
                 # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
+                if self._is_flat_dict(truncated_data) and not isinstance(truncated_data, list):
+                    json_string = json.dumps(truncated_data, separators=(",", ":"), default=str)
                     # Add a simple prefix if it's compact
                     serialized_data_json = " - " + json_string
                 else:
@@ -1229,9 +1168,7 @@ class Filter:
 
             except (TypeError, ValueError) as e:  # Catch specific serialization errors
                 serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
+            except Exception as e:  # Catch any other unexpected errors during processing
                 serialized_data_json = f" - {{Processing Error: {e}}}"
 
         # Add the final JSON string (or error message) back into the record
@@ -1275,7 +1212,7 @@ class Filter:
             return  # Stop processing if the level is invalid
 
         # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        handlers: dict[int, Handler] = log._core.handlers  # type: ignore
         handler_id_to_remove = None
         found_correct_handler = False
 

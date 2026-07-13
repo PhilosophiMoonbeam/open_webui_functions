@@ -11,12 +11,12 @@ requirements:
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import (
-    Any,
-    Awaitable,
-    Callable,
     TYPE_CHECKING,
+    Any,
 )
+
 from pydantic import BaseModel
 
 if TYPE_CHECKING:

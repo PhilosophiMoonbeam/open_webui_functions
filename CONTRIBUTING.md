@@ -59,6 +59,7 @@ The `dev/` directory offers a convenient environment for developing and testing 
 
 *   Test your changes thoroughly before submitting a pull request.
 *   Consider adding unit tests to ensure the stability and reliability of your code.
+*   Install the locked development environment with `uv sync`, then run `make quality` before submitting.
 
 ## Code Review
 

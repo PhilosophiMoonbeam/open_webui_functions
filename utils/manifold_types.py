@@ -1,4 +1,5 @@
-from typing import Any, NotRequired, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
+
 from google.genai import types
 
 
@@ -161,6 +162,7 @@ Event = ChatCompletionEvent | StatusEvent | NotificationEvent | CitationEvent
 
 # region `__metadata__`
 
+
 # Ollama-specific model details. Not present for pipe models.
 class ModelDetails(TypedDict):
     """Details about the model within Ollama metadata."""
@@ -182,9 +184,7 @@ class OllamaDetails(TypedDict):
     size: int
     digest: str
     details: ModelDetails
-    urls: list[
-        int
-    ]  # Example shows [0], type might be more complex? List[Any] is safer if unsure.
+    urls: list[int]  # Example shows [0], type might be more complex? List[Any] is safer if unsure.
 
 
 # Nested types for `MetadataModel.info`
@@ -306,7 +306,7 @@ class Metadata(TypedDict):
     tool_servers: list[Any]
     files: list[FileAttachmentTD] | None
     features: Features | None
-    variables: dict[str, str] # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
+    variables: dict[str, str]  # Keys are variable names (e.g., "{{USER_NAME}}"), values are strings
     model: MetadataModel
     direct: bool
     params: MetadataParams
@@ -321,7 +321,7 @@ class Metadata(TypedDict):
     merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
     is_paid_api: NotRequired[bool]  # Added in `Pipe.pipe`
     is_vertex_ai: NotRequired[bool]  # Added in `Pipe.pipe`
-    canonical_model_id: NotRequired[str] # Added in `Pipe.pipe`
+    canonical_model_id: NotRequired[str]  # Added in `Pipe.pipe`
     cumulative_tokens: NotRequired[int | None]  # Added in `Pipe.pipe`
     cumulative_cost: NotRequired[float | None]  # Added in `Pipe.pipe`
 
@@ -359,9 +359,7 @@ class UserMessage(TypedDict):
     """Represents a message from the user."""
 
     role: Literal["user"]
-    content: (
-        str | list[Content]
-    )  # Content can be a simple string or a list of Content blocks
+    content: str | list[Content]  # Content can be a simple string or a list of Content blocks
 
 
 class AssistantMessage(TypedDict):
@@ -403,7 +401,7 @@ class Options(TypedDict):
 
 class Body(TypedDict):
     """
-    Represents the main request body structure. 
+    Represents the main request body structure.
     This differs between `Filter.inlet`, `Pipe.pipe`, and `Filter.outlet`.
     """
 
@@ -412,8 +410,10 @@ class Body(TypedDict):
     messages: list[Message]
     files: NotRequired[list[FileAttachmentTD]]
     features: NotRequired[Features]  # Only present in `Filter.inlet`
-    metadata: Metadata # Only present in `Filter.inlet`
+    metadata: Metadata  # Only present in `Filter.inlet`
     options: NotRequired[Options]
+
+
 # endregion `body` dict
 
 
@@ -436,13 +436,11 @@ class ChatMessageTD(TypedDict):
     model: NotRequired[str]  # e.g. "associate_messages_to_files" for assistant
     modelName: NotRequired[str]  # e.g. "Associate Messages to Files"
     modelIdx: NotRequired[int]
-    userContext: NotRequired[
-        Any | None
-    ]  # Can be null if present, or not present at all
+    userContext: NotRequired[Any | None]  # Can be null if present, or not present at all
     sources: NotRequired[
         list[Source]
     ]  # Present in history.messages for assistant, not in top-level messages list
-    statusHistory: NotRequired[list[StatusEventData]] # assistant messages only
+    statusHistory: NotRequired[list[StatusEventData]]  # assistant messages only
     usage: NotRequired[dict[str, Any]]  # assistant messages only
 
     # Custom keys added by Gemini Manifold plugin

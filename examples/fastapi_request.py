@@ -9,22 +9,22 @@ version: 0.0.0
 """
 
 import json
+from typing import TYPE_CHECKING, Any
+
 from fastapi import Request
 from pydantic import BaseModel
-from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 class Filter:
-
     class Valves(BaseModel):
         pass
 
     def __init__(self):
         self.valves = self.Valves()
-        self._log(f"Function has been initialized.", "__init__")
+        self._log("Function has been initialized.", "__init__")
 
     def inlet(self, body: "Body", **kwargs) -> "Body":
         """This allows modifying the input LLM model gets."""

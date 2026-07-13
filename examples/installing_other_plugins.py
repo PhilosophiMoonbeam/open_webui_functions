@@ -10,7 +10,6 @@ version: 0.0.0
 requirements:
 """
 
-from pydantic import BaseModel, Field
 import requests
 from open_webui.models.functions import (
     FunctionForm,
@@ -20,13 +19,12 @@ from open_webui.models.functions import (
 )
 from open_webui.models.users import Users
 from open_webui.utils.plugin import extract_frontmatter
-
+from pydantic import BaseModel, Field
 
 SEARCH_FILTER_ID = "grounding_with_google_search"
 
 
 class Pipe:
-
     class Valves(BaseModel):
         USE_GROUNDING_SEARCH: bool = Field(
             default=False,

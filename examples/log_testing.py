@@ -11,20 +11,16 @@ requirements:
 """
 
 import sys
+from collections.abc import AsyncGenerator, Generator, Iterator
 from typing import (
-    Any,
-    AsyncGenerator,
-    Generator,
-    Iterator,
-    Literal,
-    NotRequired,
-    TypedDict,
     TYPE_CHECKING,
+    Literal,
 )
+
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
-from open_webui.utils.logger import stdout_format
 from loguru import logger
+from open_webui.utils.logger import stdout_format
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -43,11 +39,11 @@ class Pipe:
         EXAMPLE_STRING: str = Field(
             default="", title="Admin String", description="String configurable by admin"
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
 
     class UserValves(BaseModel):
@@ -101,8 +97,8 @@ class Pipe:
             return record["name"] == __name__  # Filter by module name
 
         # Access the internal state of the logger
-        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
-        for key, handler in handlers.items():
+        handlers: dict[int, Handler] = logger._core.handlers  # type: ignore
+        for _key, handler in handlers.items():
             existing_filter = handler._filter
             if (
                 hasattr(existing_filter, "__name__")

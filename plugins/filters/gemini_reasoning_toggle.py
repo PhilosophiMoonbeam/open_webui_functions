@@ -12,6 +12,7 @@ version: 1.1.0
 # Shoutout to jrkropp for making me aware of Filter.toggle!
 
 from typing import TYPE_CHECKING, cast
+
 from pydantic import BaseModel
 
 if TYPE_CHECKING:

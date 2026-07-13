@@ -1,13 +1,12 @@
-from typing import cast
-from aiocache.base import BaseCache
-from aiocache.backends.memory import SimpleMemoryCache
-from aiocache.serializers import NullSerializer
+import asyncio
+import sys
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
+
 import pytest
 import pytest_asyncio
-from unittest.mock import patch, MagicMock, AsyncMock, call, ANY
-import sys
-import asyncio
-import io
+from aiocache.backends.memory import SimpleMemoryCache
+from aiocache.base import BaseCache
+from aiocache.serializers import NullSerializer
 
 # --- Mock problematic Open WebUI modules BEFORE they are imported by your plugin ---
 mock_chats_module = MagicMock()
@@ -37,22 +36,24 @@ sys.modules["open_webui.storage.provider"] = mock_storage_module
 sys.modules["open_webui.utils.misc"] = mock_misc_module
 
 
+from plugins.filters.gemini_manifold_companion import EventEmitter
 from plugins.pipes.gemini_manifold import (
-    Pipe,
+    ContentBuildError,
     FilesAPIManager,
     GeminiContentBuilder,
     GeminiPDFProcessor,
+    LocalFileSource,
     PDFMitigationManager,
     PDFMitigationOutcome,
+    PDFProcessingError,
+    Pipe,
     PreparedPDFPart,
     PreparedPDFResult,
-    LocalFileSource,
-    PDFProcessingError,
-    ContentBuildError,
     genai_errors,
-    types as gemini_types,
 )  # gemini_types is google.genai.types
-from plugins.filters.gemini_manifold_companion import EventEmitter
+from plugins.pipes.gemini_manifold import (
+    types as gemini_types,
+)
 
 # region Test Constants
 # General Users
@@ -113,13 +114,13 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
     """
     mock_gemini_client_actual_instance = MagicMock()
 
-    with patch(
-        "plugins.pipes.gemini_manifold.genai.Client",
-        return_value=mock_gemini_client_actual_instance,
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ), patch(
-        "sys.stdout", MagicMock()
+    with (
+        patch(
+            "plugins.pipes.gemini_manifold.genai.Client",
+            return_value=mock_gemini_client_actual_instance,
+        ) as MockedGenAIClientConstructor,
+        patch.object(Pipe, "_add_log_handler", MagicMock()),
+        patch("sys.stdout", MagicMock()),
     ):
         pipe = Pipe()
         # Initialize with base data from mock_pipe_valves_data
@@ -129,10 +130,9 @@ async def pipe_instance_fixture(mock_pipe_valves_data):
 
     # Teardown: Clear caches to ensure clean state for subsequent tests
     Pipe._get_or_create_genai_client.cache_clear()
-    if hasattr(pipe._get_genai_models, "cache"):
-        cache_instance = getattr(pipe._get_genai_models, "cache")
-        if cache_instance:
-            await cast(BaseCache, cache_instance).clear()
+    cache_instance = getattr(pipe._get_genai_models, "cache", None)
+    if isinstance(cache_instance, BaseCache):
+        await cache_instance.clear()
 
 
 # endregion Fixtures
@@ -145,13 +145,13 @@ def test_pipe_initialization_with_api_key_prefers_free(mock_pipe_valves_data):
     """
     mock_gemini_client_instance = MagicMock()
 
-    with patch(
-        "plugins.pipes.gemini_manifold.genai.Client",
-        return_value=mock_gemini_client_instance,
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ), patch(
-        "sys.stdout", MagicMock()
+    with (
+        patch(
+            "plugins.pipes.gemini_manifold.genai.Client",
+            return_value=mock_gemini_client_instance,
+        ) as MockedGenAIClientConstructor,
+        patch.object(Pipe, "_add_log_handler", MagicMock()),
+        patch("sys.stdout", MagicMock()),
     ):
         try:
             pipe_instance = Pipe()
@@ -183,19 +183,15 @@ def test_get_user_client_no_auth_provided_raises_error(mock_pipe_valves_data):
     mock_pipe_valves_data["USE_VERTEX_AI"] = False
     mock_pipe_valves_data["VERTEX_PROJECT"] = None
 
-    with patch(
-        "plugins.pipes.gemini_manifold.genai.Client"
-    ) as MockedGenAIClientConstructor, patch.object(
-        Pipe, "_add_log_handler", MagicMock()
-    ), patch(
-        "sys.stdout", MagicMock()
+    with (
+        patch("plugins.pipes.gemini_manifold.genai.Client") as MockedGenAIClientConstructor,
+        patch.object(Pipe, "_add_log_handler", MagicMock()),
+        patch("sys.stdout", MagicMock()),
     ):
         pipe_instance = Pipe()
         pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
 
-        with pytest.raises(
-            ValueError, match="Neither VERTEX_PROJECT nor a Gemini API key"
-        ):
+        with pytest.raises(ValueError, match="Neither VERTEX_PROJECT nor a Gemini API key"):
             pipe_instance._get_user_client(pipe_instance.valves, USER_EMAIL_REGULAR)
 
         MockedGenAIClientConstructor.assert_not_called()
@@ -296,16 +292,12 @@ def test_user_must_auth_no_user_key_provided_errors(pipe_instance_fixture):
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = None
 
-    user_valves_instance = Pipe.UserValves(
-        GEMINI_FREE_API_KEY=None, GEMINI_PAID_API_KEY=None
-    )
+    user_valves_instance = Pipe.UserValves(GEMINI_FREE_API_KEY=None, GEMINI_PAID_API_KEY=None)
     merged_valves = pipe._get_merged_valves(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    with pytest.raises(
-        ValueError, match="Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY"
-    ):
+    with pytest.raises(ValueError, match="Please set GEMINI_FREE_API_KEY or GEMINI_PAID_API_KEY"):
         pipe._get_user_client(merged_valves, USER_EMAIL_UNPRIVILEGED)
 
     MockedGenAIClientConstructor.assert_not_called()
@@ -521,9 +513,7 @@ def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
         GEMINI_FREE_API_KEY=USER_FREE_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
-    )
+    merged_valves = pipe._get_merged_valves(pipe.valves, user_valves_instance, USER_EMAIL_REGULAR)
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
 
@@ -549,9 +539,7 @@ def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
         VERTEX_PROJECT=USER_VERTEX_PROJECT,
         VERTEX_LOCATION=USER_VERTEX_LOCATION,
     )
-    merged_valves = pipe._get_merged_valves(
-        pipe.valves, user_valves_instance, USER_EMAIL_REGULAR
-    )
+    merged_valves = pipe._get_merged_valves(pipe.valves, user_valves_instance, USER_EMAIL_REGULAR)
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
 
@@ -565,6 +553,7 @@ def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
 
 
 # region Test Toggleable Paid API Filter
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -595,10 +584,7 @@ async def test_paid_api_toggle_selects_correct_key(
 
     # Provide both the model ID and the canonical ID required by the new pipe logic
     model_id = "gemini-pro"
-    __metadata__ = {
-        "model": {"id": model_id},
-        "canonical_model_id": model_id 
-    }
+    __metadata__ = {"model": {"id": model_id}, "canonical_model_id": model_id}
 
     # Ensure both keys are present in the initial valves
     pipe.valves.GEMINI_FREE_API_KEY = ADMIN_FREE_KEY
@@ -615,14 +601,13 @@ async def test_paid_api_toggle_selects_correct_key(
             return toggle_status
         return (False, False)
 
-    with patch.object(
-        pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
-    ) as mock_toggle_status, patch.object(
-        pipe, "_get_user_client", wraps=pipe._get_user_client
-    ), patch.object(
-        pipe, "_check_companion_filter_version"
-    ), patch.object(
-        pipe, "_get_merged_valves", return_value=pipe.valves
+    with (
+        patch.object(
+            pipe, "_get_toggleable_feature_status", side_effect=mock_toggle_side_effect
+        ) as mock_toggle_status,
+        patch.object(pipe, "_get_user_client", wraps=pipe._get_user_client),
+        patch.object(pipe, "_check_companion_filter_version"),
+        patch.object(pipe, "_get_merged_valves", return_value=pipe.valves),
     ):
         try:
             # We expect this to get quite far now with the fixed metadata
@@ -648,12 +633,12 @@ async def test_paid_api_toggle_selects_correct_key(
         MockedGenAIClientConstructor.assert_called()
         # Find the call that matches our expected key
         api_keys_used = [
-            call.kwargs.get("api_key") 
-            for call in MockedGenAIClientConstructor.call_args_list
+            call.kwargs.get("api_key") for call in MockedGenAIClientConstructor.call_args_list
         ]
         assert expected_api_key in api_keys_used
 
     Pipe._get_or_create_genai_client.cache_clear()
+
 
 # endregion Test Toggleable Paid API Filter
 
@@ -811,9 +796,7 @@ async def test_get_file_source_resolves_open_webui_storage_path(tmp_path):
     assert source.file_bytes is None
     assert source.mime_type == "application/pdf"
     mock_files_module.Files.get_file_by_id.assert_awaited_once_with("stored-file-id")
-    mock_storage_module.Storage.get_file.assert_called_once_with(
-        "s3://bucket/uploads/stored.pdf"
-    )
+    mock_storage_module.Storage.get_file.assert_called_once_with("s3://bucket/uploads/stored.pdf")
 
 
 @pytest.mark.asyncio
@@ -876,9 +859,7 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
     )
 
-    with patch(
-        "plugins.pipes.gemini_manifold.types.Part.from_text"
-    ) as mock_part_from_text:
+    with patch("plugins.pipes.gemini_manifold.types.Part.from_text") as mock_part_from_text:
         # The mock Part object needs a 'text' attribute for the new check in `build_contents`.
         mock_text_part = MagicMock(spec=gemini_types.Part)
         mock_text_part.text = "Hello!"
@@ -954,18 +935,14 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     mock_text_part_after_obj = MagicMock(spec=gemini_types.Part, name="TextPartAfter")
     mock_text_part_after_obj.text = text_after_stripped
 
-    with patch(
-        "plugins.pipes.gemini_manifold.types.Part.from_text"
-    ) as mock_part_from_text:
+    with patch("plugins.pipes.gemini_manifold.types.Part.from_text") as mock_part_from_text:
 
         def from_text_side_effect(text):
             if text == text_before_stripped:
                 return mock_text_part_before_obj
             if text == text_after_stripped:
                 return mock_text_part_after_obj
-            generic_mock = MagicMock(
-                spec=gemini_types.Part, name=f"GenericTextPart_{text[:10]}"
-            )
+            generic_mock = MagicMock(spec=gemini_types.Part, name=f"GenericTextPart_{text[:10]}")
             generic_mock.text = text
             return generic_mock
 
@@ -1239,8 +1216,9 @@ async def test_builder_build_contents_with_multiple_pdf_attachments(
     user_content_obj = contents[0]
     assert user_content_obj.parts is not None
     assert len(user_content_obj.parts) == 3
+    assert all(part.file_data is not None for part in user_content_obj.parts[:2])
     assert [
-        part.file_data.file_uri for part in user_content_obj.parts[:2]  # type: ignore[union-attr]
+        part.file_data.file_uri for part in user_content_obj.parts[:2] if part.file_data is not None
     ] == [
         first_gemini_file.uri,
         second_gemini_file.uri,
@@ -1258,9 +1236,7 @@ async def test_builder_build_contents_with_multiple_pdf_attachments(
 
 
 @pytest.mark.asyncio
-async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(
-    pipe_instance_fixture, tmp_path
-):
+async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_fixture, tmp_path):
     """
     Tests that a compressed single-PDF output is uploaded under a synthetic ID,
     avoiding stale original-file ID hash mappings.
@@ -1325,9 +1301,7 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(
         file_path=None,
     )
     mock_files_api_manager.get_or_upload_file_from_path.assert_awaited_once()
-    upload_kwargs = (
-        mock_files_api_manager.get_or_upload_file_from_path.await_args.kwargs
-    )
+    upload_kwargs = mock_files_api_manager.get_or_upload_file_from_path.await_args.kwargs
     assert upload_kwargs["file_path"] == str(optimized_pdf_path)
     assert upload_kwargs["mime_type"] == pdf_mime_type
     assert upload_kwargs["owui_file_id"].startswith(f"{pdf_file_id}:pdf:")
@@ -1370,9 +1344,7 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
                         start_page=(i * 46) + 1,
                         end_page=(i + 1) * 46,
                     )
-                    for i, (path, chunk) in enumerate(
-                        zip(chunk_paths, chunks, strict=True)
-                    )
+                    for i, (path, chunk) in enumerate(zip(chunk_paths, chunks, strict=True))
                 ],
                 page_count=2401,
                 was_mitigated=True,
@@ -1415,14 +1387,8 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
     assert parts[0].text is not None
     assert "very-large.pdf" in parts[0].text
     assert "3 consecutive attachments" in parts[0].text
-    assert (
-        "PDF 'very-large.pdf', attachment 1: original document pages 1-46"
-        in parts[0].text
-    )
-    assert (
-        "PDF 'very-large.pdf', attachment 2: original document pages 47-92"
-        in parts[0].text
-    )
+    assert "PDF 'very-large.pdf', attachment 1: original document pages 1-46" in parts[0].text
+    assert "PDF 'very-large.pdf', attachment 2: original document pages 47-92" in parts[0].text
     assert "do not restart page numbering at 1" in parts[0].text
     assert [part.file_data.file_uri for part in parts[1:]] == [  # type: ignore[union-attr]
         "gs://fake-bucket/chunk-1.pdf",
@@ -1459,29 +1425,30 @@ async def test_pdf_mitigation_manager_reuses_cached_result(tmp_path):
         chunk_path.write_bytes(chunk)
         chunk_paths.append(chunk_path)
 
-    with patch.object(
-        GeminiPDFProcessor,
-        "prepare_to_directory",
-        return_value=PreparedPDFResult(
-            parts=[
-                PreparedPDFPart(
-                    path=str(path),
-                    size=len(chunk),
-                    start_page=(i * 600) + 1,
-                    end_page=(i + 1) * 600,
-                )
-                for i, (path, chunk) in enumerate(
-                    zip(chunk_paths, chunks, strict=True)
-                )
-            ],
-            page_count=1200,
-            was_mitigated=True,
-        ),
-    ) as mock_prepare, patch.object(
-        manager,
-        "_write_temp_source",
-        wraps=manager._write_temp_source,
-    ) as mock_write_temp_source:
+    with (
+        patch.object(
+            GeminiPDFProcessor,
+            "prepare_to_directory",
+            return_value=PreparedPDFResult(
+                parts=[
+                    PreparedPDFPart(
+                        path=str(path),
+                        size=len(chunk),
+                        start_page=(i * 600) + 1,
+                        end_page=(i + 1) * 600,
+                    )
+                    for i, (path, chunk) in enumerate(zip(chunk_paths, chunks, strict=True))
+                ],
+                page_count=1200,
+                was_mitigated=True,
+            ),
+        ) as mock_prepare,
+        patch.object(
+            manager,
+            "_write_temp_source",
+            wraps=manager._write_temp_source,
+        ) as mock_write_temp_source,
+    ):
         first_outcome = await manager.prepare(
             file_bytes=original_pdf_bytes,
             file_path=None,
@@ -1496,9 +1463,7 @@ async def test_pdf_mitigation_manager_reuses_cached_result(tmp_path):
     assert mock_prepare.call_count == 1
     assert mock_write_temp_source.call_count == 1
     assert first_outcome.result is second_outcome.result
-    assert [part.path for part in first_outcome.result.parts] == [
-        str(path) for path in chunk_paths
-    ]
+    assert [part.path for part in first_outcome.result.parts] == [str(path) for path in chunk_paths]
 
 
 def test_pdf_processor_rejects_single_page_over_limit(monkeypatch):
@@ -1565,10 +1530,7 @@ def test_pdf_processor_splits_real_pdf_by_page_limit(tmp_path):
     assert result.page_count == 5
     assert result.was_mitigated is True
     assert len(result.parts) == 3
-    page_counts = [
-        processor._count_pages_from_path(pikepdf, part.path)
-        for part in result.parts
-    ]
+    page_counts = [processor._count_pages_from_path(pikepdf, part.path) for part in result.parts]
     assert page_counts == [2, 2, 1]
     assert [(part.start_page, part.end_page) for part in result.parts] == [
         (1, 2),
@@ -1599,14 +1561,16 @@ async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
         pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
     )
 
-    with patch.object(
-        builder,
-        "_process_message_turn",
-        new_callable=AsyncMock,
-        side_effect=PDFProcessingError("failed to process PDF"),
+    with (
+        patch.object(
+            builder,
+            "_process_message_turn",
+            new_callable=AsyncMock,
+            side_effect=PDFProcessingError("failed to process PDF"),
+        ),
+        pytest.raises(ContentBuildError, match="failed to process PDF"),
     ):
-        with pytest.raises(ContentBuildError, match="failed to process PDF"):
-            await builder.build_contents()
+        await builder.build_contents()
 
 
 # endregion Test GeminiContentBuilder

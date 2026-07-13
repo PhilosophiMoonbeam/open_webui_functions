@@ -12,7 +12,7 @@ import aiofiles
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
-from watchfiles import awatch, Change
+from watchfiles import Change, awatch
 
 # --- Configuration & State Management ---
 
@@ -109,7 +109,7 @@ async def extract_metadata_from_file(filepath: str) -> dict[str, str]:
     """
     metadata = {}
     try:
-        async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
+        async with aiofiles.open(filepath, encoding="utf-8") as file:
             content = await file.read()
 
         if not content.strip().startswith('"""'):
@@ -156,7 +156,7 @@ class OwuiApiClient:
                 f"{self._root_url}/health", timeout=aiohttp.ClientTimeout(total=3)
             ) as response:
                 return response.status == 200
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (TimeoutError, aiohttp.ClientError):
             return False
         except Exception as e:
             logger.exception(f"Unexpected error checking API: {e}")
@@ -171,7 +171,7 @@ class OwuiApiClient:
                 response.raise_for_status()
                 functions = await response.json()
                 return any(f["id"] == function_id for f in functions)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.error(f"Error checking function existence: {e}")
             return False
         except Exception as e:
@@ -210,9 +210,9 @@ class OwuiApiClient:
     ) -> bool:
         """Updates a remote function, or creates it if it doesn't exist. Returns True on success."""
         try:
-            async with aiofiles.open(filepath, "r", encoding="utf-8") as file:
+            async with aiofiles.open(filepath, encoding="utf-8") as file:
                 code_content = await file.read()
-        except (IOError, OSError) as e:
+        except OSError as e:
             logger.error(f"Failed to read file {filepath} before update: {e}")
             return False
 
@@ -243,15 +243,13 @@ class OwuiApiClient:
                         filepath, function_id, function_name, description, code_content
                     )
                     return True
-                except (aiohttp.ClientError, asyncio.TimeoutError) as create_err:
+                except (TimeoutError, aiohttp.ClientError) as create_err:
                     logger.error(f"Creation failed for {filepath}: {create_err}")
-                except Exception as create_exc:
-                    logger.exception(
-                        f"Unexpected error creating function {function_id}"
-                    )
+                except Exception:
+                    logger.exception(f"Unexpected error creating function {function_id}")
             else:
                 logger.error(f"Update failed for {filepath}: {e}")
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.error(
                 f"Update failed for {filepath}: {type(e).__name__}: {e}. Check network/API status."
             )
@@ -281,9 +279,9 @@ class FunctionUpdater:
         # We generate a unique suffix based on the endpoint and key. This prevents
         # hash collisions or "false-positive" sync states when switching between
         # different OWUI environments (e.g., local vs remote).
-        instance_id = hashlib.sha256(
-            f"{config.api_endpoint}{config.api_key}".encode()
-        ).hexdigest()[:8]
+        instance_id = hashlib.sha256(f"{config.api_endpoint}{config.api_key}".encode()).hexdigest()[
+            :8
+        ]
 
         self._state_file = os.path.join(self._state_dir, f"hashes_{instance_id}.json")
 
@@ -298,7 +296,7 @@ class FunctionUpdater:
         """Loads the previous file hashes from disk on startup."""
         if os.path.exists(self._state_file):
             try:
-                with open(self._state_file, "r", encoding="utf-8") as f:
+                with open(self._state_file, encoding="utf-8") as f:
                     state = json.load(f)
                     logger.info(f"💾 Loaded previous state from {self._state_file}")
                     return state
@@ -387,9 +385,7 @@ class FunctionUpdater:
 
         logger.info(f"👀 Started file watcher on {len(self.config.filepaths)} files...")
 
-        async for changes in awatch(
-            *directories_to_watch, stop_event=self.shutdown_event
-        ):
+        async for changes in awatch(*directories_to_watch, stop_event=self.shutdown_event):
             for change_type, path in changes:
                 if path in self.config.filepaths and change_type != Change.deleted:
                     await self._process_file(path, client)
@@ -412,16 +408,12 @@ class FunctionUpdater:
             # to reconnect as soon as it comes back up. Once available, we respect
             # the user-configured interval to avoid unnecessary overhead.
             current_interval = (
-                self.config.polling_interval
-                if self.api_state == ApiState.AVAILABLE
-                else 1
+                self.config.polling_interval if self.api_state == ApiState.AVAILABLE else 1
             )
 
             try:
-                await asyncio.wait_for(
-                    self.shutdown_event.wait(), timeout=current_interval
-                )
-            except asyncio.TimeoutError:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=current_interval)
+            except TimeoutError:
                 continue
             except asyncio.CancelledError:
                 break
@@ -429,9 +421,7 @@ class FunctionUpdater:
     async def run(self) -> None:
         """The main execution loop."""
         async with aiohttp.ClientSession() as session:
-            api_client = OwuiApiClient(
-                session, self.config.api_endpoint, self.config.api_key
-            )
+            api_client = OwuiApiClient(session, self.config.api_endpoint, self.config.api_key)
 
             try:
                 async with asyncio.TaskGroup() as tg:

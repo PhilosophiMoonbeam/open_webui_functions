@@ -1,0 +1,111 @@
+[project]
+name = "open-webui-functions"
+version = "0.1.0"
+description = "Open WebUI pipes, filters, development utilities, and examples."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "aiocache",
+  "aiofiles",
+  "aiohttp",
+  "fastapi",
+  "google-api-core",
+  "google-cloud-storage",
+  "google-genai==2.8.0",
+  "loguru",
+  "pikepdf",
+  "pydantic",
+  "python-dotenv",
+  "pyyaml",
+  "watchfiles",
+  "xxhash",
+]
+
+[dependency-groups]
+dev = [
+  "pyright>=1.1.397",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.11.0",
+  "vulture>=2.14",
+]
+
+[tool.uv]
+package = false
+
+[tool.pyright]
+pythonVersion = "3.11"
+pythonPlatform = "All"
+typeCheckingMode = "basic"
+include = ["plugins", "utils", "dev", "tests", "examples"]
+exclude = ["plugins/archived", "submodules"]
+venvPath = "."
+venv = ".venv"
+reportMissingTypeStubs = false
+reportMissingImports = false
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["plugins", "utils", "dev", "tests", "examples"]
+exclude = ["plugins/archived", "submodules"]
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "I",
+  "UP",
+  "B",
+]
+ignore = [
+  # Published plugins carry metadata and bootstrap code before their imports.
+  "E402",
+  # Plugin files are copied independently, so shared typing names are imported in bulk.
+  "F403",
+  "F405",
+  # The formatter deliberately leaves long URLs, metadata, and messages intact.
+  "E501",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+  "-ra",
+  "--strict-config",
+  "--strict-markers",
+]
+norecursedirs = [
+  ".git",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".venv",
+  "build",
+  "dist",
+  "submodules",
+]
+
+[tool.vulture]
+paths = ["plugins", "utils", "dev", "tests", "examples"]
+exclude = ["plugins/archived/", "submodules/"]
+ignore_names = [
+  "Handler",
+  "Record",
+  "UserData",
+  "cls",
+  "exc",
+  "exc_type",
+  "frame",
+  "module",
+  "traceback",
+]
+min_confidence = 80

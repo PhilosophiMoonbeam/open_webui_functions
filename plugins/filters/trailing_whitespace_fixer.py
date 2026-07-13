@@ -12,7 +12,7 @@ version: 1.0.0
 import datetime
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
@@ -86,7 +86,7 @@ class Filter:
 
                     # If any part of the message was changed, update the message content.
                     if was_modified:
-                        message["content"] = content_parts # type: ignore
+                        message["content"] = content_parts  # type: ignore
                         modified_count += 1
 
         if user_message_count > 0:

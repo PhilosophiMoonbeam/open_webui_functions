@@ -12,19 +12,18 @@ requirements:
 
 import json
 import sys
+from collections.abc import Awaitable, Callable
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Awaitable,
-    Callable,
     Literal,
     cast,
-    TYPE_CHECKING,
 )
 
-from pydantic import BaseModel, Field
+from loguru import logger
 from open_webui.models.chats import Chats
 from open_webui.utils.logger import stdout_format
-from loguru import logger
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -37,11 +36,11 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
 
     def __init__(self):
@@ -51,9 +50,7 @@ class Pipe:
     async def pipes(self) -> list["ModelData"]:
         self._add_log_handler()
         log.info("Registering the pipe model.")
-        return [
-            {"id": "associate_messages_to_files", "name": "Associate Messages to Files"}
-        ]
+        return [{"id": "associate_messages_to_files", "name": "Associate Messages to Files"}]
 
     async def pipe(
         self,
@@ -66,9 +63,7 @@ class Pipe:
         chat_id = __metadata__.get("chat_id")
         if not chat_id:
             error_msg = "Chat ID not found in request body or metadata."
-            await self._emit_error(
-                error_msg, event_emitter=__event_emitter__, exception=False
-            )
+            await self._emit_error(error_msg, event_emitter=__event_emitter__, exception=False)
             return None
 
         # Get the message history directly from the backend.
@@ -78,9 +73,7 @@ class Pipe:
             print(json.dumps(chat.model_dump(), indent=2, default=str))
         else:
             error_msg = f"Chat with ID {chat_id} not found."
-            await self._emit_error(
-                error_msg, event_emitter=__event_emitter__, exception=False
-            )
+            await self._emit_error(error_msg, event_emitter=__event_emitter__, exception=False)
             return None
         return "Hello World!"
 
@@ -97,7 +90,7 @@ class Pipe:
         sources: list["Source"] | None = None,
     ):
         """Constructs and emits completion event."""
-        emission: "ChatCompletionEvent" = {
+        emission: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": {"done": done},
         }
@@ -121,13 +114,9 @@ class Pipe:
             log.opt(depth=1, exception=False).warning(error_msg)
         else:
             log.opt(depth=1, exception=exception).error(error_msg)
-        await self._emit_completion(
-            error=f"\n{error_msg}", event_emitter=event_emitter, done=True
-        )
+        await self._emit_completion(error=f"\n{error_msg}", event_emitter=event_emitter, done=True)
 
-    async def _process_chat_messages(
-        self, chat: "ChatObjectDataTD"
-    ) -> list[dict[str, Any]]:
+    async def _process_chat_messages(self, chat: "ChatObjectDataTD") -> list[dict[str, Any]]:
         """
         Turns the Open WebUI's ChatModel object into more lean dict object that contains only the messages.
         """
@@ -163,8 +152,8 @@ class Pipe:
             return record["name"] == __name__  # Filter by module name
 
         # Access the internal state of the logger
-        handlers: dict[int, "Handler"] = logger._core.handlers  # type: ignore
-        for key, handler in handlers.items():
+        handlers: dict[int, Handler] = logger._core.handlers  # type: ignore
+        for _key, handler in handlers.items():
             existing_filter = handler._filter
             if (
                 hasattr(existing_filter, "__name__")

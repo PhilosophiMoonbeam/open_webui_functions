@@ -26,62 +26,61 @@ RECOMMENDED_COMPANION_VERSION = "2.1.0"
 # This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
-from google import genai
-from google.genai import types
-from google.genai import errors as genai_errors
-
-import time
-import copy
-import json
-from urllib.parse import urlparse, parse_qs
-import xxhash
 import asyncio
-import aiofiles
-from aiocache import cached
-from aiocache.base import BaseCache
-from aiocache.serializers import NullSerializer
-from aiocache.backends.memory import SimpleMemoryCache
-from functools import cache
-from datetime import datetime, timezone
-from fastapi.datastructures import State
-import io
-import mimetypes
-import uuid
 import base64
-import re
-import fnmatch
-import sys
+import copy
 import difflib
+import fnmatch
+import io
+import json
+import mimetypes
 import os
+import re
 import shutil
+import sys
 import tempfile
+import time
+import uuid
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
-from loguru import logger
-from fastapi import Request, FastAPI
-import pydantic_core
-from pydantic import BaseModel, Field, field_validator
-from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import (
+    TYPE_CHECKING,
     Any,
     Final,
-    AsyncGenerator,
     Literal,
-    TYPE_CHECKING,
     cast,
 )
+from urllib.parse import parse_qs, urlparse
 
+import aiofiles
+import pydantic_core
+import xxhash
+from aiocache import cached
+from aiocache.backends.memory import SimpleMemoryCache
+from aiocache.base import BaseCache
+from aiocache.serializers import NullSerializer
+from fastapi import FastAPI, Request
+from fastapi.datastructures import State
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+from loguru import logger
 from open_webui.models.chats import Chats
 from open_webui.models.files import FileForm, Files
-from open_webui.storage.provider import Storage
 from open_webui.models.functions import Functions
+from open_webui.storage.provider import Storage
 from open_webui.utils.misc import pop_system_message
+from pydantic import BaseModel, Field, field_validator
 
 # This block is skipped at runtime.
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
     from plugins.filters.gemini_manifold_companion import EventEmitter
+
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
     from utils.manifold_types import *
 
@@ -226,10 +225,7 @@ class GeminiPDFProcessor:
         optimized_bytes = self._optimize_pdf(pikepdf, file_bytes)
         optimized_page_count = self._count_pages(pikepdf, optimized_bytes)
 
-        if (
-            len(optimized_bytes) <= self.max_bytes
-            and optimized_page_count <= self.max_pages
-        ):
+        if len(optimized_bytes) <= self.max_bytes and optimized_page_count <= self.max_pages:
             return [optimized_bytes], optimized_page_count, True
 
         chunks = self._split_pdf(pikepdf, optimized_bytes)
@@ -243,9 +239,7 @@ class GeminiPDFProcessor:
         source_size: int | None = None,
     ) -> PreparedPDFResult:
         pikepdf = self._get_pikepdf()
-        source_size = (
-            source_size if source_size is not None else os.path.getsize(source_path)
-        )
+        source_size = source_size if source_size is not None else os.path.getsize(source_path)
         page_count = self._count_pages_from_path(pikepdf, source_path)
 
         if source_size <= self.max_bytes and page_count <= self.max_pages:
@@ -332,9 +326,7 @@ class GeminiPDFProcessor:
             self._remove_page_thumbnails(pikepdf, pdf)
             return self._save_pdf(pikepdf, pdf)
 
-    def _optimize_pdf_to_path(
-        self, pikepdf: Any, source_path: str, destination_path: str
-    ) -> None:
+    def _optimize_pdf_to_path(self, pikepdf: Any, source_path: str, destination_path: str) -> None:
         with self._open_pdf_path(pikepdf, source_path) as pdf:
             self._remove_page_thumbnails(pikepdf, pdf)
             self._save_pdf_to_path(pikepdf, pdf, destination_path)
@@ -393,9 +385,7 @@ class GeminiPDFProcessor:
 
                 while low <= high:
                     page_count = (low + high) // 2
-                    candidate = self._save_page_range(
-                        pikepdf, pdf, start, start + page_count
-                    )
+                    candidate = self._save_page_range(pikepdf, pdf, start, start + page_count)
 
                     if len(candidate) <= self.target_bytes:
                         best_chunk = candidate
@@ -449,9 +439,7 @@ class GeminiPDFProcessor:
                     part_number = len(parts) + 1
                     start_page = start + 1
                     end_page = start + page_count
-                    candidate_path = os.path.join(
-                        output_dir, f"part-{part_number:04d}.tmp.pdf"
-                    )
+                    candidate_path = os.path.join(output_dir, f"part-{part_number:04d}.tmp.pdf")
                     self._save_page_range_to_path(
                         pikepdf, pdf, start, start + page_count, candidate_path
                     )
@@ -512,16 +500,12 @@ class GeminiPDFProcessor:
                         start += 1
                         break
 
-                    next_count = int(
-                        page_count * (self.target_bytes / candidate_size) * 0.88
-                    )
+                    next_count = int(page_count * (self.target_bytes / candidate_size) * 0.88)
                     page_count = max(1, min(page_count - 1, next_count))
 
         return parts
 
-    def _save_page_range(
-        self, pikepdf: Any, source_pdf: Any, start: int, stop: int
-    ) -> bytes:
+    def _save_page_range(self, pikepdf: Any, source_pdf: Any, start: int, stop: int) -> bytes:
         chunk_pdf = pikepdf.Pdf.new()
         chunk_pdf.pages.extend(source_pdf.pages[start:stop])
         self._remove_page_thumbnails(pikepdf, chunk_pdf)
@@ -572,8 +556,7 @@ class UploadStatusManager:
         This should be started as a background task using asyncio.create_task().
         """
         while not (
-            self.finalize_received
-            and self.total_uploads_expected == self.uploads_completed
+            self.finalize_received and self.total_uploads_expected == self.uploads_completed
         ):
             msg = await self.queue.get()
             msg_type = msg[0]
@@ -606,7 +589,9 @@ class UploadStatusManager:
             message = f"Upload complete. {self.uploads_completed} file(s) processed."
         else:
             # Show "Uploading 1 of N..."
-            message = f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+            message = (
+                f"Uploading file {self.uploads_completed + 1} of {self.total_uploads_expected}..."
+            )
 
         self.event_emitter.emit_status(message, done=is_done, indent_level=1)
 
@@ -718,9 +703,7 @@ class FilesAPIManager:
         cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
             log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
-            log.debug(
-                f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
-            )
+            log.debug(f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately.")
             return cached_file
 
         # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
@@ -816,9 +799,7 @@ class FilesAPIManager:
                 if lock_key in self.upload_locks:
                     del self.upload_locks[lock_key]
 
-    async def _get_content_hash(
-        self, file_bytes: bytes, owui_file_id: str | None
-    ) -> str:
+    async def _get_content_hash(self, file_bytes: bytes, owui_file_id: str | None) -> str:
         """
         Retrieves the file's content hash, using a cache for known IDs or computing it.
 
@@ -860,9 +841,7 @@ class FilesAPIManager:
         cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
             log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
-            log.debug(
-                f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately."
-            )
+            log.debug(f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately.")
             return cached_file
 
         lock_key = self._get_lock_key(content_hash)
@@ -941,9 +920,7 @@ class FilesAPIManager:
                 if lock_key in self.upload_locks:
                     del self.upload_locks[lock_key]
 
-    async def _get_content_hash_from_path(
-        self, file_path: str, owui_file_id: str | None
-    ) -> str:
+    async def _get_content_hash_from_path(self, file_path: str, owui_file_id: str | None) -> str:
         if owui_file_id:
             cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
             if cached_hash:
@@ -973,7 +950,7 @@ class FilesAPIManager:
         if not expiration_time:
             return None
 
-        now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(UTC)
         if expiration_time <= now_utc:
             return 0
 
@@ -985,15 +962,11 @@ class FilesAPIManager:
             return False
         return error.code == 409 or getattr(error, "status", "") == "ALREADY_EXISTS"
 
-    async def _cache_active_file(
-        self, content_hash: str, active_file: types.File
-    ) -> None:
+    async def _cache_active_file(self, content_hash: str, active_file: types.File) -> None:
         ttl_seconds = self._calculate_ttl(active_file.expiration_time)
         file_cache_key = self._get_file_cache_key(content_hash)
         await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
-        log.debug(
-            f"Cached file object for hash {content_hash} with TTL: {ttl_seconds}s."
-        )
+        log.debug(f"Cached file object for hash {content_hash} with TTL: {ttl_seconds}s.")
 
     async def _recover_after_upload_conflict(
         self,
@@ -1012,9 +985,7 @@ class FilesAPIManager:
         conflict as an idempotent success path by fetching the existing object,
         allowing a short retry window for service-side consistency.
         """
-        log.info(
-            f"Upload conflict for {deterministic_name}; attempting to reuse existing file."
-        )
+        log.info(f"Upload conflict for {deterministic_name}; attempting to reuse existing file.")
         last_error: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
@@ -1027,9 +998,7 @@ class FilesAPIManager:
                 if file.state == types.FileState.ACTIVE:
                     active_file = file
                 else:
-                    active_file = await self._poll_for_active_state(
-                        file.name, owui_file_id
-                    )
+                    active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
                 await self._cache_active_file(content_hash, active_file)
                 return active_file
@@ -1068,12 +1037,8 @@ class FilesAPIManager:
 
         try:
             file_io = io.BytesIO(file_bytes)
-            upload_config = types.UploadFileConfig(
-                name=deterministic_name, mime_type=mime_type
-            )
-            uploaded_file = await self.client.aio.files.upload(
-                file=file_io, config=upload_config
-            )
+            upload_config = types.UploadFileConfig(name=deterministic_name, mime_type=mime_type)
+            uploaded_file = await self.client.aio.files.upload(file=file_io, config=upload_config)
             if not uploaded_file.name:
                 raise FilesAPIError(
                     f"File upload for {deterministic_name} did not return a file name."
@@ -1084,18 +1049,14 @@ class FilesAPIManager:
 
             # Check if the file is already active. If so, we can skip polling.
             if uploaded_file.state == types.FileState.ACTIVE:
-                log.debug(
-                    f"File {uploaded_file.name} is already ACTIVE. Skipping poll."
-                )
+                log.debug(f"File {uploaded_file.name} is already ACTIVE. Skipping poll.")
                 active_file = uploaded_file
             else:
                 # If not active, proceed with the original polling logic.
                 log.debug(
                     f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
                 )
-                active_file = await self._poll_for_active_state(
-                    uploaded_file.name, owui_file_id
-                )
+                active_file = await self._poll_for_active_state(uploaded_file.name, owui_file_id)
                 log.debug(f"File {active_file.name} is now ACTIVE.")
 
             await self._cache_active_file(content_hash, active_file)
@@ -1142,9 +1103,7 @@ class FilesAPIManager:
         log.info(f"Starting upload for {deterministic_name} from local path...")
 
         try:
-            upload_config = types.UploadFileConfig(
-                name=deterministic_name, mime_type=mime_type
-            )
+            upload_config = types.UploadFileConfig(name=deterministic_name, mime_type=mime_type)
             with open(file_path, "rb") as file_io:
                 uploaded_file = await self.client.aio.files.upload(
                     file=file_io, config=upload_config
@@ -1158,17 +1117,13 @@ class FilesAPIManager:
             log.trace("Uploaded file details:", payload=uploaded_file)
 
             if uploaded_file.state == types.FileState.ACTIVE:
-                log.debug(
-                    f"File {uploaded_file.name} is already ACTIVE. Skipping poll."
-                )
+                log.debug(f"File {uploaded_file.name} is already ACTIVE. Skipping poll.")
                 active_file = uploaded_file
             else:
                 log.debug(
                     f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
                 )
-                active_file = await self._poll_for_active_state(
-                    uploaded_file.name, owui_file_id
-                )
+                active_file = await self._poll_for_active_state(uploaded_file.name, owui_file_id)
                 log.debug(f"File {active_file.name} is now ACTIVE.")
 
             await self._cache_active_file(content_hash, active_file)
@@ -1228,14 +1183,10 @@ class FilesAPIManager:
                 raise FilesAPIError(error_message)
 
             state_name = file.state.name if file.state else "UNKNOWN"
-            log.trace(
-                f"File {file_name} is still {state_name}. Waiting {poll_interval}s..."
-            )
+            log.trace(f"File {file_name} is still {state_name}. Waiting {poll_interval}s...")
             await asyncio.sleep(poll_interval)
 
-        raise FilesAPIError(
-            f"File {file_name} did not become ACTIVE within {timeout} seconds."
-        )
+        raise FilesAPIError(f"File {file_name} did not become ACTIVE within {timeout} seconds.")
 
 
 class PDFMitigationManager:
@@ -1260,9 +1211,7 @@ class PDFMitigationManager:
         file_path: str | None,
     ) -> PDFMitigationOutcome | None:
         if file_path:
-            original_hash = await asyncio.to_thread(
-                FilesAPIManager._hash_file_path, file_path
-            )
+            original_hash = await asyncio.to_thread(FilesAPIManager._hash_file_path, file_path)
             return PDFMitigationOutcome(
                 original_hash=original_hash,
                 result=await self._get_or_prepare(
@@ -1311,9 +1260,7 @@ class PDFMitigationManager:
         async with lock:
             cached_result = await self._get_cached_result(original_hash)
             if cached_result:
-                log.debug(
-                    f"PDF mitigation cache HIT for source hash {original_hash} after lock."
-                )
+                log.debug(f"PDF mitigation cache HIT for source hash {original_hash} after lock.")
                 return cached_result
 
             cache_key = self._cache_key(original_hash)
@@ -1364,9 +1311,7 @@ class PDFMitigationManager:
             return False
         if not value.was_mitigated:
             return True
-        return bool(value.parts) and all(
-            os.path.exists(part.path) for part in value.parts
-        )
+        return bool(value.parts) and all(os.path.exists(part.path) for part in value.parts)
 
     @staticmethod
     def _cache_root() -> Path:
@@ -1391,9 +1336,7 @@ class PDFMitigationManager:
                 ):
                     path.unlink()
             except Exception:
-                log.exception(
-                    f"Could not clean stale PDF mitigation cache path {path}."
-                )
+                log.exception(f"Could not clean stale PDF mitigation cache path {path}.")
 
     @staticmethod
     def _write_temp_source(original_hash: str, file_bytes: bytes) -> str:
@@ -1445,9 +1388,7 @@ class GeminiContentBuilder:
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.vertexai = self.files_api_manager.client.vertexai
 
-        self.system_prompt, self.messages_body = self._extract_system_prompt(
-            self.messages_body
-        )
+        self.system_prompt, self.messages_body = self._extract_system_prompt(self.messages_body)
         self.metadata_body = metadata_body
         self.user_data = user_data
         self.messages_db = None
@@ -1553,21 +1494,19 @@ class GeminiContentBuilder:
         self, metadata_body: "Metadata", user_data: "UserData"
     ) -> list["ChatMessageTD"] | None:
         """
-        Reconstructs the active chat branch from history. Removes the trailing 
-        assistant placeholder and strictly validates that the DB history length 
+        Reconstructs the active chat branch from history. Removes the trailing
+        assistant placeholder and strictly validates that the DB history length
         matches the request body.
         """
         chat_id = metadata_body.get("chat_id", "")
         if not chat_id or "local" in chat_id:
             return None
 
-        chat = await Chats.get_chat_by_id_and_user_id(
-            id=chat_id, user_id=user_data["id"]
-        )
+        chat = await Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=user_data["id"])
         if not chat:
             return None
 
-        chat_content: "ChatObjectDataTD" = chat.chat  # type: ignore
+        chat_content: ChatObjectDataTD = chat.chat  # type: ignore
         history_data = chat_content.get("history", {})
         messages_dict = history_data.get("messages", {})
         current_id = history_data.get("currentId")
@@ -1576,24 +1515,24 @@ class GeminiContentBuilder:
             return None
 
         # 1. Walk up the parentId chain to reconstruct the linear conversation branch.
-        messages_db: list["ChatMessageTD"] = []
+        messages_db: list[ChatMessageTD] = []
         curr_id = current_id
-        
+
         while curr_id and curr_id in messages_dict:
             msg = messages_dict[curr_id]
             messages_db.insert(0, msg)
             curr_id = msg.get("parentId")
 
         # 2. Handle the trailing assistant placeholder.
-        # OWUI often inserts an empty assistant message entry for the turn currently 
-        # being processed. We remove it to align with the 'messages_body' which 
+        # OWUI often inserts an empty assistant message entry for the turn currently
+        # being processed. We remove it to align with the 'messages_body' which
         # only contains previous turns plus the current user message.
         if messages_db and messages_db[-1].get("role") == "assistant":
             messages_db.pop()
 
         # 3. Strict validation.
-        # If the reconstructed history (minus placeholder) doesn't exactly match the 
-        # length of the request body (minus system prompt), we bail out. 
+        # If the reconstructed history (minus placeholder) doesn't exactly match the
+        # length of the request body (minus system prompt), we bail out.
         # This prevents misaligned metadata mapping.
         if len(messages_db) != len(self.messages_body):
             log.debug(
@@ -1625,7 +1564,9 @@ class GeminiContentBuilder:
                     "Injecting a prompt to ask for clarification."
                 )
                 # Inform the user via a toast notification.
-                toast_msg = f"Your message #{i + 1} was empty. The assistant will ask for clarification."
+                toast_msg = (
+                    f"Your message #{i + 1} was empty. The assistant will ask for clarification."
+                )
                 self.event_emitter.emit_toast(toast_msg, "info")
 
                 clarification_prompt = (
@@ -1633,9 +1574,7 @@ class GeminiContentBuilder:
                     "clarification on what they would like to ask or discuss."
                 )
                 # This will become the only part for this user message.
-                parts = await self._genai_parts_from_text(
-                    clarification_prompt, status_queue
-                )
+                parts = await self._genai_parts_from_text(clarification_prompt, status_queue)
             else:
                 # Case 2: User has sent content, check if it includes text.
                 has_text_component = any(p.text for p in parts if p.text)
@@ -1700,7 +1639,7 @@ class GeminiContentBuilder:
         # PATH 1: Database is available (Normal Chat).
         if self.messages_db:
             message_db = self.messages_db[i]
-            files: list["FileAttachmentTD"] = message_db.get("files", [])
+            files: list[FileAttachmentTD] = message_db.get("files", [])
 
             if files:
                 db_files_processed = True
@@ -1746,9 +1685,7 @@ class GeminiContentBuilder:
         # Now, process the content from the message payload.
         user_content = message.get("content")
         if isinstance(user_content, str):
-            user_content_list: list["Content"] = [
-                {"type": "text", "text": user_content}
-            ]
+            user_content_list: list[Content] = [{"type": "text", "text": user_content}]
         elif isinstance(user_content, list):
             user_content_list = user_content
         else:
@@ -1762,9 +1699,7 @@ class GeminiContentBuilder:
             if c_type == "text":
                 c = cast("TextContent", c)
                 if c_text := c.get("text"):
-                    user_parts.extend(
-                        await self._genai_parts_from_text(c_text, status_queue)
-                    )
+                    user_parts.extend(await self._genai_parts_from_text(c_text, status_queue))
 
             # PATH 2: Temporary Chat Image Handling.
             # FIXME: this puts images to the end of the message, see if it matters where they are.
@@ -1772,9 +1707,7 @@ class GeminiContentBuilder:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
                 if uri := c.get("image_url", {}).get("url"):
-                    user_parts.extend(
-                        await self._genai_parts_from_uri(uri, status_queue)
-                    )
+                    user_parts.extend(await self._genai_parts_from_uri(uri, status_queue))
 
         return user_parts
 
@@ -1822,11 +1755,11 @@ class GeminiContentBuilder:
     def _pop_thoughts(self, content: str) -> tuple[str, list[str]]:
         """
         Identifies and removes thought blocks from the content.
-        
+
         A thought is defined as text between <think> and </think>\n.
-        This method handles multiple thought blocks if they are peppered 
+        This method handles multiple thought blocks if they are peppered
         throughout the message.
-        
+
         :param content: The raw message content from the assistant.
         :return: A tuple containing (cleaned_content, list_of_extracted_thoughts).
         """
@@ -1871,13 +1804,9 @@ class GeminiContentBuilder:
             # Now current_content has no thoughts and no citations,
             # making it directly comparable to original_content.
             if current_content.strip() == original_content.strip():
-                log.debug(
-                    f"Reconstructing assistant message at index {i} from stored parts."
-                )
+                log.debug(f"Reconstructing assistant message at index {i} from stored parts.")
                 try:
-                    return await self._rehydrate_assistant_parts(
-                        gemini_parts, status_queue
-                    )
+                    return await self._rehydrate_assistant_parts(gemini_parts, status_queue)
                 except (pydantic_core.ValidationError, TypeError, ValueError):
                     log.exception(
                         f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
@@ -1938,9 +1867,7 @@ class GeminiContentBuilder:
         else:
             pattern = re.compile(markdown_part)
             process_youtube = False
-            log.info(
-                "YouTube URL parsing is disabled. URLs will be treated as plain text."
-            )
+            log.info("YouTube URL parsing is disabled. URLs will be treated as plain text.")
 
         for match in pattern.finditer(text):
             # Add the text segment that precedes the media link
@@ -1948,15 +1875,10 @@ class GeminiContentBuilder:
                 parts.append(types.Part.from_text(text=text_segment))
 
             # The URI is in group 1 for markdown, or group 2 for YouTube.
-            if process_youtube:
-                uri = match.group(1) or match.group(2)
-            else:
-                uri = match.group(1)
+            uri = match.group(1) or match.group(2) if process_youtube else match.group(1)
 
             if not uri:
-                log.warning(
-                    f"Found unsupported URI format in text: {match.group(0)}. Skipping."
-                )
+                log.warning(f"Found unsupported URI format in text: {match.group(0)}. Skipping.")
                 continue
 
             # Delegate all URI processing to the unified helper
@@ -2099,11 +2021,7 @@ class GeminiContentBuilder:
         force_raw: bool = False,
         source_name: str | None = None,
     ) -> list[types.Part]:
-        if (
-            mime_type == "application/pdf"
-            and self.valves.PDF_LIMIT_MITIGATION
-            and not force_raw
-        ):
+        if mime_type == "application/pdf" and self.valves.PDF_LIMIT_MITIGATION and not force_raw:
             outcome = await self.pdf_mitigation_manager.prepare(
                 file_bytes=file_bytes,
                 file_path=file_path,
@@ -2367,17 +2285,13 @@ class GeminiContentBuilder:
             # Start time from query `t`. Convert flexible format to "Ns".
             if "t" in query_params:
                 raw_start = query_params["t"][0]
-                if (
-                    total_seconds := self._parse_duration_to_seconds(raw_start)
-                ) is not None:
+                if (total_seconds := self._parse_duration_to_seconds(raw_start)) is not None:
                     start_offset = f"{total_seconds}s"
 
             # End time from fragment `end`. Convert flexible format to "Ns".
             if "end" in fragment_params:
                 raw_end = fragment_params["end"][0]
-                if (
-                    total_seconds := self._parse_duration_to_seconds(raw_end)
-                ) is not None:
+                if (total_seconds := self._parse_duration_to_seconds(raw_end)) is not None:
                     end_offset = f"{total_seconds}s"
 
             # Frame rate from fragment `interval` or `fps`. `interval` takes precedence.
@@ -2654,7 +2568,6 @@ class GeminiContentBuilder:
 
 
 class Pipe:
-
     @staticmethod
     def _validate_coordinates_format(v: str | None) -> str | None:
         """Reusable validator for 'latitude,longitude' format."""
@@ -2662,9 +2575,7 @@ class Pipe:
             try:
                 parts = v.split(",")
                 if len(parts) != 2:
-                    raise ValueError(
-                        "Must contain exactly two parts separated by a comma."
-                    )
+                    raise ValueError("Must contain exactly two parts separated by a comma.")
 
                 lat_str, lon_str = parts
                 lat = float(lat_str.strip())
@@ -2678,7 +2589,7 @@ class Pipe:
                 raise ValueError(
                     f"Invalid format for MAPS_GROUNDING_COORDINATES: '{v}'. "
                     f"Expected 'latitude,longitude' (e.g., '40.7128,-74.0060'). Original error: {e}"
-                )
+                ) from e
         return v
 
     class Valves(BaseModel):
@@ -2821,12 +2732,12 @@ class Pipe:
             Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="""Select logging level. Use `docker logs -f open-webui` to view logs.
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="""Select logging level. Use `docker logs -f open-webui` to view logs.
             Default value is INFO.""",
+            )
         )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
             default="1K",
@@ -2889,6 +2800,7 @@ class Pipe:
         and enforce policies, while still giving users the flexibility to tailor
         certain parameters, like their API key or model settings, for their own use.
         """
+
         # FIXME: `Literal[""]` might not be necessary anymore
         GEMINI_FREE_API_KEY: str | None = Field(
             default=None,
@@ -3007,11 +2919,8 @@ class Pipe:
         @field_validator("THINKING_BUDGET", mode="after")
         @classmethod
         def validate_thinking_budget_range(cls, v):
-            if v is not None and v != "":
-                if not (-1 <= v <= 32768):
-                    raise ValueError(
-                        "THINKING_BUDGET must be between -1 and 32768, inclusive."
-                    )
+            if v is not None and v != "" and not (-1 <= v <= 32768):
+                raise ValueError("THINKING_BUDGET must be between -1 and 32768, inclusive.")
             return v
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
@@ -3034,8 +2943,9 @@ class Pipe:
         # Clear cache if caching is disabled
         if not self.valves.CACHE_MODELS:
             log.debug("CACHE_MODELS is False, clearing model cache.")
-            cache_instance = getattr(self._get_genai_models, "cache")
-            await cast(BaseCache, cache_instance).clear()
+            cache_instance = getattr(self._get_genai_models, "cache", None)
+            if isinstance(cache_instance, BaseCache):
+                await cache_instance.clear()
 
         log.info("Fetching and filtering models from Google API.")
         # Get and filter models (potentially cached based on API key, base URL, white- and blacklist)
@@ -3064,9 +2974,7 @@ class Pipe:
 
         self._add_log_handler(self.valves.LOG_LEVEL)
 
-        log.debug(
-            f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}"
-        )
+        log.debug(f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}")
         log.trace("__metadata__:", payload=__metadata__)
         features = __metadata__.get("features", {}) or cast("Features", {})
 
@@ -3075,7 +2983,7 @@ class Pipe:
 
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
-        model_config: dict[str, Any] = app_state._state.get("gemini_model_config")
+        model_config: dict[str, Any] | None = app_state._state.get("gemini_model_config")
         # FIXME: be even more strict by requring the model id to be present in the config to proceed?
         if model_config is None:
             error_msg = (
@@ -3096,8 +3004,9 @@ class Pipe:
         )
 
         if task_type := __metadata__.get("task"):
-            log.info(f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing.")
-            __event_emitter__ = None
+            log.info(
+                f"{task_type=}, disabling event emissions, YouTube URL parsing and document processing."
+            )
             # We disable YouTube parsing for task models to minimize latency and token costs,
             # as simple tasks like title or tag generation do not require video context.
             valves.PARSE_YOUTUBE_URLS = False
@@ -3112,21 +3021,26 @@ class Pipe:
             features=features,
         )
 
-        log.debug(f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}")
+        log.debug(
+            f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}"
+        )
 
-        # FIXME: might be None in some cases, needs handling
-        event_emitter: "EventEmitter" = self._get_and_clear_data_from_state(
+        event_emitter: EventEmitter | None = self._get_and_clear_data_from_state(
             app_state=app_state,
             chat_id=__metadata__.get("chat_id"),
             message_id=__metadata__.get("message_id"),
             key_suffix="gemini_event_emitter",
-            clear_after_read=False
+            clear_after_read=False,
         )
         if not event_emitter:
-            log.debug("No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request.")
+            log.debug(
+                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
+            )
             event_emitter = app_state._state.get("gemini_dummy_event_emitter")
         if not event_emitter:
-            log.error("No event emitter available. This is unexpected as the dummy event emitter should always be present. Request will likely error out.")
+            raise RuntimeError(
+                "No event emitter is available; the companion filter did not initialize one."
+            )
 
         # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):
@@ -3187,13 +3101,10 @@ class Pipe:
                     event_emitter.emit_status(
                         f"Free Tier {reason}, switching to Paid API...", done=False
                     )
-                    continue 
+                    continue
 
                 # If we can't retry, re-raise the error to stop execution
-                error_msg = (
-                    f"Gemini request failed before a model response could be "
-                    f"generated: {e}"
-                )
+                error_msg = f"Gemini request failed before a model response could be generated: {e}"
                 log.exception(f"Error during request execution (Tier: {tier}): {e}")
                 event_emitter.emit_status("Request failed", done=True)
                 event_emitter.emit_toast(error_msg, "error")
@@ -3242,8 +3153,7 @@ class Pipe:
         else:  # Covers (use_vertex_ai and not vertex_project) OR (not use_vertex_ai)
             if use_vertex_ai and not vertex_project:
                 log.warning(
-                    "Vertex AI is enabled but no project is set. "
-                    "Using Gemini Developer API."
+                    "Vertex AI is enabled but no project is set. Using Gemini Developer API."
                 )
             # This also implicitly covers the case where api_key might be None,
             # which is handled by the initial check or the SDK.
@@ -3261,9 +3171,7 @@ class Pipe:
             raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
     def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
-        user_whitelist = (
-            valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
-        )
+        user_whitelist = valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
         log.debug(
             f"User whitelist: {user_whitelist}, user email: {user_email}, "
             f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
@@ -3325,9 +3233,7 @@ class Pipe:
         fetch_both = bool(use_vertex_ai and vertex_project and (free_api_key or paid_api_key))
 
         if fetch_both:
-            log.info(
-                "Attempting to fetch models from both Gemini Developer API and Vertex AI."
-            )
+            log.info("Attempting to fetch models from both Gemini Developer API and Vertex AI.")
             gemini_models_list: list[types.Model] = []
             vertex_models_list: list[types.Model] = []
 
@@ -3427,12 +3333,8 @@ class Pipe:
             # Determine if we are effectively using Vertex AI or Gemini API
             # This depends on user's config (use_vertex_ai) and availability of project/key
             client_target_is_vertex = bool(use_vertex_ai and vertex_project)
-            client_source_name = (
-                "Vertex AI" if client_target_is_vertex else "Gemini Developer API"
-            )
-            log.info(
-                f"Attempting to fetch models from a single source: {client_source_name}."
-            )
+            client_source_name = "Vertex AI" if client_target_is_vertex else "Gemini Developer API"
+            log.info(f"Attempting to fetch models from a single source: {client_source_name}.")
 
             try:
                 client = self._get_or_create_genai_client(
@@ -3441,9 +3343,7 @@ class Pipe:
                     base_url=base_url,
                     use_vertex_ai=client_target_is_vertex,  # Pass the determined target
                     vertex_project=vertex_project if client_target_is_vertex else None,
-                    vertex_location=(
-                        vertex_location if client_target_is_vertex else None
-                    ),
+                    vertex_location=(vertex_location if client_target_is_vertex else None),
                 )
                 all_raw_models = await self._fetch_models_from_client_internal(
                     client, client_source_name
@@ -3455,9 +3355,7 @@ class Pipe:
                     )
 
             except GenaiApiError as e:
-                raise GenaiApiError(
-                    f"Failed to get models from {client_source_name}: {e}"
-                ) from e
+                raise GenaiApiError(f"Failed to get models from {client_source_name}: {e}") from e
             except Exception as e:
                 log.error(
                     f"An unexpected error occurred while configuring client or fetching models from {client_source_name}: {e}",
@@ -3493,14 +3391,10 @@ class Pipe:
                 )
 
         if not generative_models:
-            log.warning(
-                "No generative models found after filtering all retrieved models."
-            )
+            log.warning("No generative models found after filtering all retrieved models.")
             return []
 
-        def match_patterns(
-            name_to_check: str, list_of_patterns_str: str | None
-        ) -> bool:
+        def match_patterns(name_to_check: str, list_of_patterns_str: str | None) -> bool:
             if not list_of_patterns_str:
                 return False
             patterns = [
@@ -3508,7 +3402,7 @@ class Pipe:
             ]  # Ensure pat is not empty
             return any(fnmatch.fnmatch(name_to_check, pat) for pat in patterns)
 
-        filtered_models_data: list["ModelData"] = []
+        filtered_models_data: list[ModelData] = []
         for model in generative_models:
             # model.name is guaranteed non-None by generative_models filter logic
             assert model.name is not None
@@ -3520,12 +3414,8 @@ class Pipe:
                 )
                 continue
 
-            passes_whitelist = not whitelist_str or match_patterns(
-                stripped_name, whitelist_str
-            )
-            passes_blacklist = not blacklist_str or not match_patterns(
-                stripped_name, blacklist_str
-            )
+            passes_whitelist = not whitelist_str or match_patterns(stripped_name, whitelist_str)
+            passes_blacklist = not blacklist_str or not match_patterns(stripped_name, blacklist_str)
 
             if passes_whitelist and passes_blacklist:
                 filtered_models_data.append(
@@ -3556,9 +3446,7 @@ class Pipe:
             )
             models = [model async for model in google_models_pager]
             log.info(f"Retrieved {len(models)} models from {source_name}.")
-            log.trace(
-                f"All models returned by {source_name}:", payload=models
-            )  # Can be verbose
+            log.trace(f"All models returned by {source_name}:", payload=models)  # Can be verbose
             return models
         except Exception as e:
             log.error(f"Retrieving models from {source_name} failed: {e}")
@@ -3634,17 +3522,13 @@ class Pipe:
         # 2. Check for a base model ID in the metadata for custom models
         if metadata := body.get("metadata"):
             # Safely navigate the nested structure: metadata -> model -> info -> base_model_id
-            base_model_name = (
-                metadata.get("model", {}).get("info", {}).get("base_model_id", None)
-            )
+            base_model_name = metadata.get("model", {}).get("info", {}).get("base_model_id", None)
             # If a base model ID is found, it overrides the initially requested name
             if base_model_name:
                 effective_model_name = base_model_name
 
         # 3. Create the canonical model name by removing the manifold prefix
-        canonical_model_name = effective_model_name.replace(
-            "gemini_manifold_google_genai.", ""
-        )
+        canonical_model_name = effective_model_name.replace("gemini_manifold_google_genai.", "")
 
         # 4. Log the relevant names for debugging purposes
         log.debug(
@@ -3679,14 +3563,9 @@ class Pipe:
         features = __metadata__.get("features", {}) or {}
         is_vertex_ai = __metadata__.get("is_vertex_ai", False)
 
-        log.debug(
-            "Features extracted from metadata (UI toggles and config):",
-            payload=features
-        )
+        log.debug("Features extracted from metadata (UI toggles and config):", payload=features)
 
-        safety_settings: list[types.SafetySetting] | None = __metadata__.get(
-            "safety_settings"
-        )
+        safety_settings: list[types.SafetySetting] | None = __metadata__.get("safety_settings")
 
         thinking_conf = None
         # We are ensured to have a valid model ID at this point.
@@ -3720,13 +3599,9 @@ class Pipe:
                 try:
                     # Attempt to parse as a number (for thinking_budget).
                     budget = round(float(reasoning_effort))
-                    log.info(
-                        f"Interpreting `reasoning_effort` as a thinking budget: {budget}"
-                    )
+                    log.info(f"Interpreting `reasoning_effort` as a thinking budget: {budget}")
                     thinking_conf.thinking_budget = budget
-                    thinking_conf.thinking_level = (
-                        None  # Budget and level are mutually exclusive.
-                    )
+                    thinking_conf.thinking_level = None  # Budget and level are mutually exclusive.
                 except (ValueError, TypeError):
                     # If it's not a number, treat it as a thinking_level string.
                     if isinstance(reasoning_effort, str):
@@ -3735,9 +3610,7 @@ class Pipe:
                             log.info(
                                 f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
                             )
-                            thinking_conf.thinking_level = types.ThinkingLevel[
-                                effort_level_str
-                            ]
+                            thinking_conf.thinking_level = types.ThinkingLevel[effort_level_str]
                             thinking_conf.thinking_budget = (
                                 None  # Budget and level are mutually exclusive.
                             )
@@ -3815,17 +3688,13 @@ class Pipe:
                 )
             else:
                 log.info("Using grounding with Google Search as a Tool.")
-                gen_content_conf.tools.append(
-                    types.Tool(google_search=types.GoogleSearch())
-                )
+                gen_content_conf.tools.append(types.Tool(google_search=types.GoogleSearch()))
 
         # NB: It is not possible to use both Search and Code execution at the same time,
         # however, it can be changed later, so let's just handle it as a common error
         if features.get("google_code_execution"):
             log.info("Using code execution on Google side.")
-            gen_content_conf.tools.append(
-                types.Tool(code_execution=types.ToolCodeExecution())
-            )
+            gen_content_conf.tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
 
         # Determine if URL context tool should be enabled.
         is_avail, is_on = await self._get_toggleable_feature_status(
@@ -3848,12 +3717,8 @@ class Pipe:
                         "URL context tool is enabled, but Vertex AI is used with other tools. Skipping."
                     )
                 else:
-                    log.info(
-                        f"Model {model_id} is compatible with URL context tool. Enabling."
-                    )
-                    gen_content_conf.tools.append(
-                        types.Tool(url_context=types.UrlContext())
-                    )
+                    log.info(f"Model {model_id} is compatible with URL context tool. Enabling.")
+                    gen_content_conf.tools.append(types.Tool(url_context=types.UrlContext()))
             else:
                 log.warning(
                     f"URL context tool is enabled, but model {model_id} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping."
@@ -3865,9 +3730,7 @@ class Pipe:
         )
         if is_avail and is_on:
             log.info("Enabling Google Maps grounding tool.")
-            gen_content_conf.tools.append(
-                types.Tool(google_maps=types.GoogleMaps())
-            )
+            gen_content_conf.tools.append(types.Tool(google_maps=types.GoogleMaps()))
 
             if valves.MAPS_GROUNDING_COORDINATES:
                 try:
@@ -3876,8 +3739,7 @@ class Pipe:
                     longitude = float(lon_str.strip())
 
                     log.info(
-                        "Using coordinates for Maps grounding: "
-                        f"lat={latitude}, lon={longitude}"
+                        f"Using coordinates for Maps grounding: lat={latitude}, lon={longitude}"
                     )
 
                     lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
@@ -3886,9 +3748,7 @@ class Pipe:
                     if not gen_content_conf.tool_config:
                         gen_content_conf.tool_config = types.ToolConfig()
                     if not gen_content_conf.tool_config.retrieval_config:
-                        gen_content_conf.tool_config.retrieval_config = (
-                            types.RetrievalConfig()
-                        )
+                        gen_content_conf.tool_config.retrieval_config = types.RetrievalConfig()
 
                     gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
 
@@ -4004,22 +3864,16 @@ class Pipe:
 
         # Check for image/system prompt compatibility
         is_image_model = self._is_image_model(model_id, model_config)
-        if (
-            is_image_model or "gemma" in model_id
-        ) and gen_content_conf.system_instruction:
+        if (is_image_model or "gemma" in model_id) and gen_content_conf.system_instruction:
             gen_content_conf.system_instruction = None
-            log.warning(
-                f"Model '{model_id}' does not support system prompts. Removing."
-            )
+            log.warning(f"Model '{model_id}' does not support system prompts. Removing.")
 
         gen_content_args = {
             "model": model_id,
             "contents": contents,
             "config": gen_content_conf,
         }
-        log.debug(
-            f"Passing args to {api_name} (Tier: {tier}):", payload=gen_content_args
-        )
+        log.debug(f"Passing args to {api_name} (Tier: {tier}):", payload=gen_content_args)
 
         # 5. Stream Setup
         # 'is_streaming_request' tracks what Open WebUI expects to receive.
@@ -4066,7 +3920,7 @@ class Pipe:
         try:
             first_chunk = await iterator.__anext__()
         except StopAsyncIteration:
-            raise ValueError("API returned an empty response stream.")
+            raise ValueError("API returned an empty response stream.") from None
 
         # Success: Reconstruct the stream including the peeked chunk
         async def reconstructed_stream():
@@ -4114,9 +3968,7 @@ class Pipe:
         # Check Search
         is_search_requested = features.get("google_search_tool")
         if is_search_requested and "search_grounding" in excluded_features:
-            log.info(
-                f"Free Tier ineligible: Search requested but excluded for {model_id}."
-            )
+            log.info(f"Free Tier ineligible: Search requested but excluded for {model_id}.")
             return False
 
         # Check Maps
@@ -4125,9 +3977,7 @@ class Pipe:
             features.get("gemini_maps_grounding_toggle")
             and "grounding_google_maps" in excluded_features
         ):
-            log.info(
-                f"Free Tier ineligible: Maps requested but excluded for {model_id}."
-            )
+            log.info(f"Free Tier ineligible: Maps requested but excluded for {model_id}.")
             return False
 
         return True
@@ -4162,7 +4012,10 @@ class Pipe:
             async for chunk in response_stream:
                 candidate = self._get_first_candidate(chunk.candidates)
                 content = candidate.content if candidate else None
-                log.trace(f"Processing response chunk #{chunk_counter}, first candidate's content:", payload=content)
+                log.trace(
+                    f"Processing response chunk #{chunk_counter}, first candidate's content:",
+                    payload=content,
+                )
                 chunk_counter += 1
                 final_response_chunk = chunk  # Keep the latest chunk for metadata
 
@@ -4192,9 +4045,7 @@ class Pipe:
                             try:
                                 title: str | None = None
                                 # Prefer markdown-style "### Heading" titles.
-                                for m in re.finditer(
-                                    r"(^|\n)###\s+(.+?)(?=\n|$)", part.text or ""
-                                ):
+                                for m in re.finditer(r"(^|\n)###\s+(.+?)(?=\n|$)", part.text or ""):
                                     title = m.group(2).strip()
                                 # Fall back to bold "**Title**" lines if no heading was found.
                                 if not title:
@@ -4365,18 +4216,14 @@ class Pipe:
             case types.Part(inline_data=data) if data:
                 # An image part, which can be part of a thought or regular content.
                 # Image parts don't need tag disabling.
-                processed_text, image_url = await self._process_image_part(
-                    data, __metadata__, app
-                )
+                processed_text, image_url = await self._process_image_part(data, __metadata__, app)
                 payload_content = processed_text
 
                 # Transform inline_data into file_data to avoid storing raw bytes in the database.
                 # This mutates the part object which is held by reference in `response_parts`.
                 if image_url and data.mime_type:
                     part.inline_data = None
-                    part.file_data = types.FileData(
-                        file_uri=image_url, mime_type=data.mime_type
-                    )
+                    part.file_data = types.FileData(file_uri=image_url, mime_type=data.mime_type)
             case types.Part(executable_code=code) if code:
                 # Code blocks are already formatted and safe.
                 if processed_text := self._process_executable_code_part(code):
@@ -4404,11 +4251,7 @@ class Pipe:
         # The regex finds '<' followed by an optional '/' and then one of the special tags.
         # The inner parentheses group the tags, so the optional '/' applies to all of them.
         TAG_REGEX = re.compile(
-            r"<(/?"
-            + "("
-            + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE)
-            + ")"
-            + r")"
+            r"<(/?" + "(" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + ")" + r")"
         )
         # The substitution injects a ZWS, e.g., '</think>' becomes '<ZWS/think'.
         modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
@@ -4503,9 +4346,7 @@ class Pipe:
             log.warning("Image upload to Open WebUI database likely failed.")
             return None
 
-        image_url: str = app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
+        image_url: str = app.url_path_for("get_file_content_by_id", id=file_item.id)
         log.success("Image upload finished!")
         return image_url
 
@@ -4571,24 +4412,18 @@ class Pipe:
 
         if not model_response:
             log.warning("Response processing skipped: Model response was empty.")
-            event_emitter.emit_status(
-                "Response failed [Empty Response]", done=True
-            )
+            event_emitter.emit_status("Response failed [Empty Response]", done=True)
             return
 
         if not (candidate := self._get_first_candidate(model_response.candidates)):
             log.warning("Response processing skipped: No candidates found.")
-            event_emitter.emit_status(
-                "Response failed [No Candidates]", done=True
-            )
+            event_emitter.emit_status("Response failed [No Candidates]", done=True)
             return
 
         # --- Construct detailed finish reason message ---
         reason_name = getattr(candidate.finish_reason, "name", "UNSPECIFIED")
         reason_description = FINISH_REASON_DESCRIPTIONS.get(reason_name)
-        finish_message = (
-            candidate.finish_message.strip() if candidate.finish_message else None
-        )
+        finish_message = candidate.finish_message.strip() if candidate.finish_message else None
 
         details_parts = [part for part in (reason_description, finish_message) if part]
         details_str = f": {' '.join(details_parts)}" if details_parts else ""
@@ -4633,7 +4468,7 @@ class Pipe:
     ):
         """
         Stores multiple values in the app state, namespaced by chat and message ID.
-        Exits early if this is a task model (e.g. title generation) to prevent 
+        Exits early if this is a task model (e.g. title generation) to prevent
         state bloat and interference with the main chat's filter logic.
         """
         # TODO: code a separate dataclass that handles all stuff that I need to store in app state
@@ -4677,13 +4512,9 @@ class Pipe:
                 delattr(app_state, key)
             except AttributeError:
                 # This case is unlikely but handles a race condition where the attribute might already be gone.
-                log.warning(
-                    f"State key '{key}' was already gone before deletion attempt."
-                )
+                log.warning(f"State key '{key}' was already gone before deletion attempt.")
         else:
-            log.debug(
-                f"Retrieved data from app state for key '{key}' without clearing it."
-            )
+            log.debug(f"Retrieved data from app state for key '{key}' without clearing it.")
         return value
 
     @staticmethod
@@ -4731,9 +4562,7 @@ class Pipe:
         Returns None if usage metadata is not present.
         """
         if not response.usage_metadata:
-            log.warning(
-                "Usage metadata is missing from the response. Cannot determine usage."
-            )
+            log.warning("Usage metadata is missing from the response. Cannot determine usage.")
             return None
 
         # Dump the raw token usage details, excluding any fields that are None.
@@ -4751,9 +4580,7 @@ class Pipe:
         }
 
         if not is_paid_api:
-            log.debug(
-                "Using free API, costs are not applicable and will be reported as 0."
-            )
+            log.debug("Using free API, costs are not applicable and will be reported as 0.")
         else:
             # For paid APIs, attempt to calculate cost.
             try:
@@ -4762,15 +4589,11 @@ class Pipe:
                     pricing = model_config[model_id].get("pricing", {})
 
                     if pricing:
-                        total_cost = input_cost = cache_cost = output_cost = (
-                            image_output_cost
-                        ) = 0.0
+                        total_cost = input_cost = cache_cost = output_cost = image_output_cost = 0.0
 
                         # Calculate input cost (non-cached tokens)
                         prompt_tokens = token_details.get("prompt_token_count", 0)
-                        cached_tokens = token_details.get(
-                            "cached_content_token_count", 0
-                        )
+                        cached_tokens = token_details.get("cached_content_token_count", 0)
                         non_cached_input_tokens = prompt_tokens - cached_tokens
 
                         if non_cached_input_tokens > 0 and "input" in pricing:
@@ -4781,20 +4604,14 @@ class Pipe:
 
                         # Calculate cached input cost (if applicable)
                         if cached_tokens > 0 and "caching" in pricing:
-                            cache_cost = self._calculate_cost(
-                                cached_tokens, pricing["caching"]
-                            )
+                            cache_cost = self._calculate_cost(cached_tokens, pricing["caching"])
                             total_cost += cache_cost
 
                         # Calculate output cost (image + text separately)
-                        completion_tokens = token_details.get(
-                            "candidates_token_count", 0
-                        )
+                        completion_tokens = token_details.get("candidates_token_count", 0)
                         if completion_tokens > 0:
                             # If there is an image generated, it would be in candidates_tokens_details
-                            candidates_details = token_details.get(
-                                "candidates_tokens_details", []
-                            )
+                            candidates_details = token_details.get("candidates_tokens_details", [])
                             image_tokens = 0
                             for detail in candidates_details or []:
                                 if detail.get("modality") == "IMAGE":
@@ -4803,9 +4620,7 @@ class Pipe:
 
                             # Calculate text output cost
                             if text_tokens > 0 and "output" in pricing:
-                                output_cost += self._calculate_cost(
-                                    text_tokens, pricing["output"]
-                                )
+                                output_cost += self._calculate_cost(text_tokens, pricing["output"])
 
                             # Calculate image output cost
                             if image_tokens > 0 and "image_output" in pricing:
@@ -4835,24 +4650,18 @@ class Pipe:
                             f"No pricing data found for model {model_id}. Cost details will be empty."
                         )
                 else:
-                    log.debug(
-                        f"Model {model_id} not found in config. Cost details will be empty."
-                    )
+                    log.debug(f"Model {model_id} not found in config. Cost details will be empty.")
             except Exception as e:
-                log.warning(
-                    f"Failed to calculate cost: {e}. Cost details will be empty."
-                )
+                log.warning(f"Failed to calculate cost: {e}. Cost details will be empty.")
 
         # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict
         # to populate the admin dashboard.
         # We aggregate Gemini's specific counts into these two categories.
-        input_tokens = (
-            token_details.get("prompt_token_count", 0) + 
-            token_details.get("tool_use_prompt_token_count", 0)
+        input_tokens = token_details.get("prompt_token_count", 0) + token_details.get(
+            "tool_use_prompt_token_count", 0
         )
-        output_tokens = (
-            token_details.get("candidates_token_count", 0) + 
-            token_details.get("thoughts_token_count", 0)
+        output_tokens = token_details.get("candidates_token_count", 0) + token_details.get(
+            "thoughts_token_count", 0
         )
 
         usage_payload = {
@@ -4924,17 +4733,13 @@ class Pipe:
         elif isinstance(data, dict):
             # Process dictionary items, creating a new dict
             return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
+                k: self._truncate_long_strings(v, max_len, truncation_marker, truncation_enabled)
                 for k, v in data.items()
             }
         elif isinstance(data, list):
             # Process list items, creating a new list
             return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
+                self._truncate_long_strings(item, max_len, truncation_marker, truncation_enabled)
                 for item in data
             ]
         else:
@@ -4983,12 +4788,8 @@ class Pipe:
                 )
 
                 # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
+                if self._is_flat_dict(truncated_data) and not isinstance(truncated_data, list):
+                    json_string = json.dumps(truncated_data, separators=(",", ":"), default=str)
                     # Add a simple prefix if it's compact
                     serialized_data_json = " - " + json_string
                 else:
@@ -4998,9 +4799,7 @@ class Pipe:
 
             except (TypeError, ValueError) as e:  # Catch specific serialization errors
                 serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
+            except Exception as e:  # Catch any other unexpected errors during processing
                 serialized_data_json = f" - {{Processing Error: {e}}}"
 
         # Add the final JSON string (or error message) back into the record
@@ -5021,7 +4820,7 @@ class Pipe:
         # Return the format string template
         return base_template.rstrip()
 
-    @cache
+    @cache  # noqa: B019 -- Pipe has application lifetime; cache prevents duplicate log handlers.
     def _add_log_handler(self, log_level: str):
         """
         Adds or updates the loguru handler specifically for this plugin.
@@ -5046,7 +4845,7 @@ class Pipe:
             return  # Stop processing if the level is invalid
 
         # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        handlers: dict[int, Handler] = log._core.handlers  # type: ignore
         handler_id_to_remove = None
         found_correct_handler = False
 
@@ -5136,9 +4935,7 @@ class Pipe:
             "gemini_vertex_ai_toggle", __metadata__
         )
         # Vertex is only viable if toggled on AND we have a project ID
-        can_use_vertex = (
-            vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
-        )
+        can_use_vertex = vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
 
         paid_toggle_available, paid_toggled_on = await self._get_toggleable_feature_status(
             "gemini_paid_api", __metadata__
@@ -5147,9 +4944,7 @@ class Pipe:
         task_type = __metadata__.get("task")
         routing_strategy = valves.TASK_MODEL_ROUTING if task_type else "match_main"
 
-        is_free_eligible = self._check_free_tier_eligibility(
-            model_id, model_config, features
-        )
+        is_free_eligible = self._check_free_tier_eligibility(model_id, model_config, features)
 
         execution_order: list[str] = []
 
@@ -5204,9 +4999,7 @@ class Pipe:
                     if has_paid_key:
                         execution_order = ["paid"]
                     else:
-                        log.error(
-                            "Paid API toggle is ON, but GEMINI_PAID_API_KEY is missing."
-                        )
+                        log.error("Paid API toggle is ON, but GEMINI_PAID_API_KEY is missing.")
                 else:
                     # Logic for standard/un-toggled flow
                     if has_free_key:
@@ -5233,14 +5026,10 @@ class Pipe:
                     elif has_paid_key:
                         execution_order = ["paid"]
 
-        log.debug(
-            f"Routing strategy for {model_id} ({routing_strategy}): {execution_order}"
-        )
+        log.debug(f"Routing strategy for {model_id} ({routing_strategy}): {execution_order}")
         return execution_order
 
-    def _resolve_custom_params(
-        self, body: "Body", __metadata__: "Metadata"
-    ) -> dict[str, Any]:
+    def _resolve_custom_params(self, body: "Body", __metadata__: "Metadata") -> dict[str, Any]:
         """
         Resolves custom parameters from the model page and chat controls.
         Chat control settings usually take precedence, but we ignore them
@@ -5255,9 +5044,7 @@ class Pipe:
             "options",
             "stream_options",
         }
-        merged_params = {
-            key: value for key, value in body.items() if key not in known_body_keys
-        }
+        merged_params = {key: value for key, value in body.items() if key not in known_body_keys}
         log.debug("Model page parameters extracted from body:", payload=merged_params)
 
         if __metadata__.get("task"):
@@ -5331,7 +5118,9 @@ class Pipe:
         if not is_enabled_for_model:
             # This is a configuration issue, not a user-facing warning. Debug is appropriate.
             model_id = __metadata__.get("model", {}).get("id", "Unknown")
-            log.debug(f"Filter '{filter_id}' is not enabled for model '{model_id}' and is not global.")
+            log.debug(
+                f"Filter '{filter_id}' is not enabled for model '{model_id}' and is not global."
+            )
             return (False, False)
 
         # 4. Check if the user has toggled the feature ON for this request
@@ -5395,16 +5184,11 @@ class Pipe:
                     merged_data[field_name] = user_value
 
         user_whitelist = (
-            default_valves.AUTH_WHITELIST.split(",")
-            if default_valves.AUTH_WHITELIST
-            else []
+            default_valves.AUTH_WHITELIST.split(",") if default_valves.AUTH_WHITELIST else []
         )
 
         # Apply special logic based on default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-        if (
-            default_valves.USER_MUST_PROVIDE_AUTH_CONFIG
-            and user_email not in user_whitelist
-        ):
+        if default_valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
             log.info(
                 f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
                 " Admin-provided API keys and Vertex AI settings will not be used."
@@ -5450,9 +5234,7 @@ class Pipe:
             # Comparing tuples of integers is a robust way to handle versions like '1.10.0' vs '1.2.0'.
             try:
                 companion_v_tuple = tuple(map(int, companion_version.split(".")))
-                recommended_v_tuple = tuple(
-                    map(int, RECOMMENDED_COMPANION_VERSION.split("."))
-                )
+                recommended_v_tuple = tuple(map(int, RECOMMENDED_COMPANION_VERSION.split(".")))
 
                 if companion_v_tuple < recommended_v_tuple:
                     log.warning(

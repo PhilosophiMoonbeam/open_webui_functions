@@ -48,15 +48,13 @@ Use the included utility script to automatically create/update multiple function
    - Set `API_KEY` (see [this doc page](https://docs.openwebui.com/reference/monitoring/#authentication-setup-for-api-key-) for help).
    - List the files you want to install in `FILEPATHS`.
    - Set `HOST`, `PORT`, etc.
-3. **Setup Environment:**
+3. **Setup Environment:** Install [uv](https://docs.astral.sh/uv/) and synchronize the locked project environment:
    ```bash
-   python3.11 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
+   uv sync
    ```
 4. **Run Sync:**
    ```bash
-   python dev/function_updater.py --env dev/.env.install
+   uv run python dev/function_updater.py --env dev/.env.install
    ```
 
 ## Utilities & Development
@@ -64,6 +62,13 @@ Use the included utility script to automatically create/update multiple function
 - **`utils/`**: Contains shared code like `manifold_types.py` used by multiple plugins.
 - **`examples/`**: Test scripts and example plugins demonstrating specific capabilities.
 - **`dev/`**: Tools for active development, including `function_updater.py` for monitoring file changes and `dev.sh` for environment setup.
+
+## Development Checks
+
+`pyproject.toml` and `uv.lock` are the canonical Python environment definition. Local
+development is pinned to Python 3.11 to match the Open WebUI Docker runtime. Run
+`make quality` to format and lint maintained Python, then execute the complete read-only
+quality gate. Use `make check` to run the same gate without modifying files.
 
 ## Archived Functions
 

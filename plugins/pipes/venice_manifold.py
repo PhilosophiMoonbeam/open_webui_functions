@@ -17,6 +17,8 @@ version: 0.11.0
 # TODO: Negative prompts
 # TODO: Upscaling
 
+import asyncio
+import base64
 import copy
 import inspect
 import io
@@ -25,22 +27,21 @@ import mimetypes
 import os
 import sys
 import time
-import asyncio
 import uuid
-import aiohttp
-import base64
 from collections.abc import Awaitable, Callable
 from typing import (
+    TYPE_CHECKING,
     Any,
     Literal,
-    TYPE_CHECKING,
 )
-from pydantic import BaseModel, Field
-from fastapi import Request
+
+import aiohttp
 import pydantic_core
-from open_webui.models.files import Files, FileForm
-from open_webui.storage.provider import Storage
+from fastapi import Request
 from loguru import logger
+from open_webui.models.files import FileForm, Files
+from open_webui.storage.provider import Storage
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -54,9 +55,7 @@ log = logger.bind(auditable=False)
 
 class Pipe:
     class Valves(BaseModel):
-        VENICE_API_TOKEN: str | None = Field(
-            default=None, description="Venice.ai API Token"
-        )
+        VENICE_API_TOKEN: str | None = Field(default=None, description="Venice.ai API Token")
         HEIGHT: int = Field(default=1024, description="Image height")
         WIDTH: int = Field(default=1024, description="Image width")
         STEPS: int = Field(default=16, description="Image generation steps")
@@ -65,11 +64,11 @@ class Pipe:
             default=True,
             description="Whether to request models only on first load.",
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
         USE_FILES_API: bool = Field(
             title="Use Files API",
@@ -89,7 +88,7 @@ class Pipe:
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
 
-        self.models: list["ModelData"] = []
+        self.models: list[ModelData] = []
 
         log.success("Function has been initialized.")
         log.trace("Full self object:", payload=self.__dict__)
@@ -130,7 +129,9 @@ class Pipe:
         self.__event_emitter__ = __event_emitter__
 
         if "error" in __metadata__["model"]["id"]:
-            error_msg = f'There has been an error during model retrival phase: {str(__metadata__["model"])}'
+            error_msg = (
+                f"There has been an error during model retrival phase: {str(__metadata__['model'])}"
+            )
             await self._emit_error(error_msg, exception=False)
             return
 
@@ -141,11 +142,7 @@ class Pipe:
 
         model = body.get("model", "").split(".", 1)[-1]
         prompt = next(
-            (
-                msg["content"]
-                for msg in reversed(body["messages"])
-                if msg["role"] == "user"
-            ),
+            (msg["content"] for msg in reversed(body["messages"]) if msg["role"] == "user"),
             "",
         )
 
@@ -201,7 +198,9 @@ class Pipe:
 
         total_time = time.time() - start_time
         success = image_data and image_data.get("images")
-        status_text = f"Image {'generated' if success else 'generation failed'} after {total_time:.2f}s"
+        status_text = (
+            f"Image {'generated' if success else 'generation failed'} after {total_time:.2f}s"
+        )
 
         await __event_emitter__(
             {
@@ -236,20 +235,22 @@ class Pipe:
 
     async def _get_models(self) -> list["ModelData"]:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
+            async with (
+                aiohttp.ClientSession() as session,
+                session.get(
                     "https://api.venice.ai/api/v1/models?type=image",
                     headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
-                ) as response:
-                    response.raise_for_status()
-                    raw_models = await response.json()
-                    raw_models = raw_models.get("data", [])
-                    if not raw_models:
-                        log.warning("Venice API returned no models.")
-                    return [
-                        {"id": model["id"], "name": model["id"], "description": None}
-                        for model in raw_models
-                    ]
+                ) as response,
+            ):
+                response.raise_for_status()
+                raw_models = await response.json()
+                raw_models = raw_models.get("data", [])
+                if not raw_models:
+                    log.warning("Venice API returned no models.")
+                return [
+                    {"id": model["id"], "name": model["id"], "description": None}
+                    for model in raw_models
+                ]
         except aiohttp.ClientResponseError as e:
             error_msg = f"Error getting models: {str(e)}"
             return [self._return_error_model(error_msg)]
@@ -278,9 +279,7 @@ class Pipe:
     async def _generate_image(self, model: str, prompt: str) -> dict | None:
         try:
             async with aiohttp.ClientSession() as session:
-                log.info(
-                    f"Sending image generation request to Venice.ai for model: {model}"
-                )
+                log.info(f"Sending image generation request to Venice.ai for model: {model}")
                 async with session.post(
                     "https://api.venice.ai/api/v1/image/generate",
                     headers={"Authorization": f"Bearer {self.valves.VENICE_API_TOKEN}"},
@@ -296,9 +295,7 @@ class Pipe:
                         "safe_mode": False,
                     },
                 ) as response:
-                    log.info(
-                        f"Received response from Venice.ai with status: {response.status}"
-                    )
+                    log.info(f"Received response from Venice.ai with status: {response.status}")
                     response.raise_for_status()
                     return await response.json()
 
@@ -358,7 +355,9 @@ class Pipe:
             else:
                 # Old version without tags <v0.6.5
                 contents, image_path = await asyncio.to_thread(
-                    Storage.upload_file, image, imagename  # type: ignore
+                    Storage.upload_file,
+                    image,
+                    imagename,  # type: ignore
                 )
         except Exception:
             error_msg = "Error occurred during upload to the storage provider."
@@ -385,9 +384,7 @@ class Pipe:
             log.warning("Files.insert_new_file did not return anything.")
             return None
         # Get the image url.
-        image_url: str = __request__.app.url_path_for(
-            "get_file_content_by_id", id=file_item.id
-        )
+        image_url: str = __request__.app.url_path_for("get_file_content_by_id", id=file_item.id)
         return image_url
 
     # endregion 1.2 Image generation
@@ -398,7 +395,7 @@ class Pipe:
         self, error_msg: str, warning: bool = False, exception: bool = True
     ) -> None:
         """Emits an event to the front-end that causes it to display a nice red error message."""
-        error: "ChatCompletionEvent" = {
+        error: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": {
                 "done": True,
@@ -452,17 +449,13 @@ class Pipe:
         elif isinstance(data, dict):
             # Process dictionary items, creating a new dict
             return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
+                k: self._truncate_long_strings(v, max_len, truncation_marker, truncation_enabled)
                 for k, v in data.items()
             }
         elif isinstance(data, list):
             # Process list items, creating a new list
             return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
+                self._truncate_long_strings(item, max_len, truncation_marker, truncation_enabled)
                 for item in data
             ]
         else:
@@ -511,12 +504,8 @@ class Pipe:
                 )
 
                 # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
+                if self._is_flat_dict(truncated_data) and not isinstance(truncated_data, list):
+                    json_string = json.dumps(truncated_data, separators=(",", ":"), default=str)
                     # Add a simple prefix if it's compact
                     serialized_data_json = " - " + json_string
                 else:
@@ -526,9 +515,7 @@ class Pipe:
 
             except (TypeError, ValueError) as e:  # Catch specific serialization errors
                 serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
+            except Exception as e:  # Catch any other unexpected errors during processing
                 serialized_data_json = f" - {{Processing Error: {e}}}"
 
         # Add the final JSON string (or error message) back into the record
@@ -572,7 +559,7 @@ class Pipe:
             return  # Stop processing if the level is invalid
 
         # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        handlers: dict[int, Handler] = log._core.handlers  # type: ignore
         handler_id_to_remove = None
         found_correct_handler = False
 

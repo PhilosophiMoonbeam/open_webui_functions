@@ -11,17 +11,17 @@ version: 0.0.0
 import datetime
 import inspect
 import json
-from pydantic import BaseModel, Field
-from fastapi import Request
 from collections.abc import Awaitable, Callable
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from fastapi import Request
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
 
 
 class Filter:
-
     class Valves(BaseModel):
         EXAMPLE_STRING: str = Field(
             default="", title="Admin String", description="String configurable by admin"
@@ -54,8 +54,7 @@ class Filter:
     ) -> "Body":
 
         message_content = (
-            "Returning all local variables as JSON:\n"
-            f"{json.dumps(locals(), indent=2, default=str)}"
+            f"Returning all local variables as JSON:\n{json.dumps(locals(), indent=2, default=str)}"
         )
         self._log(message_content)
 
@@ -74,8 +73,7 @@ class Filter:
     ) -> dict | None:
 
         message_content = (
-            "Returning all local variables as JSON:\n"
-            f"{json.dumps(locals(), indent=2, default=str)}"
+            f"Returning all local variables as JSON:\n{json.dumps(locals(), indent=2, default=str)}"
         )
         self._log(message_content)
 
@@ -94,8 +92,7 @@ class Filter:
     ) -> "Body":
 
         message_content = (
-            "Returning all local variables as JSON:\n"
-            f"{json.dumps(locals(), indent=2, default=str)}"
+            f"Returning all local variables as JSON:\n{json.dumps(locals(), indent=2, default=str)}"
         )
         self._log(message_content)
 

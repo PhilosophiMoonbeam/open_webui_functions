@@ -10,6 +10,7 @@ version: 1.0.0
 """
 
 from typing import TYPE_CHECKING, cast
+
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
