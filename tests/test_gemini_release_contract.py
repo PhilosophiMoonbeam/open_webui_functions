@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -21,6 +22,18 @@ import yaml
 ROOT = Path(__file__).parents[1]
 MANIFEST_PATH = ROOT / "release" / "gemini-suite-v3.0.0.yaml"
 BUILDER_PATH = ROOT / ".github" / "scripts" / "build_gemini_suite.py"
+
+
+def _bash_executable() -> str:
+    if os.name != "nt":
+        return "bash"
+    git_executable = shutil.which("git")
+    assert git_executable is not None
+    git_directory = Path(git_executable).parent
+    candidates = (git_directory / "bash.exe", git_directory.parent / "bin" / "bash.exe")
+    bash = next((candidate for candidate in candidates if candidate.is_file()), None)
+    assert bash is not None, "Git for Windows Bash is required by the release contract"
+    return str(bash)
 
 
 def _load_builder() -> ModuleType:
@@ -61,6 +74,11 @@ def test_manifest_hashes_every_coordinated_artifact() -> None:
         content = (ROOT / cast(str, artifact["path"])).read_bytes()
         assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
         assert len(content) == artifact["bytes"]
+
+
+def test_git_checkout_preserves_canonical_release_bytes() -> None:
+    attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    assert "* text=auto eol=lf" in attributes
 
 
 def test_bundle_is_byte_reproducible_and_has_only_manifested_members(tmp_path: Path) -> None:
@@ -147,6 +165,7 @@ def test_ci_and_release_workflows_cover_all_contract_surfaces() -> None:
         '"release/**"',
         '"tests/**"',
         '"utils/**"',
+        '".gitattributes"',
         '".python-version"',
         '"pyproject.toml"',
         '"uv.lock"',
@@ -220,13 +239,31 @@ def test_ci_and_release_workflows_cover_all_contract_surfaces() -> None:
     assert "test_enterprise_previous_interaction_live" in live_tests
 
 
+def test_maintained_workflows_pin_current_node24_actions() -> None:
+    expected = {
+        "actions/checkout": "9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
+        "actions/setup-python": "ece7cb06caefa5fff74198d8649806c4678c61a1",
+        "astral-sh/setup-uv": "11f9893b081a58869d3b5fccaea48c9e9e46f990",
+    }
+    seen: set[str] = set()
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        source = path.read_text(encoding="utf-8")
+        for action, revision in re.findall(
+            r"uses:\s+(actions/(?:checkout|setup-python)|astral-sh/setup-uv)@([^\s#]+)",
+            source,
+        ):
+            seen.add(action)
+            assert revision == expected[action], path
+    assert seen == set(expected)
+
+
 def test_release_tag_parser_rejects_malformed_tags(tmp_path: Path) -> None:
     parser = ROOT / ".github" / "scripts" / "parse_tag.sh"
     output = tmp_path / "output"
     environment = {**os.environ, "GITHUB_OUTPUT": str(output)}
 
     valid = subprocess.run(
-        ["bash", str(parser)],
+        [_bash_executable(), str(parser)],
         cwd=ROOT,
         env={**environment, "GITHUB_REF_NAME": "gemini-suite/v3.0.0"},
         check=False,
@@ -234,7 +271,7 @@ def test_release_tag_parser_rejects_malformed_tags(tmp_path: Path) -> None:
         text=True,
     )
     malformed = subprocess.run(
-        ["bash", str(parser)],
+        [_bash_executable(), str(parser)],
         cwd=ROOT,
         env={**environment, "GITHUB_REF_NAME": "gemini-suite/latest"},
         check=False,
