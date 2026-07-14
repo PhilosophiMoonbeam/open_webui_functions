@@ -18,7 +18,7 @@ VERSION = "3.0.0"
 # during the development of this personal use plugin.
 RECOMMENDED_COMPANION_VERSION = "3.0.0"
 MODEL_CATALOG_SCHEMA_VERSION = 3
-MODEL_CATALOG_PROVENANCE_SHA256 = "9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"
+MODEL_CATALOG_PROVENANCE_SHA256 = "5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"
 GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 CATALOG_MODEL_IDS = frozenset(
     {
@@ -1511,7 +1511,7 @@ class CatalogProductAuthorization(_PipeCatalogModel):
 
 class AppStateModelCatalog(_PipeCatalogModel):
     schema_version: Literal[3]
-    provenance_sha256: Literal["a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6"]
+    provenance_sha256: Literal["5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"]
     freshness: CatalogFreshness
     sources: dict[str, CatalogSource] = Field(min_length=1)
     evidence: dict[str, CatalogEvidence] = Field(min_length=1)
@@ -6069,9 +6069,9 @@ class Pipe:
             model_id=model_id,
         )
 
-        # Check for image/system prompt compatibility
+        # Exact catalog policy controls image/system-prompt compatibility.
         is_image_model = self._is_image_model(selected_service.policy)
-        if (is_image_model or "gemma" in model_id) and request_options.system_instruction:
+        if is_image_model and request_options.system_instruction:
             request_options.system_instruction = None
             log.warning("Removing an unsupported system prompt from the request.")
 

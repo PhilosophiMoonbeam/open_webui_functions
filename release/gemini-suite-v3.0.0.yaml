@@ -20,25 +20,25 @@ artifacts:
     role: pipe
     version: 3.0.0
     path: plugins/pipes/gemini_manifold.py
-    sha256: f7a47c900ca297c0d55da201c4b391e736546c14b8ebb87fce8e5c44ba0c95aa
-    bytes: 311562
+    sha256: 19efafb419eb09a9b6c9f4b41e9b02c96a280af724bbd2571651687cb813ce51
+    bytes: 311558
   - id: gemini_manifold_companion
     role: companion
     version: 3.0.0
     path: plugins/filters/gemini_manifold_companion.py
-    sha256: 6ba09cc796274008bd0dfa4ccb5f1efa223dcc02634b4beee78d1d4449b87879
+    sha256: 584f7b63ce8968f98fb89c2a4dc418fa0c25f70db5e408e501ff109a0ffd064f
     bytes: 66485
   - id: gemini_model_catalog
     role: catalog
     version: 3
     path: plugins/pipes/gemini_models.yaml
-    sha256: 1d5cf6fcbc33ea330d7c492aa7165a6e16c8f4a0fb761932640450dc38396831
+    sha256: 606536e62691307ac8e40e934252ea7e910e927eb1493cdbde3e3275a8d477da
     bytes: 35381
   - id: gemini_model_provenance
     role: provenance
     version: 1
     path: docs/development/gemini-model-provenance-v1.yaml
-    sha256: a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6
+    sha256: 5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e
     bytes: 29263
   - id: gemini_reasoning_toggle
     role: toggle

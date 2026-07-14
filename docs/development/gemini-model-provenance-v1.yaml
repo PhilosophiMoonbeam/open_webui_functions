@@ -2,7 +2,7 @@ schema_version: 1
 artifact: gemini-interactions-model-claim-provenance
 scope: developer-api
 researched_at: "2026-07-14"
-repository_commit: "a0fdd922acbce4357363635e41b338f101c20808"
+repository_commit: "0532956258e19e257c41002d0f2c4268ab8ac087"
 
 evidence_policy:
   freshness_days: 30

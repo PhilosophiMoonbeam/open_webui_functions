@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import re
 from pathlib import Path
 from typing import cast
@@ -10,6 +12,8 @@ PROVENANCE_PATH = (
     Path(__file__).parents[1] / "docs" / "development" / "gemini-model-provenance-v1.yaml"
 )
 CATALOG_PATH = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+PIPE_PATH = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_manifold.py"
+COMPANION_PATH = Path(__file__).parents[1] / "plugins" / "filters" / "gemini_manifold_companion.py"
 
 RETAINED_MODEL_IDS = {
     "gemini-3.5-flash",
@@ -37,10 +41,33 @@ def _load(path: Path) -> dict[str, object]:
     return cast(dict[str, object], loaded)
 
 
+def _string_constant(path: Path, name: str) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if isinstance(target, ast.Name) and target.id == name:
+            value = ast.literal_eval(statement.value)
+            assert isinstance(value, str)
+            return value
+    raise AssertionError(f"{name} is missing from {path}")
+
+
+def test_exported_provenance_constants_match_artifact_and_catalog() -> None:
+    digest = hashlib.sha256(PROVENANCE_PATH.read_bytes()).hexdigest()
+    catalog = _load(CATALOG_PATH)
+
+    assert catalog["provenance_sha256"] == digest
+    assert _string_constant(PIPE_PATH, "MODEL_CATALOG_PROVENANCE_SHA256") == digest
+    assert _string_constant(COMPANION_PATH, "MODEL_CATALOG_PROVENANCE_SHA256") == digest
+
+
 def test_provenance_sources_are_dated_exact_and_digest_bound() -> None:
     provenance = _load(PROVENANCE_PATH)
     assert provenance["schema_version"] == 1
     assert provenance["researched_at"] == "2026-07-14"
+    assert provenance["repository_commit"] == "0532956258e19e257c41002d0f2c4268ab8ac087"
 
     sources = cast(dict[str, dict[str, object]], provenance["sources"])
     assert len(sources) >= 20

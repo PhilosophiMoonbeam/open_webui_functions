@@ -46,7 +46,7 @@ log = logger.bind(auditable=False)
 
 DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.0.0/plugins/pipes/gemini_models.yaml"
 MODEL_CATALOG_SCHEMA_VERSION = 3
-MODEL_CATALOG_PROVENANCE_SHA256 = "9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"
+MODEL_CATALOG_PROVENANCE_SHA256 = "5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"
 GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 
 # Default timeout for URL resolution
@@ -360,7 +360,7 @@ class CatalogProductAuthorization(_CatalogModel):
 
 class ModelCatalog(_CatalogModel):
     schema_version: Literal[3]
-    provenance_sha256: Literal["a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6"]
+    provenance_sha256: Literal["5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"]
     freshness: CatalogFreshness
     sources: dict[str, CatalogSource] = Field(min_length=1)
     evidence: dict[str, CatalogEvidence] = Field(min_length=1)

@@ -51,7 +51,7 @@ def test_protocol_3_catalog_is_evidence_bound_and_actionable() -> None:
     assert set(catalog.product_authorizations) == EXPECTED_IDS
     assert set(catalog.runtime_models()) == EXPECTED_IDS
     assert catalog.provenance_sha256 == (
-        "a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6"
+        "5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"
     )
 
 

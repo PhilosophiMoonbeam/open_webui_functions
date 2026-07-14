@@ -1,6 +1,6 @@
 # Gemini Interactions model policy catalog. Protocol 3 is a strict breaking boundary.
 schema_version: 3
-provenance_sha256: a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6
+provenance_sha256: 5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e
 freshness:
   freshness_days: 30
   retrieved_at: '2026-07-14'

@@ -115,6 +115,25 @@ def test_vertex_toggle_and_identifier_are_removed_from_maintained_surface() -> N
     assert findings == []
 
 
+def test_model_policy_has_no_family_substring_compatibility_branches() -> None:
+    pipe_path = MAINTAINED[0]
+    tree = ast.parse(pipe_path.read_text(encoding="utf-8"), filename=str(pipe_path))
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        for operator, comparator in zip(node.ops, node.comparators, strict=True):
+            if (
+                isinstance(operator, ast.In)
+                and isinstance(node.left, ast.Constant)
+                and isinstance(node.left.value, str)
+                and isinstance(comparator, ast.Name)
+                and comparator.id == "model_id"
+            ):
+                findings.append(f"{pipe_path.relative_to(ROOT)}:{node.lineno}")
+    assert findings == []
+
+
 def test_enterprise_toggle_embedded_asset_has_no_vertex_branding() -> None:
     toggle_path = ROOT / "plugins" / "filters" / "gemini_enterprise_toggle.py"
     tree = ast.parse(toggle_path.read_text(encoding="utf-8"), filename=str(toggle_path))
