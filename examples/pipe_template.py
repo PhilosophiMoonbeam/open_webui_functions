@@ -10,18 +10,19 @@ version: 0.0.0
 requirements:
 """
 
-import json
 import datetime
 import inspect
-from collections.abc import Iterator, AsyncGenerator, Generator, Callable, Awaitable
+import json
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator
 from typing import (
-    Any,
     TYPE_CHECKING,
+    Any,
 )
-from pydantic import BaseModel, Field
+
 import pydantic_core
-from starlette.responses import StreamingResponse
 from fastapi import Request
+from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
@@ -37,9 +38,7 @@ class LeanLogger:
 
     def _recursively_truncate(self, data: Any) -> Any:
         if isinstance(data, dict):
-            return {
-                key: self._recursively_truncate(value) for key, value in data.items()
-            }
+            return {key: self._recursively_truncate(value) for key, value in data.items()}
         if isinstance(data, list):
             return [self._recursively_truncate(item) for item in data]
         if isinstance(data, str) and len(data) > self.MAX_VALUE_LENGTH:
@@ -53,14 +52,10 @@ class LeanLogger:
         caller_name = inspect.stack()[2].function
         print(f"[{timestamp}] [{level}] [{__name__}.{caller_name}] {message}")
         if data:
-            serializable_data = pydantic_core.to_jsonable_python(
-                data, serialize_unknown=True
-            )
+            serializable_data = pydantic_core.to_jsonable_python(data, serialize_unknown=True)
             sanitized_data = self._recursively_truncate(serializable_data)
             pretty_data = json.dumps(sanitized_data, indent=2, default=str)
-            indented_data = "\n".join(
-                [f"  {line}" for line in pretty_data.splitlines()]
-            )
+            indented_data = "\n".join([f"  {line}" for line in pretty_data.splitlines()])
             print(indented_data)
 
 
@@ -87,11 +82,11 @@ class Pipe:
         _log(f"{self.__class__.__name__} instance initialized.", data=self.__dict__)
 
     async def pipes(self) -> list["ModelData"]:
-        models: list["ModelData"] = [
+        models: list[ModelData] = [
             {"id": "model_id_1", "name": "model_1"},
             {"id": "model_id_2", "name": "model_2"},
         ]
-        _log(f"Registering models:", data=models)
+        _log("Registering models:", data=models)
         return models
 
     async def pipe(
@@ -110,13 +105,7 @@ class Pipe:
         __chat_id__: str | None,
         __session_id__: str | None,
     ) -> (
-        str
-        | dict[str, Any]
-        | BaseModel
-        | StreamingResponse
-        | Iterator
-        | AsyncGenerator
-        | Generator
+        str | dict[str, Any] | BaseModel | StreamingResponse | Iterator | AsyncGenerator | Generator
     ):
         _log("Returning all local variables as JSON:", data=locals())
         return f"Hello! I'm {__name__}."

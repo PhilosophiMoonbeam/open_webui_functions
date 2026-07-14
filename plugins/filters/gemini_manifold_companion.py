@@ -6,35 +6,35 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.1.0
+version: 3.0.0
 """
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 
 # This filter can detect that a feature like web search or code execution is enabled in the front-end,
 # set the feature back to False so Open WebUI does not run it's own logic and then
 # pass custom values to "Gemini Manifold google_genai" that signal which feature was enabled and intercepted.
 
+import asyncio
 import copy
 import functools
+import hashlib
 import json
-from google.genai import types
-
 import sys
 import time
-import asyncio
 import urllib.request
+from collections.abc import Awaitable, Callable
+from datetime import date, timedelta
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+
 import aiohttp
+import pydantic_core
+import yaml
 from fastapi import Request
 from fastapi.datastructures import State
 from loguru import logger
-from pydantic import BaseModel, Field
-import pydantic_core
-import yaml
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TYPE_CHECKING, cast
-
-from open_webui.models.functions import Functions
+from open_webui.models.chats import Chats
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -44,11 +44,551 @@ if TYPE_CHECKING:
 # Setting auditable=False avoids duplicate output for log levels that would be printed out by the main log.
 log = logger.bind(auditable=False)
 
-DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/master/plugins/pipes/gemini_models.yaml"
+DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.0.0/plugins/pipes/gemini_models.yaml"
+MODEL_CATALOG_SCHEMA_VERSION = 3
+MODEL_CATALOG_PROVENANCE_SHA256 = "5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"
+GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 
 # Default timeout for URL resolution
 # TODO: Move to Pipe.Valves.
 DEFAULT_URL_TIMEOUT = aiohttp.ClientTimeout(total=10)  # 10 seconds total timeout
+
+
+class ModelCatalogError(ValueError):
+    """Raised when the remote model policy is unavailable or incompatible."""
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate keys and merge-key expansion."""
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if any(key.tag == "tag:yaml.org,2002:merge" for key, _ in node.value):
+            raise ModelCatalogError("YAML merge keys are forbidden in the model catalog")
+        super().flatten_mapping(node)
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ModelCatalogError(f"duplicate YAML key is forbidden: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+class _CatalogModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+CatalogContentKind = Literal["text", "image", "video", "audio", "document"]
+CatalogImageResolution = Literal["512", "1K", "2K", "4K"]
+CatalogImageAspectRatio = Literal[
+    "1:1",
+    "1:4",
+    "1:8",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:1",
+    "4:3",
+    "4:5",
+    "5:4",
+    "8:1",
+    "9:16",
+    "16:9",
+    "21:9",
+]
+CatalogEvidenceKind = Literal[
+    "provider_interactions_availability",
+    "provider_interactions_feature",
+    "provider_model_lifecycle",
+    "provider_interactions_thinking",
+    "provider_developer_pricing",
+    "provider_lifecycle_changelog",
+    "provider_interactions_input_transport",
+    "provider_model_properties",
+    "repository_implementation",
+    "repository_test_evidence",
+]
+
+
+class CatalogFreshness(_CatalogModel):
+    freshness_days: int = Field(gt=0)
+    retrieved_at: date
+    expires_after: date
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "CatalogFreshness":
+        if self.expires_after != self.retrieved_at + timedelta(days=self.freshness_days):
+            raise ValueError("catalog expiry must equal retrieved_at plus freshness_days")
+        if self.retrieved_at > date.today():
+            raise ValueError("catalog retrieval date must not be in the future")
+        if date.today() > self.expires_after:
+            raise ValueError("catalog evidence is expired")
+        return self
+
+
+class CatalogSource(_CatalogModel):
+    kind: CatalogEvidenceKind
+    url: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+    published_last_updated: date | None
+    retrieved_at: date
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    subject_model_ids: frozenset[str] = Field(default_factory=frozenset)
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "CatalogSource":
+        if self.retrieved_at > date.today():
+            raise ValueError("source retrieval date must not be in the future")
+        if self.published_last_updated is not None:
+            if self.published_last_updated > self.retrieved_at:
+                raise ValueError("source publication date must not follow retrieval")
+        return self
+
+
+class CatalogEvidence(_CatalogModel):
+    source: str = Field(min_length=1)
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class CatalogLimits(_CatalogModel):
+    input_tokens: int = Field(gt=0)
+    output_tokens: int = Field(gt=0)
+
+
+class CatalogContent(_CatalogModel):
+    inputs: frozenset[CatalogContentKind]
+    outputs: frozenset[CatalogContentKind]
+
+
+class CatalogImageOutput(_CatalogModel):
+    resolutions: tuple[CatalogImageResolution, ...] = Field(min_length=1)
+    aspect_ratios: tuple[CatalogImageAspectRatio, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_options(self) -> "CatalogImageOutput":
+        if len(self.resolutions) != len(set(self.resolutions)):
+            raise ValueError("image resolutions must be unique")
+        if len(self.aspect_ratios) != len(set(self.aspect_ratios)):
+            raise ValueError("image aspect ratios must be unique")
+        return self
+
+
+class CatalogThinking(_CatalogModel):
+    supported: bool
+    control: Literal["known", "unknown"]
+    levels: frozenset[Literal["minimal", "low", "medium", "high"]]
+    summaries: bool
+
+    @model_validator(mode="after")
+    def validate_support(self) -> "CatalogThinking":
+        if self.supported != bool(self.levels):
+            raise ValueError("thinking levels must be present exactly when thinking is supported")
+        if self.summaries and not self.supported:
+            raise ValueError("thinking summaries require thinking support")
+        if (self.control == "known") != self.supported:
+            raise ValueError("known thinking control must match supported controls")
+        return self
+
+
+class CatalogTools(_CatalogModel):
+    google_search: bool
+    google_maps: bool
+    code_execution: bool
+    url_context: bool
+    file_search: bool
+
+
+class CatalogInteractions(_CatalogModel):
+    store: bool
+    response_format: bool
+    thinking: CatalogThinking
+    custom_function_calling: bool
+    files: bool
+    external_urls: bool
+    tools: CatalogTools
+
+
+class CatalogPriceTier(_CatalogModel):
+    up_to_prompt_tokens: int | None = Field(default=None, gt=0)
+    price_per_million: float = Field(ge=0)
+
+
+class CatalogPricedRate(_CatalogModel):
+    state: Literal["priced"]
+    tiers: tuple[CatalogPriceTier, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_tiers(self) -> "CatalogPricedRate":
+        thresholds = [tier.up_to_prompt_tokens for tier in self.tiers]
+        if thresholds[-1] is not None:
+            raise ValueError("priced rate must end with an unbounded tier")
+        bounded = [threshold for threshold in thresholds[:-1] if threshold is not None]
+        if len(bounded) != len(thresholds) - 1 or bounded != sorted(set(bounded)):
+            raise ValueError("pricing thresholds must be unique and ascending")
+        return self
+
+
+class CatalogUnpricedRate(_CatalogModel):
+    state: Literal["unpriced"]
+    reason: str = Field(min_length=1)
+
+
+CatalogRate = Annotated[
+    CatalogPricedRate | CatalogUnpricedRate,
+    Field(discriminator="state"),
+]
+
+
+class CatalogPricing(_CatalogModel):
+    free_tier: bool
+    excluded_features: frozenset[Literal["google_search", "google_maps"]]
+    threshold_basis: Literal["total_input_tokens_including_cached"]
+    input: dict[CatalogContentKind, CatalogRate]
+    cached_input: dict[CatalogContentKind, CatalogRate]
+    output: dict[CatalogContentKind, CatalogRate]
+
+    @model_validator(mode="after")
+    def validate_modalities(self) -> "CatalogPricing":
+        if not self.input or not self.output:
+            raise ValueError("pricing must declare input and output modalities")
+        if set(self.cached_input) != set(self.input):
+            raise ValueError("cached pricing must cover every input modality")
+        return self
+
+
+class CatalogSupportedService(_CatalogModel):
+    availability: Literal["supported"]
+    lifecycle: Literal["stable", "preview"]
+    limits: CatalogLimits
+    content: CatalogContent
+    image_output: CatalogImageOutput | None = None
+    interactions: CatalogInteractions
+    pricing: CatalogPricing
+
+    @model_validator(mode="after")
+    def validate_capability_dependencies(self) -> "CatalogSupportedService":
+        if set(self.content.inputs) != set(self.pricing.input):
+            raise ValueError("input pricing must exactly cover authorized input modalities")
+        if set(self.content.outputs) != set(self.pricing.output):
+            raise ValueError("output pricing must exactly cover authorized output modalities")
+        if self.interactions.external_urls and not self.interactions.tools.url_context:
+            raise ValueError("external URL input requires the URL-context tool")
+        if ("image" in self.content.outputs) != (self.image_output is not None):
+            raise ValueError("image output options must exist exactly for image-output models")
+        return self
+
+
+class CatalogUnavailableService(_CatalogModel):
+    availability: Literal["unsupported", "unverified"]
+    reason: str = Field(min_length=1)
+
+
+CatalogService = Annotated[
+    CatalogSupportedService | CatalogUnavailableService,
+    Field(discriminator="availability"),
+]
+
+
+class CatalogServices(_CatalogModel):
+    developer: CatalogService
+    enterprise: CatalogService
+
+
+class CatalogModel(_CatalogModel):
+    services: CatalogServices
+
+    @model_validator(mode="after")
+    def validate_somewhere_actionable(self) -> "CatalogModel":
+        if all(
+            service.availability == "unsupported"
+            for service in (self.services.developer, self.services.enterprise)
+        ):
+            raise ValueError("a catalog model must be supported or pending verification somewhere")
+        return self
+
+
+class CatalogClaimEvidence(_CatalogModel):
+    availability: str
+    properties: str
+    thinking: str
+    pricing: str
+    image_output: str | None = None
+
+
+class CatalogProviderCapabilities(_CatalogModel):
+    function_calling: bool
+    structured_outputs: bool
+    thinking: bool
+    google_search: bool
+    google_maps: bool
+    code_execution: bool
+    url_context: bool
+    file_search: bool
+
+
+class CatalogProviderClaim(_CatalogModel):
+    model_id: str
+    availability: Literal["supported"]
+    lifecycle: Literal["stable", "preview"]
+    limits: CatalogLimits
+    content: CatalogContent
+    image_output: CatalogImageOutput | None = None
+    capabilities: CatalogProviderCapabilities
+    thinking: CatalogThinking
+    pricing: CatalogPricing
+    evidence: CatalogClaimEvidence
+
+
+class CatalogProductAuthorization(_CatalogModel):
+    model_id: str
+    discovery: Literal["allow"]
+    interactions: CatalogInteractions
+    evidence: tuple[str, ...] = Field(min_length=1)
+
+
+class ModelCatalog(_CatalogModel):
+    schema_version: Literal[3]
+    provenance_sha256: Literal["5684d034b820bf5a99b28342263035ea3684f132bc0b6bfa3721678b55d9536e"]
+    freshness: CatalogFreshness
+    sources: dict[str, CatalogSource] = Field(min_length=1)
+    evidence: dict[str, CatalogEvidence] = Field(min_length=1)
+    provider_claims: dict[str, CatalogProviderClaim] = Field(min_length=1)
+    product_authorizations: dict[str, CatalogProductAuthorization] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_claims(self) -> "ModelCatalog":
+        if set(self.provider_claims) != set(self.product_authorizations):
+            raise ValueError("provider claims and product authorizations must have identical IDs")
+        invalid = [
+            model_id for model_id in self.provider_claims if not model_id.startswith("gemini-")
+        ]
+        if invalid:
+            raise ValueError(f"invalid Gemini model ids: {invalid}")
+        expected_kinds: dict[str, CatalogEvidenceKind] = {
+            "availability": "provider_interactions_availability",
+            "properties": "provider_model_properties",
+            "thinking": "provider_interactions_thinking",
+            "pricing": "provider_developer_pricing",
+        }
+        for evidence_id, evidence in self.evidence.items():
+            source = self.sources.get(evidence.source)
+            if source is None:
+                raise ValueError(f"evidence '{evidence_id}' references an unknown source")
+            if evidence.content_digest != source.content_digest:
+                raise ValueError(f"evidence '{evidence_id}' digest mismatch")
+            if source.retrieved_at < self.freshness.retrieved_at:
+                raise ValueError(f"evidence '{evidence_id}' is stale")
+        for model_id, claim in self.provider_claims.items():
+            authorization = self.product_authorizations[model_id]
+            if claim.model_id != model_id or authorization.model_id != model_id:
+                raise ValueError("catalog keys and exact claim model IDs must match")
+            for field_name, expected_kind in expected_kinds.items():
+                evidence_id = getattr(claim.evidence, field_name)
+                evidence = self.evidence.get(evidence_id)
+                if evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown evidence")
+                source = self.sources[evidence.source]
+                if source.kind != expected_kind:
+                    raise ValueError(f"model '{model_id}' has wrong evidence kind for {field_name}")
+                if source.subject_model_ids and model_id not in source.subject_model_ids:
+                    raise ValueError(f"model '{model_id}' evidence has an exact-ID mismatch")
+            image_evidence_id = claim.evidence.image_output
+            if (claim.image_output is None) != (image_evidence_id is None):
+                raise ValueError("image output claims require exact image-output evidence")
+            if image_evidence_id is not None:
+                image_evidence = self.evidence.get(image_evidence_id)
+                if image_evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown image evidence")
+                image_source = self.sources[image_evidence.source]
+                if image_source.kind != "provider_interactions_feature":
+                    raise ValueError(f"model '{model_id}' has wrong image evidence kind")
+                if model_id not in image_source.subject_model_ids:
+                    raise ValueError(f"model '{model_id}' image evidence has an exact-ID mismatch")
+            for evidence_id in authorization.evidence:
+                evidence = self.evidence.get(evidence_id)
+                if evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown product evidence")
+                if self.sources[evidence.source].kind not in {
+                    "repository_implementation",
+                    "repository_test_evidence",
+                }:
+                    raise ValueError(f"model '{model_id}' product evidence has wrong kind")
+            if authorization.interactions.thinking != claim.thinking:
+                raise ValueError("provider thinking and product authorization contradict")
+            tools = authorization.interactions.tools
+            capabilities = claim.capabilities
+            if claim.thinking.supported and not capabilities.thinking:
+                raise ValueError("thinking controls exceed provider capability")
+            if authorization.interactions.response_format and not capabilities.structured_outputs:
+                raise ValueError("product response format exceeds provider capability")
+            if (
+                authorization.interactions.custom_function_calling
+                and not capabilities.function_calling
+            ):
+                raise ValueError("product function calling exceeds provider capability")
+            for tool_name in (
+                "google_search",
+                "google_maps",
+                "code_execution",
+                "url_context",
+                "file_search",
+            ):
+                if getattr(tools, tool_name) and not getattr(capabilities, tool_name):
+                    raise ValueError(f"product {tool_name} exceeds provider capability")
+            if tools.file_search:
+                raise ValueError("file_search is not product-authorized")
+            if authorization.interactions.external_urls and not tools.url_context:
+                raise ValueError("external URL input requires URL context")
+            if authorization.interactions.files and not claim.content.inputs:
+                raise ValueError("files require an authorized input modality")
+        return self
+
+    def runtime_models(self) -> dict[str, CatalogModel]:
+        unavailable = CatalogUnavailableService(
+            availability="unverified",
+            reason="No credential-backed Enterprise Interactions model and capability evidence is recorded.",
+        )
+        return {
+            model_id: CatalogModel(
+                services=CatalogServices(
+                    developer=CatalogSupportedService(
+                        availability="supported",
+                        lifecycle=claim.lifecycle,
+                        limits=claim.limits,
+                        content=claim.content,
+                        image_output=claim.image_output,
+                        interactions=self.product_authorizations[model_id].interactions,
+                        pricing=claim.pricing,
+                    ),
+                    enterprise=unavailable,
+                )
+            )
+            for model_id, claim in self.provider_claims.items()
+        }
+
+
+def _canonicalize_catalog(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _canonicalize_catalog(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonicalize_catalog(item) for item in value), key=repr)
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_catalog(item) for item in value]
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def canonical_catalog_bytes(catalog: ModelCatalog) -> bytes:
+    normalized = _canonicalize_catalog(catalog.model_dump(mode="python", exclude_none=False))
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class CatalogAppStateEnvelope(_CatalogModel):
+    schema_version: Literal[3]
+    canonical_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    payload: ModelCatalog
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> "CatalogAppStateEnvelope":
+        expected = "sha256:" + hashlib.sha256(canonical_catalog_bytes(self.payload)).hexdigest()
+        if self.canonical_digest != expected:
+            raise ValueError("catalog canonical digest mismatch")
+        return self
+
+    @classmethod
+    def from_catalog(cls, catalog: ModelCatalog) -> "CatalogAppStateEnvelope":
+        digest = "sha256:" + hashlib.sha256(canonical_catalog_bytes(catalog)).hexdigest()
+        return cls(schema_version=3, canonical_digest=digest, payload=catalog)
+
+
+class GroundingTextBlock(_CatalogModel):
+    step_index: int
+    content_index: int
+    text: str
+
+
+class GroundingReviewSnippet(_CatalogModel):
+    review_id: str | None = None
+    title: str | None = None
+    uri: str | None = None
+
+
+class GroundingSource(_CatalogModel):
+    id: str
+    kind: Literal["url", "file", "place"]
+    uri: str | None = None
+    title: str | None = None
+    file_name: str | None = None
+    media_id: str | None = None
+    page_number: int | None = None
+    source: str | None = None
+    place_id: str | None = None
+    custom_metadata: dict[str, JsonValue] | None = None
+    review_snippets: list[GroundingReviewSnippet] = Field(default_factory=list)
+
+
+class GroundingCitation(_CatalogModel):
+    source_id: str
+    block_index: int
+    start: int
+    end: int
+    index_unit: Literal["provider", "utf8_bytes", "unicode_codepoints"]
+
+
+class GroundingToolRecord(_CatalogModel):
+    tool: Literal["google_search", "url_context", "google_maps", "file_search", "retrieval"]
+    phase: Literal["call", "result"]
+    step_index: int
+    call_id: str | None = None
+    queries: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
+    search_type: str | None = None
+    retrieval_type: str | None = None
+    statuses: list[str] = Field(default_factory=list)
+    search_suggestions: list[str] = Field(default_factory=list)
+    places: list[GroundingSource] = Field(default_factory=list)
+    widget_context_tokens: list[str] = Field(default_factory=list)
+    is_error: bool | None = None
+
+
+class GroundingDiagnostic(_CatalogModel):
+    code: str
+    detail: str
+    step_index: int | None = None
+
+
+class GroundingEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    protocol_version: Literal[1]
+    visible_content_sha256: str
+    grounded_text_sha256: str
+    text_blocks: list[GroundingTextBlock] = Field(default_factory=list)
+    sources: list[GroundingSource] = Field(default_factory=list)
+    citations: list[GroundingCitation] = Field(default_factory=list)
+    tool_records: list[GroundingToolRecord] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)
+    tool_errors: list[str] = Field(default_factory=list)
+    diagnostics: list[GroundingDiagnostic] = Field(default_factory=list)
 
 
 class EventEmitter:
@@ -73,17 +613,15 @@ class EventEmitter:
         self.is_abandoned: bool = False
         self._idle_timeout = idle_timeout
 
-        self._queue: asyncio.Queue["Event | None"] = asyncio.Queue()
-        self._toast_queue: asyncio.Queue["Event | None"] = asyncio.Queue()
+        self._queue: asyncio.Queue[Event | None] = asyncio.Queue()
+        self._toast_queue: asyncio.Queue[Event | None] = asyncio.Queue()
 
         self._worker_task: asyncio.Task | None = None
         self._toast_worker_task: asyncio.Task | None = None
 
         if self._emitter is not None:
             self._worker_task = asyncio.create_task(self._process_queue(self._queue))
-            self._toast_worker_task = asyncio.create_task(
-                self._process_queue(self._toast_queue)
-            )
+            self._toast_worker_task = asyncio.create_task(self._process_queue(self._toast_queue))
 
     async def _process_queue(self, queue: asyncio.Queue["Event | None"]) -> None:
         """
@@ -109,8 +647,10 @@ class EventEmitter:
             if self._emitter:
                 try:
                     await self._emitter(event)
+                except asyncio.CancelledError:
+                    log.warning("Open WebUI event callback was cancelled; dropping the event.")
                 except Exception:
-                    log.exception("Error in EventEmitter background worker")
+                    log.error("Error in EventEmitter background worker")
 
             queue.task_done()
 
@@ -124,6 +664,8 @@ class EventEmitter:
 
     async def flush(self) -> None:
         """Blocks until all currently queued events across all queues have been processed."""
+        self._drain_queue_if_worker_stopped(self._queue, self._worker_task)
+        self._drain_queue_if_worker_stopped(self._toast_queue, self._toast_worker_task)
         await asyncio.gather(self._queue.join(), self._toast_queue.join())
 
     async def shutdown(self) -> None:
@@ -137,16 +679,31 @@ class EventEmitter:
         if self._toast_worker_task and not self._toast_worker_task.done():
             self._toast_queue.put_nowait(None)
             tasks_to_await.append(self._toast_worker_task)
+        else:
+            self._drain_queue_if_worker_stopped(self._toast_queue, self._toast_worker_task)
+
+        if self._worker_task is None or self._worker_task.done():
+            self._drain_queue_if_worker_stopped(self._queue, self._worker_task)
 
         if tasks_to_await:
             await asyncio.gather(*tasks_to_await)
+
+    @staticmethod
+    def _drain_queue_if_worker_stopped(
+        queue: asyncio.Queue["Event | None"], worker: asyncio.Task | None
+    ) -> None:
+        if worker is not None and not worker.done():
+            return
+        while not queue.empty():
+            queue.get_nowait()
+            queue.task_done()
 
     def emit_toast(
         self,
         msg: str,
         type: Literal["info", "success", "warning", "error"] = "info",
     ) -> None:
-        event: "NotificationEvent" = {
+        event: NotificationEvent = {
             "type": "notification",
             "data": {"type": type, "content": msg},
         }
@@ -172,14 +729,13 @@ class EventEmitter:
             description = f"{description} (+{elapsed:.2f}s)"
 
         final_hidden = hidden or (
-            self.status_mode in ("hidden_compact", "hidden_detailed")
-            and is_successful_finish
+            self.status_mode in ("hidden_compact", "hidden_detailed") and is_successful_finish
         )
 
         if not final_hidden and indent_level > 0:
             description = f"{'- ' * indent_level}{description}"
 
-        event: "StatusEvent" = {
+        event: StatusEvent = {
             "type": "status",
             "data": {"description": description, "done": done, "hidden": final_hidden},
         }
@@ -200,14 +756,14 @@ class EventEmitter:
         if usage is not None:
             data["usage"] = usage
 
-        event: "ChatCompletionEvent" = {
+        event: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": cast(Any, data),
         }
         self._enqueue(event)
 
     def emit_sources(self, source_data: "Source") -> None:
-        event: "CitationEvent" = {
+        event: CitationEvent = {
             "type": "source",
             "data": {
                 "source": source_data["source"],
@@ -224,7 +780,7 @@ class EventEmitter:
     def emit_grounding_queries(self, queries: list[str]) -> None:
         if not queries:
             return
-        event: "StatusEvent" = {
+        event: StatusEvent = {
             "type": "status",
             "data": {
                 "action": "web_search_queries_generated",
@@ -236,13 +792,7 @@ class EventEmitter:
 
 
 class Filter:
-
     class Valves(BaseModel):
-        USE_PERMISSIVE_SAFETY: bool = Field(
-            default=False,
-            description="""Whether to request relaxed safety filtering.
-            Default value is False.""",
-        )
         BYPASS_BACKEND_RAG: bool = Field(
             default=True,
             description="""Decide if you want ot bypass Open WebUI's RAG and send your documents directly to Google API.
@@ -278,11 +828,11 @@ class Filter:
             • hidden_compact: Final success hidden, no thoughts. • hidden_detailed: Final success hidden, with thoughts.
             • visible: All status visible. • visible_timed: Visible with timestamps.""",
         )
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
 
     # TODO: Support user settting through UserValves.
@@ -293,7 +843,7 @@ class Filter:
         self.log_level = self.valves.LOG_LEVEL
         self._add_log_handler()
         log.success("Function has been initialized.")
-        log.trace("Full self object:", payload=self.__dict__)
+        log.trace("Companion initialized; valve values omitted from logs.")
 
     def inlet(
         self,
@@ -306,27 +856,17 @@ class Filter:
 
         app_state: State = __request__.app.state
 
-        # Perform housekeeping before creating new state objects.
-        # This ensures that even if a pipe/filter pair crashes or hangs,
-        # the memory footprint doesn't grow indefinitely over time.
-        self._cleanup_event_emitters(app_state)
-
-        emitter = EventEmitter(
-            __event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR
-        )
-        self._store_data_in_state(
-            app_state,
-            __metadata__,
-            {"gemini_event_emitter": emitter},
-        )
-        app_state._state["gemini_dummy_event_emitter"] = EventEmitter(None)
-
         # Load and store model configuration in app state
         log.debug("Loading model configuration...")
-        model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
-        app_state._state["gemini_model_config"] = model_config
+        catalog_envelope = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
+        if date.today() > catalog_envelope.payload.freshness.expires_after:
+            raise ModelCatalogError("Gemini model catalog evidence is expired")
+        app_state._state["gemini_model_catalog"] = catalog_envelope.model_dump(
+            mode="json", exclude_none=False
+        )
         log.debug(
-            f"Stored model config in app state with {len(model_config)} model(s)."
+            "Stored the atomic model-catalog envelope in app state with "
+            f"{len(catalog_envelope.payload.provider_claims)} model(s)."
         )
 
         # Detect log level change inside self.valves
@@ -337,11 +877,9 @@ class Filter:
             )
             self._add_log_handler()
 
-        log.debug(
-            f"inlet method has been called. Gemini Manifold Companion version is {VERSION}"
-        )
+        log.debug(f"inlet method has been called. Gemini Manifold Companion version is {VERSION}")
 
-        canonical_model_name, is_manifold = self._get_model_name(body)
+        _, is_manifold = self._get_model_name(body)
 
         # Exit early if we are filtering an unsupported model.
         if not is_manifold:
@@ -350,17 +888,8 @@ class Filter:
             )
             return body
 
-        # Check if the model supports grounding or code execution using YAML config
-        is_grounding_model = self._check_model_capability(
-            canonical_model_name, model_config, "search_grounding"
-        )
-        is_code_exec_model = self._check_model_capability(
-            canonical_model_name, model_config, "code_execution"
-        )
-        log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
-
         features = body.get("features", {})
-        log.debug(f"body.features:", payload=features)
+        log.debug(f"Received {len(features)} request feature flag(s).")
 
         # Ensure features field exists
         metadata = body.get("metadata")
@@ -374,37 +903,24 @@ class Filter:
         # Add the companion version to the payload for the pipe to consume.
         metadata_features["gemini_manifold_companion_version"] = VERSION
 
-        if is_grounding_model:
-            web_search_enabled = (
-                features.get("web_search", False)
-                if isinstance(features, dict)
-                else False
+        web_search_enabled = (
+            features.get("web_search", False) if isinstance(features, dict) else False
+        )
+        if web_search_enabled:
+            log.info(
+                "Search feature was requested; the pipe will authorize it against the selected service policy."
             )
-            if web_search_enabled:
-                log.info(
-                    "Search feature is enabled, disabling it and adding custom feature called google_search_tool."
-                )
-                # Disable web_search
-                features["web_search"] = False
-                metadata_features["google_search_tool"] = True
-        if is_code_exec_model:
-            code_execution_enabled = (
-                features.get("code_interpreter", False)
-                if isinstance(features, dict)
-                else False
+            features["web_search"] = False
+            metadata_features["google_search_tool"] = True
+        code_execution_enabled = (
+            features.get("code_interpreter", False) if isinstance(features, dict) else False
+        )
+        if code_execution_enabled:
+            log.info(
+                "Code execution was requested; the pipe will authorize it against the selected service policy."
             )
-            if code_execution_enabled:
-                log.info(
-                    "Code interpreter feature is enabled, disabling it and adding custom feature called google_code_execution."
-                )
-                # Disable code_interpreter
-                features["code_interpreter"] = False
-                metadata_features["google_code_execution"] = True
-        if self.valves.USE_PERMISSIVE_SAFETY:
-            log.info("Adding permissive safety settings to body.metadata")
-            metadata["safety_settings"] = self._get_permissive_safety_settings(
-                canonical_model_name
-            )
+            features["code_interpreter"] = False
+            metadata_features["google_code_execution"] = True
         if self.valves.BYPASS_BACKEND_RAG:
             if __metadata__["chat_id"] == "local":
                 # TODO toast notification
@@ -419,15 +935,11 @@ class Filter:
                     "BYPASS_BACKEND_RAG is enabled, bypassing Open WebUI RAG to let the Manifold pipe handle documents."
                 )
                 if files := body.get("files"):
-                    log.info(
-                        f"Removing {len(files)} files from the Open WebUI RAG pipeline."
-                    )
+                    log.info(f"Removing {len(files)} files from the Open WebUI RAG pipeline.")
                     body["files"] = []
                 metadata_features["upload_documents"] = True
         else:
-            log.info(
-                "BYPASS_BACKEND_RAG is disabled. Open WebUI's RAG will be used if applicable."
-            )
+            log.info("BYPASS_BACKEND_RAG is disabled. Open WebUI's RAG will be used if applicable.")
             metadata_features["upload_documents"] = False
 
         # TODO: Filter out the citation markers here.
@@ -446,189 +958,158 @@ class Filter:
         __metadata__: dict[str, Any],
         __event_emitter__: Callable[["Event"], Awaitable[None]],
     ) -> "Body":
-        """Modifies the complete response payload after it's received from the LLM. Operates on the final `body` dictionary."""
-
-        log.debug("outlet method has been called.")
-
-        chat_id: str = __metadata__.get("chat_id", "")
-        message_id: str = __metadata__.get("message_id", "")
-        app_state: State = __request__.app.state
-
-        log.debug(f"Checking for attributes for message {message_id} in request state.")
-
-        stored_metadata: types.GroundingMetadata | None = (
-            self._get_and_clear_data_from_state(
-                app_state, chat_id, message_id, "grounding", True
-            )
-        )
-        # FIXME: can this be None?
-        emitter: EventEmitter = self._get_and_clear_data_from_state(
-            app_state, chat_id, message_id, "gemini_event_emitter", True
-        )
-
-        if stored_metadata:
-            log.info("Found grounding metadata, processing citations.")
-            log.trace("Stored grounding metadata:", payload=stored_metadata)
-
-            current_content = body["messages"][-1]["content"]
-            if isinstance(current_content, list):
-                text_to_use = ""
-                for item in current_content:
-                    if item.get("type") == "text":
-                        item = cast("TextContent", item)
-                        text_to_use = item["text"]
-                        break
-            else:
-                text_to_use = current_content
-
-            # Insert citation markers into the response text
-            cited_text = self._get_text_w_citation_markers(
-                stored_metadata,
-                text_to_use,
-            )
-
-            if cited_text:
-                content = body["messages"][-1]["content"]
-                if isinstance(content, list):
-                    for item in content:
-                        if item.get("type") == "text":
-                            item = cast("TextContent", item)
-                            item["text"] = cited_text
-                            break
-                else:
-                    body["messages"][-1]["content"] = cited_text
-
-            # Emit status event with search queries before resolving URLs
-            if stored_metadata.web_search_queries:
-                emitter.emit_grounding_queries(stored_metadata.web_search_queries)
-            else:
-                log.debug("Grounding metadata does not contain any search queries.")
-
-            # Emit sources to the front-end.
-            gs_supports = stored_metadata.grounding_supports
-            gs_chunks = stored_metadata.grounding_chunks
-            if gs_supports and gs_chunks:
-                await self._resolve_and_emit_sources(
-                    grounding_chunks=gs_chunks,
-                    supports=gs_supports,
-                    emitter=emitter,
-                )
+        """Apply the durable, SDK-neutral grounding envelope exactly once."""
+        del __request__
+        emitter = EventEmitter(__event_emitter__, status_mode=self.valves.STATUS_EMISSION_BEHAVIOR)
+        try:
+            envelope = await self._load_grounding_envelope(body, __metadata__)
+            if envelope is None:
+                return body
+            text, setter = self._assistant_text_accessor(body)
+            if text is None or setter is None:
                 emitter.emit_status(
-                    "This response was grounded with a Google tool", done=True
+                    "Grounding metadata could not be applied to this response.", done=True
                 )
-            else:
-                msg = "Grounding metadata was found but it's missing grounding supports or chunks. The response is likely not grounded."
-                log.info(msg)
-                emitter.emit_status(msg, done=True)
-        else:
-            log.info("No grounding metadata found in request state.")
-
-        log.debug("outlet method has finished.")
-        return body
+                return body
+            current_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if current_digest != envelope.visible_content_sha256:
+                emitter.emit_status(
+                    "Grounding citations were skipped because the assistant response was edited.",
+                    done=True,
+                )
+                return body
+            cited_text, warning_count = self._insert_citation_markers(envelope, text)
+            setter(cited_text)
+            if envelope.queries:
+                emitter.emit_grounding_queries(envelope.queries)
+            await self._emit_grounding_sources(envelope, emitter)
+            for error in envelope.tool_errors:
+                emitter.emit_toast(error, "warning")
+            if warning_count or envelope.diagnostics:
+                emitter.emit_toast(
+                    "Some grounding annotations could not be displayed safely.", "warning"
+                )
+            if envelope.sources:
+                emitter.emit_status("This response was grounded with a Google tool", done=True)
+            return body
+        except ValidationError:
+            log.error("Invalid Gemini grounding envelope.")
+            emitter.emit_toast("Stored grounding metadata is invalid and was ignored.", "warning")
+            return body
+        finally:
+            await emitter.flush()
+            await emitter.shutdown()
 
     # region 1. Helper methods inside the Filter class
 
     # region 1.1 Add citations
 
-    def _get_text_w_citation_markers(
-        self,
-        grounding_metadata: types.GroundingMetadata,
-        raw_str: str,
-    ) -> str | None:
-        """
-        Returns the model response with citation markers.
-        Thoughts, if present as THOUGHT_START_TAG...THOUGHT_END_TAG at the beginning of raw_str,
-        are preserved but excluded from the citation indexing process.
-        Everything up to the *last* THOUGHT_END_TAG tag is considered part of the thought.
-        """
-
-        supports = grounding_metadata.grounding_supports
-        grounding_chunks = grounding_metadata.grounding_chunks
-        if not supports or not grounding_chunks:
-            log.info(
-                "Grounding metadata missing supports or chunks, can't insert citation markers. "
-                "Response was probably just not grounded."
-            )
+    @staticmethod
+    async def _load_grounding_envelope(
+        body: "Body", metadata: dict[str, Any]
+    ) -> GroundingEnvelope | None:
+        messages = body.get("messages") or []
+        if messages and isinstance(messages[-1], dict):
+            interaction = messages[-1].get("gemini_interaction")
+            if isinstance(interaction, dict) and isinstance(interaction.get("grounding"), dict):
+                return GroundingEnvelope.model_validate(interaction["grounding"])
+        chat_id = metadata.get("chat_id")
+        message_id = metadata.get("message_id")
+        user_id = metadata.get("user_id")
+        if not all(isinstance(value, str) and value for value in (chat_id, message_id, user_id)):
             return None
+        chat = await Chats.get_chat_by_id_and_user_id(id=chat_id, user_id=user_id)
+        chat_data = getattr(chat, "chat", None)
+        if not isinstance(chat_data, dict):
+            return None
+        history = chat_data.get("history")
+        db_messages = history.get("messages") if isinstance(history, dict) else None
+        message = db_messages.get(message_id) if isinstance(db_messages, dict) else None
+        interaction = message.get("gemini_interaction") if isinstance(message, dict) else None
+        grounding = interaction.get("grounding") if isinstance(interaction, dict) else None
+        return GroundingEnvelope.model_validate(grounding) if isinstance(grounding, dict) else None
 
-        log.trace("raw_str:", payload=raw_str, _log_truncation_enabled=False)
+    @staticmethod
+    def _assistant_text_accessor(
+        body: "Body",
+    ) -> tuple[str | None, Callable[[str], None] | None]:
+        messages = body.get("messages") or []
+        if not messages or not isinstance(messages[-1], dict):
+            return None, None
+        message = messages[-1]
+        content = message.get("content")
+        if isinstance(content, str):
+            message_mapping = cast(dict[str, object], message)
 
-        thought_prefix = ""
-        content_for_citation_processing = raw_str
+            def set_message_content(value: str) -> None:
+                message_mapping["content"] = value
 
-        THOUGHT_START_TAG = "<details"
-        THOUGHT_END_TAG = "</details>\n"
+            return content, set_message_content
+        if isinstance(content, list):
+            for item in content:
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "text"
+                    and isinstance(item.get("text"), str)
+                ):
+                    item_mapping = cast(dict[str, object], item)
+                    text = cast(str, item_mapping["text"])
 
-        if raw_str.startswith(THOUGHT_START_TAG):
-            last_end_thought_tag_idx = raw_str.rfind(THOUGHT_END_TAG)
-            if (
-                last_end_thought_tag_idx != -1
-                and last_end_thought_tag_idx >= len(THOUGHT_START_TAG) - 1
-            ):
-                thought_block_end_offset = last_end_thought_tag_idx + len(
-                    THOUGHT_END_TAG
-                )
-                thought_prefix = raw_str[:thought_block_end_offset]
-                content_for_citation_processing = raw_str[thought_block_end_offset:]
-                log.info(
-                    "Model thoughts detected at the beginning of the response. "
-                    "Citations will be processed on the content following the last thought block."
-                )
-            else:
-                log.warning(
-                    "Detected THOUGHT_START_TAG at the start of raw_str without a subsequent closing THOUGHT_END_TAG "
-                    "or a malformed thought block. The entire raw_str will be processed for citations. "
-                    "This might lead to incorrect marker placement if thoughts were intended and indices "
-                    "are relative to content after thoughts."
-                )
+                    def set_item_content(
+                        value: str, target: dict[str, object] = item_mapping
+                    ) -> None:
+                        target["text"] = value
 
-        processed_content_part_with_markers = content_for_citation_processing
+                    return text, set_item_content
+        return None, None
 
-        if content_for_citation_processing:
-            try:
-                modified_content_bytes = bytearray(
-                    content_for_citation_processing.encode("utf-8")
-                )
-                for support in reversed(supports):
-                    segment = support.segment
-                    indices = support.grounding_chunk_indices
-                    if not (
-                        indices is not None
-                        and segment
-                        and segment.end_index is not None
-                    ):
-                        log.debug(f"Skipping support due to missing data: {support}")
-                        continue
-                    end_pos = segment.end_index
-                    if not (0 <= end_pos <= len(modified_content_bytes)):
-                        log.warning(
-                            f"Support segment end_index ({end_pos}) is out of bounds for the processable content "
-                            f"(length {len(modified_content_bytes)} bytes after potential thought stripping). "
-                            f"Content (first 50 chars): '{content_for_citation_processing[:50]}...'. Skipping this support. Support: {support}"
-                        )
-                        continue
-                    citation_markers = "".join(f"[{index + 1}]" for index in indices)
-                    encoded_citation_markers = citation_markers.encode("utf-8")
-                    modified_content_bytes[end_pos:end_pos] = encoded_citation_markers
-                processed_content_part_with_markers = modified_content_bytes.decode(
-                    "utf-8"
-                )
-            except Exception as e:
-                log.error(
-                    f"Error injecting citation markers into content: {e}. "
-                    f"Using content part (after potential thought stripping) without new markers."
-                )
-        else:
-            if raw_str and not content_for_citation_processing:
-                log.info(
-                    "Content for citation processing is empty (e.g., raw_str contained only thoughts). "
-                    "No citation markers will be injected."
-                )
-            elif not raw_str:
-                log.warning("Raw string is empty, cannot inject citation markers.")
+    @staticmethod
+    def _insert_citation_markers(envelope: GroundingEnvelope, visible_text: str) -> tuple[str, int]:
+        source_numbers = {source.id: index + 1 for index, source in enumerate(envelope.sources)}
+        citations_by_block: dict[int, list[GroundingCitation]] = {}
+        for citation in envelope.citations:
+            citations_by_block.setdefault(citation.block_index, []).append(citation)
+        output = visible_text
+        search_from = 0
+        replacements: list[tuple[int, int, str]] = []
+        warnings = 0
+        for block_index, block in enumerate(envelope.text_blocks):
+            start_at = output.find(block.text, search_from)
+            if start_at < 0:
+                warnings += len(citations_by_block.get(block_index, []))
+                continue
+            search_from = start_at + len(block.text)
+            grouped: dict[int, set[int]] = {}
+            for citation in citations_by_block.get(block_index, []):
+                number = source_numbers.get(citation.source_id)
+                position = Filter._citation_end_character(citation, block.text)
+                if number is None or position is None:
+                    warnings += 1
+                    continue
+                grouped.setdefault(position, set()).add(number)
+            for position, numbers in grouped.items():
+                marker = "".join(f"[{number}]" for number in sorted(numbers))
+                replacements.append((start_at + position, start_at + position, marker))
+        for start, end, marker in sorted(replacements, reverse=True):
+            output = output[:start] + marker + output[end:]
+        return output, warnings
 
-        final_result_str = thought_prefix + processed_content_part_with_markers
-        return final_result_str
+    @staticmethod
+    def _citation_end_character(citation: GroundingCitation, text: str) -> int | None:
+        if citation.start < 0 or citation.end < citation.start:
+            return None
+        if citation.index_unit == "unicode_codepoints":
+            return citation.end if citation.end <= len(text) else None
+        if citation.index_unit == "provider" and not text.isascii():
+            return None
+        encoded = text.encode("utf-8")
+        if citation.end > len(encoded):
+            return None
+        try:
+            encoded[: citation.start].decode("utf-8")
+            return len(encoded[: citation.end].decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
 
     async def _resolve_url(
         self,
@@ -654,170 +1135,63 @@ class Filter:
                     timeout=timeout,
                 ) as response:
                     final_url = str(response.url)
-                    log.debug(
-                        f"Resolved URL '{url}' to '{final_url}' after {attempt} retries"
-                    )
+                    log.debug(f"Resolved a grounding URL after {attempt} retries.")
                     return final_url, True
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            except (TimeoutError, aiohttp.ClientError):
                 if attempt == max_retries:
                     log.error(
-                        f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
+                        f"Failed to resolve a grounding URL after {max_retries + 1} attempts."
                     )
                     return url, False
                 else:
                     delay = min(base_delay * (2**attempt), 10.0)
                     log.warning(
-                        f"Retry {attempt + 1}/{max_retries + 1} for URL '{url}': {e}. Waiting {delay:.1f}s..."
+                        f"Grounding URL retry {attempt + 1}/{max_retries + 1}; waiting {delay:.1f}s."
                     )
                     await asyncio.sleep(delay)
-            except Exception as e:
-                log.error(f"Unexpected error resolving URL '{url}': {e}")
+            except Exception:
+                log.error("Unexpected grounding URL resolution failure.")
                 return url, False
         return url, False
 
-    async def _resolve_and_emit_sources(
-        self,
-        grounding_chunks: list[types.GroundingChunk],
-        supports: list[types.GroundingSupport],
-        emitter: EventEmitter,
-    ):
-        """
-        Resolves URLs in the background and emits a chat completion event
-        containing only the source information, along with status updates.
-        """
-        initial_metadatas: list[tuple[int, str]] = []
-        for i, g_c in enumerate(grounding_chunks):
-            uri = None
-            if (web_info := g_c.web) and web_info.uri:
-                uri = web_info.uri
-            elif (maps_info := g_c.maps) and maps_info.uri:
-                uri = maps_info.uri
-
-            if uri:
-                initial_metadatas.append((i, uri))
-
-        if not initial_metadatas:
-            log.info("No source URIs found, skipping source emission.")
-            return
-
-        urls_to_resolve = [
-            uri
-            for _, uri in initial_metadatas
-            if uri.startswith(
-                "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+    async def _emit_grounding_sources(
+        self, envelope: GroundingEnvelope, emitter: EventEmitter
+    ) -> None:
+        grouped: dict[str, list[GroundingSource]] = {}
+        for source in envelope.sources:
+            name = (
+                "google_maps"
+                if source.kind == "place"
+                else "file_search"
+                if source.kind == "file"
+                else "google_search"
             )
-        ]
-        resolved_uris_map = {}
-
-        if urls_to_resolve:
-            num_urls = len(urls_to_resolve)
-            emitter.emit_status(f"Resolving {num_urls} source URLs...")
-
-            try:
-                log.info(f"Resolving {num_urls} source URLs...")
-                async with aiohttp.ClientSession() as session:
-                    tasks = [self._resolve_url(session, url) for url in urls_to_resolve]
-                    results = await asyncio.gather(*tasks)
-                log.info("URL resolution completed.")
-
-                resolved_uris = [res[0] for res in results]
-                resolved_uris_map = dict(zip(urls_to_resolve, resolved_uris))
-
-                success_count = sum(1 for _, success in results if success)
-                final_status_msg = (
-                    "URL resolution complete"
-                    if success_count == num_urls
-                    else f"Resolved {success_count}/{num_urls} URLs"
-                )
-                emitter.emit_status(final_status_msg, done=True)
-
-            except Exception as e:
-                log.error(f"Error during URL resolution: {e}")
-                resolved_uris_map = {url: url for url in urls_to_resolve}
-                emitter.emit_status("URL resolution failed", done=True)
-
-        source_metadatas_template: list["SourceMetadata"] = [
-            {"source": None, "original_url": None, "supports": []}
-            for _ in grounding_chunks
-        ]
-        populated_metadatas = [m.copy() for m in source_metadatas_template]
-
-        for chunk_index, original_uri in initial_metadatas:
-            final_uri = resolved_uris_map.get(original_uri, original_uri)
-            if 0 <= chunk_index < len(populated_metadatas):
-                populated_metadatas[chunk_index]["original_url"] = original_uri
-                populated_metadatas[chunk_index]["source"] = final_uri
-            else:
-                log.warning(
-                    f"Chunk index {chunk_index} out of bounds when populating resolved URLs."
-                )
-
-        # Create a mapping from each chunk index to the text segments it supports.
-        chunk_index_to_segments: dict[int, list[types.Segment]] = {}
-        for support in supports:
-            segment = support.segment
-            indices = support.grounding_chunk_indices
-            if not (segment and segment.text and indices is not None):
-                continue
-
-            for index in indices:
-                if index not in chunk_index_to_segments:
-                    chunk_index_to_segments[index] = []
-                chunk_index_to_segments[index].append(segment)
-                populated_metadatas[index]["supports"].append(support.model_dump())  # type: ignore
-
-        valid_source_metadatas: list["SourceMetadata"] = []
-        doc_list: list[str] = []
-
-        for i, meta in enumerate(populated_metadatas):
-            if meta.get("original_url") is not None:
-                valid_source_metadatas.append(meta)
-
-                content_parts: list[str] = []
-                chunk = grounding_chunks[i]
-
-                if maps_info := chunk.maps:
-                    title = maps_info.title or "N/A"
-                    place_id = maps_info.place_id or "N/A"
-                    content_parts.append(f"Title: {title}\nPlace ID: {place_id}")
-
-                supported_segments = chunk_index_to_segments.get(i)
-                if supported_segments:
-                    if content_parts:
-                        content_parts.append("")  # Add a blank line for separation
-
-                    # Use a set to show each unique snippet only once per source.
-                    unique_snippets = {
-                        (seg.text, seg.start_index, seg.end_index)
-                        for seg in supported_segments
-                        if seg.text is not None
+            grouped.setdefault(name, []).append(source)
+        for name, sources in grouped.items():
+            documents: list[str] = []
+            metadata: list[SourceMetadata] = []
+            for source in sources:
+                original_uri = source.uri
+                resolved_uri = original_uri
+                if original_uri and original_uri.startswith(
+                    "https://vertexaisearch.cloud.google.com/grounding-api-redirect/"
+                ):
+                    async with aiohttp.ClientSession() as session:
+                        resolved_uri, _ = await self._resolve_url(session, original_uri)
+                details = [
+                    value for value in (source.title, source.file_name, source.place_id) if value
+                ]
+                documents.append("\n".join(details))
+                metadata.append(
+                    {
+                        "source": resolved_uri,
+                        "original_url": original_uri,
+                        "supports": [],
                     }
-
-                    # Sort snippets by their appearance in the text.
-                    sorted_snippets = sorted(unique_snippets, key=lambda s: s[1] or 0)
-
-                    snippet_strs = [
-                        f'- "{text}" (Indices: {start}-{end})'
-                        for text, start, end in sorted_snippets
-                    ]
-                    content_parts.append("Supported text snippets:")
-                    content_parts.extend(snippet_strs)
-
-                doc_list.append("\n".join(content_parts))
-
-        sources_list: list["Source"] = []
-        if valid_source_metadatas:
-            sources_list.append(
-                {
-                    "source": {"name": "web_search"},
-                    "document": doc_list,
-                    "metadata": valid_source_metadatas,
-                }
+                )
+            emitter.emit_sources(
+                {"source": {"name": name}, "document": documents, "metadata": metadata}
             )
-
-        # TODO: emit sources as they come in, real time
-        for source in sources_list:
-            emitter.emit_sources(source)
 
     # endregion 1.1 Add citations
 
@@ -825,110 +1199,92 @@ class Filter:
     # TODO: Remove citation markers from model input.
     # endregion 1.2 Remove citation markers
 
-    # region 1.3 Get permissive safety settings
-
-    def _get_permissive_safety_settings(
-        self, model_name: str
-    ) -> list[types.SafetySetting]:
-        """Get safety settings based on model name and permissive setting."""
-
-        # Settings supported by most models
-        category_threshold_map = {
-            types.HarmCategory.HARM_CATEGORY_HARASSMENT: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: types.HarmBlockThreshold.OFF,
-            types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: types.HarmBlockThreshold.BLOCK_NONE,
-        }
-
-        # Older models use BLOCK_NONE
-        if model_name in [
-            "gemini-1.5-pro-001",
-            "gemini-1.5-flash-001",
-            "gemini-1.5-flash-8b-exp-0827",
-            "gemini-1.5-flash-8b-exp-0924",
-            "gemini-pro",
-            "gemini-1.0-pro",
-            "gemini-1.0-pro-001",
-        ]:
-            for category in category_threshold_map:
-                category_threshold_map[category] = types.HarmBlockThreshold.BLOCK_NONE
-
-        # Gemini 2.0 Flash supports CIVIC_INTEGRITY OFF
-        if model_name in [
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-001",
-            "gemini-2.0-flash-exp",
-        ]:
-            category_threshold_map[types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY] = (
-                types.HarmBlockThreshold.OFF
-            )
-
-        log.debug(
-            f"Safety settings: {str({k.value: v.value for k, v in category_threshold_map.items()})}"
-        )
-
-        safety_settings = [
-            types.SafetySetting(category=category, threshold=threshold)
-            for category, threshold in category_threshold_map.items()
-        ]
-        return safety_settings
-
-    # endregion 1.3 Get permissive safety settings
-
-    # region 1.4 Configuration loading
+    # region 1.3 Configuration loading
 
     @staticmethod
     @functools.lru_cache(maxsize=1)
-    def _load_model_config(config_path: str) -> dict:
+    def _load_model_config(config_path: str) -> CatalogAppStateEnvelope:
         """Loads the model configuration from a URL.
-        
+
         Uses LRU cache to avoid reloading the same configuration repeatedly.
         Cache is tied to the config_path argument.
         """
         if not config_path:
-            log.warning("MODEL_CONFIG_PATH is empty, returning empty config.")
-            return {}
+            raise ModelCatalogError("MODEL_CONFIG_PATH must not be empty")
 
         try:
             if not (config_path.startswith("http://") or config_path.startswith("https://")):
-                log.error(f"MODEL_CONFIG_PATH must be a URL (http:// or https://), got: {config_path}")
-                return {}
+                raise ModelCatalogError("MODEL_CONFIG_PATH must be an HTTP(S) URL.")
 
-            log.debug(f"Loading model configuration from: {config_path}")
-            with urllib.request.urlopen(config_path) as response:
-                config = yaml.safe_load(response.read())
-                log.success(f"Successfully loaded model configuration with {len(config)} model(s).")
-                return config
-        except Exception as e:
-            log.error(f"Failed to load model config from {config_path}: {e}")
-            return {}
+            log.debug("Loading the configured Gemini model catalog.")
+            with urllib.request.urlopen(config_path, timeout=10) as response:
+                raw_config = yaml.load(response.read(), Loader=_UniqueKeyLoader)
+            catalog = ModelCatalog.model_validate(raw_config)
+            envelope = CatalogAppStateEnvelope.from_catalog(catalog)
+            log.success(
+                f"Loaded Gemini model catalog protocol {catalog.schema_version} "
+                f"with {len(catalog.provider_claims)} model(s)."
+            )
+            return envelope
+        except ModelCatalogError:
+            raise
+        except Exception:
+            raise ModelCatalogError("Gemini model catalog is unavailable or invalid.") from None
 
-    # endregion 1.4 Configuration loading
+    # endregion 1.3 Configuration loading
 
     # region 1.5 Model capability checks
 
     @staticmethod
-    def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
+    def _check_model_capability(
+        model_id: str,
+        config: dict,
+        capability: str,
+        *,
+        service: Literal["developer", "enterprise"] = "developer",
+    ) -> bool:
         """Check if a model supports a specific capability based on YAML config.
-        
+
         Args:
             model_id: The canonical model id (without prefixes)
             config: The loaded YAML configuration dict
             capability: The capability to check (e.g., "search_grounding", "code_execution")
-            
+
         Returns:
             True if the model supports the capability, False otherwise
         """
         if model_id not in config:
-            log.debug(f"Model '{model_id}' not found in config, capability '{capability}' check returns False.")
+            log.debug(
+                f"Model '{model_id}' not found in config, capability '{capability}' check returns False."
+            )
             return False
 
         model_config = config[model_id]
-        capabilities = model_config.get("capabilities", {})
-        result = capabilities.get(capability, False)
+        service_policy = model_config.get("services", {}).get(service, {})
+        if service_policy.get("availability") != "supported":
+            return False
+        capability_paths = {
+            "search_grounding": ("tools", "google_search"),
+            "code_execution": ("tools", "code_execution"),
+            "url_context": ("tools", "url_context"),
+            "grounding_google_maps": ("tools", "google_maps"),
+            "file_search": ("tools", "file_search"),
+            "function_calling": ("custom_function_calling",),
+            "thinking": ("thinking", "supported"),
+            "structured_outputs": ("response_format",),
+        }
+        path = capability_paths.get(capability)
+        if path is None:
+            log.warning("An unknown catalog capability was denied.")
+            return False
+        value: object = service_policy.get("interactions", {})
+        for key in path:
+            if not isinstance(value, dict):
+                return False
+            value = value.get(key, False)
+        result = value is True
 
-        log.debug(f"Model '{model_id}' capability '{capability}' check: {result}")
+        log.debug("Completed a catalog capability check.")
         return result
 
     # endregion 1.5 Model capability checks
@@ -955,113 +1311,14 @@ class Filter:
             "stream_options",
         }
 
-        custom_param_keys = [key for key in body.keys() if key not in known_body_keys]
+        custom_param_keys = [key for key in body if key not in known_body_keys]
         for key in custom_param_keys:
             chat_control_params[key] = body[key]
 
         if custom_param_keys:
-            log.debug(
-                f"Found and preserved custom chat control parameters: {custom_param_keys}"
-            )
+            log.debug("Found and preserved custom chat control parameters.")
 
         return chat_control_params
-
-    @staticmethod
-    def _cleanup_event_emitters(app_state: State) -> None:
-        """
-        Scans the FastAPI app state for abandoned EventEmitter instances and removes them.
-        This acts as a garbage collector for orphaned state data.
-        """
-        # We iterate over a copy of keys to avoid "dictionary changed size during iteration" errors.
-        # We specifically look for the namespaced emitter keys (gemini_event_emitter_<chat>_<msg>).
-        abandoned_keys = [
-            key
-            for key, value in app_state._state.items()
-            if key.startswith("gemini_event_emitter_")
-            and isinstance(value, EventEmitter)
-            and value.is_abandoned
-        ]
-
-        for key in abandoned_keys:
-            log.warning(
-                f"Garbage Collector: Removing abandoned EventEmitter from app state: {key}"
-            )
-            # Removing the reference allows the Python GC to reclaim the EventEmitter instance
-            # and its internal queue resources.
-            del app_state._state[key]
-
-    @staticmethod
-    def _store_data_in_state(
-        app_state: State,
-        __metadata__: "Metadata",
-        data: dict[str, Any],
-    ):
-        """
-        Stores multiple values in the app state, namespaced by chat and message ID.
-        Exits early if this is a task model (e.g. title generation) to prevent
-        state bloat and interference with the main chat's filter logic.
-        """
-        if __metadata__.get("task"):
-            return
-
-        chat_id = __metadata__.get("chat_id")
-        message_id = __metadata__.get("message_id")
-
-        if not chat_id or not message_id:
-            log.warning(
-                "Skipping state storage: chat_id or message_id missing from metadata."
-            )
-            return
-
-        for key_suffix, value in data.items():
-            key = f"{key_suffix}_{chat_id}_{message_id}"
-            log.debug(f"Storing data in app state with key '{key}'.")
-            # Using shared `request.app.state` to pass data to Filter.outlet.
-            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
-            app_state._state[key] = value
-
-    @staticmethod
-    def _get_and_clear_data_from_state(
-        app_state: State,
-        chat_id: str,
-        message_id: str,
-        key_suffix: str,
-        clear_after_read: bool,
-    ) -> Any | None:
-        """Retrieves data from the app state using a namespaced key.
-
-        Deletes the value only when clear_after_read is True.
-        """
-        key = f"{key_suffix}_{chat_id}_{message_id}"
-        value = getattr(app_state, key, None)
-        if value is None:
-            return None
-
-        if clear_after_read:
-            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
-            try:
-                delattr(app_state, key)
-            except AttributeError:
-                # This case is unlikely but handles a race condition where the attribute might already be gone.
-                log.warning(
-                    f"State key '{key}' was already gone before deletion attempt."
-                )
-        else:
-            log.debug(
-                f"Retrieved data from app state for key '{key}' without clearing it."
-            )
-        return value
-
-    def _get_first_candidate(
-        self, candidates: list[types.Candidate] | None
-    ) -> types.Candidate | None:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            log.warning("Received chunk with no candidates, skipping processing.")
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
 
     @staticmethod
     def _get_model_name(body: "Body") -> tuple[str, bool]:
@@ -1089,9 +1346,7 @@ class Filter:
         # If metadata exists, attempt to extract the base_model_id
         if metadata := body.get("metadata"):
             # Safely navigate the nested structure: metadata -> model -> info -> base_model_id
-            base_model_name = (
-                metadata.get("model", {}).get("info", {}).get("base_model_id", None)
-            )
+            base_model_name = metadata.get("model", {}).get("info", {}).get("base_model_id", None)
             # If a base model ID is found, it overrides the initially requested name
             if base_model_name:
                 effective_model_name = base_model_name
@@ -1103,9 +1358,7 @@ class Filter:
 
         # 4. Create the canonical model name by removing the manifold prefix
         # from the effective model name.
-        canonical_model_name = effective_model_name.replace(
-            "gemini_manifold_google_genai.", ""
-        )
+        canonical_model_name = effective_model_name.replace("gemini_manifold_google_genai.", "")
 
         # 5. Log the relevant names for debugging purposes
         log.debug(
@@ -1124,6 +1377,43 @@ class Filter:
         if not isinstance(data, dict):
             return False
         return not any(isinstance(value, (dict, list)) for value in data.values())
+
+    @classmethod
+    def _redact_log_data(cls, data: object) -> object:
+        """Remove credentials, signed state, and secret-bearing locations recursively."""
+        if isinstance(data, dict):
+            redacted: dict[object, object] = {}
+            for key, value in data.items():
+                normalized = "_".join(
+                    part for part in str(key).lower().replace("-", "_").split("_") if part
+                )
+                sensitive = bool(
+                    normalized == "gemini_interaction"
+                    or "signature" in normalized
+                    or normalized
+                    in {
+                        "api_key",
+                        "authorization",
+                        "credential",
+                        "credential_fingerprint",
+                        "password",
+                        "secret",
+                        "access_token",
+                        "refresh_token",
+                        "uri",
+                        "url",
+                    }
+                    or normalized.endswith("_api_key")
+                    or normalized.endswith("_credential")
+                    or normalized.endswith("_secret")
+                )
+                redacted[key] = "[REDACTED]" if sensitive else cls._redact_log_data(value)
+            return redacted
+        if isinstance(data, list):
+            return [cls._redact_log_data(item) for item in data]
+        if isinstance(data, tuple):
+            return tuple(cls._redact_log_data(item) for item in data)
+        return data
 
     def _truncate_long_strings(
         self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
@@ -1155,17 +1445,13 @@ class Filter:
         elif isinstance(data, dict):
             # Process dictionary items, creating a new dict
             return {
-                k: self._truncate_long_strings(
-                    v, max_len, truncation_marker, truncation_enabled
-                )
+                k: self._truncate_long_strings(v, max_len, truncation_marker, truncation_enabled)
                 for k, v in data.items()
             }
         elif isinstance(data, list):
             # Process list items, creating a new list
             return [
-                self._truncate_long_strings(
-                    item, max_len, truncation_marker, truncation_enabled
-                )
+                self._truncate_long_strings(item, max_len, truncation_marker, truncation_enabled)
                 for item in data
             ]
         else:
@@ -1195,6 +1481,7 @@ class Filter:
                 serializable_data = pydantic_core.to_jsonable_python(
                     data_to_process, serialize_unknown=True
                 )
+                serializable_data = self._redact_log_data(serializable_data)
 
                 # Determine truncation settings
                 truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
@@ -1214,12 +1501,8 @@ class Filter:
                 )
 
                 # Serialize the (potentially truncated) data
-                if self._is_flat_dict(truncated_data) and not isinstance(
-                    truncated_data, list
-                ):
-                    json_string = json.dumps(
-                        truncated_data, separators=(",", ":"), default=str
-                    )
+                if self._is_flat_dict(truncated_data) and not isinstance(truncated_data, list):
+                    json_string = json.dumps(truncated_data, separators=(",", ":"), default=str)
                     # Add a simple prefix if it's compact
                     serialized_data_json = " - " + json_string
                 else:
@@ -1227,12 +1510,10 @@ class Filter:
                     # Prepend with newline for readability
                     serialized_data_json = "\n" + json_string
 
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except (
-                Exception
-            ) as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
+            except (TypeError, ValueError):
+                serialized_data_json = " - {Serialization Error}"
+            except Exception:
+                serialized_data_json = " - {Processing Error}"
 
         # Add the final JSON string (or error message) back into the record
         record["extra"]["_plugin_serialized_data"] = serialized_data_json
@@ -1275,7 +1556,7 @@ class Filter:
             return  # Stop processing if the level is invalid
 
         # Access the internal state of the log
-        handlers: dict[int, "Handler"] = log._core.handlers  # type: ignore
+        handlers: dict[int, Handler] = log._core.handlers  # type: ignore
         handler_id_to_remove = None
         found_correct_handler = False
 

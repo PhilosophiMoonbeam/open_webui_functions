@@ -30,11 +30,11 @@ import datetime
 import inspect
 import json
 import re
-from pydantic import BaseModel
-from typing import Any, Awaitable, Callable, cast, TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, cast
 
 from open_webui.models.functions import Functions
-
+from pydantic import BaseModel
 
 if TYPE_CHECKING:
     from utils.manifold_types import *  # My personal types in a separate file for more robustness.
@@ -52,7 +52,6 @@ DETAILS_BLOCK_REGEX = re.compile(
 
 
 class Filter:
-
     class Valves(BaseModel):
         pass
 
@@ -72,7 +71,7 @@ class Filter:
     def inlet(self, body: "Body") -> "Body":
         self._log("Inlet execution started.")
 
-        messages: list["Message"] = body.get("messages", [])
+        messages: list[Message] = body.get("messages", [])
         if not messages:
             self._log("Warning: No messages found in the body.")
             return body
@@ -84,9 +83,7 @@ class Filter:
         for idx, message in enumerate(messages):
             if message.get("role") == "user":
                 message = cast("UserMessage", message)
-                processed_message, (sp, opt, title) = self._process_user_message(
-                    message
-                )
+                processed_message, (sp, opt, title) = self._process_user_message(message)
                 messages[idx] = processed_message  # Update message in-place
 
                 # Track the parameters from the latest found prompt injection
@@ -122,7 +119,7 @@ class Filter:
         # Only add a status header if a prompt title was set during inlet
         if self.prompt_title:
             self._log(f"Emitting status event for prompt title: '{self.prompt_title}'")
-            status_event: "StatusEvent" = {
+            status_event: StatusEvent = {
                 "type": "status",
                 "data": {"description": self.prompt_title},
             }
@@ -141,9 +138,7 @@ class Filter:
         if isinstance(content, list):  # Handle mixed content (images + text)
             non_text_content = [item for item in content if item.get("type") != "text"]
             text_segments = [
-                cast("TextContent", item)["text"]
-                for item in content
-                if item.get("type") == "text"
+                cast("TextContent", item)["text"] for item in content if item.get("type") == "text"
             ]
 
             new_text_segments = []
@@ -165,8 +160,8 @@ class Filter:
             user_message["content"] = new_content
 
         else:  # Handle traditional text-only content
-            system_prompt, title, modified_content, options = (
-                self._extract_injection_params(content)
+            system_prompt, title, modified_content, options = self._extract_injection_params(
+                content
             )
             user_message["content"] = modified_content
 
@@ -280,7 +275,7 @@ class Filter:
 
         else:
             self._log(f"Applying system prompt: '{system_prompt[:70]}...'")
-            system_message: "SystemMessage" = {
+            system_message: SystemMessage = {
                 "role": "system",
                 "content": system_prompt,
             }
@@ -290,9 +285,7 @@ class Filter:
                 self._log("Updated existing system message in 'messages' list.")
             else:
                 messages.insert(0, system_message)
-                self._log(
-                    "Inserted new system message at the beginning of 'messages' list."
-                )
+                self._log("Inserted new system message at the beginning of 'messages' list.")
 
             if is_ollama and body_options is not None:
                 body_options["system"] = system_prompt

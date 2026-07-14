@@ -1,0 +1,595 @@
+schema_version: 1
+artifact: gemini-interactions-model-claim-provenance
+scope: developer-api
+researched_at: "2026-07-14"
+repository_commit: "0532956258e19e257c41002d0f2c4268ab8ac087"
+
+evidence_policy:
+  freshness_days: 30
+  expires_after: "2026-08-13"
+  on_expiry: deny_changed_or_unverifiable_claims_until_renewed
+  source_precedence:
+    - exact_interactions_supported_id_table
+    - exact_model_property_page
+    - exact_thinking_or_pricing_table_row
+    - dated_lifecycle_changelog
+    - generic_interactions_feature_guide
+    - exact_sdk_2_11_wire_shape_only
+  rules:
+    - Interactions availability requires exact model-ID equality in interactions_supported.
+    - Model pages establish lifecycle, modalities, limits, and provider capabilities only.
+    - Thinking controls require an exact row in thinking_controls; general thinking support is insufficient.
+    - Pricing requires the exact model ID, service tier, modality, cache state, and threshold semantics.
+    - SDK types establish serialization shape only and never model availability or product authorization.
+    - Product allow requires provider evidence, Interactions availability, implementation evidence, and policy review.
+    - Missing, stale, conflicting, family-inferred, or alias-based evidence is unknown and denied.
+  renewal_procedure:
+    - Fetch every HTTP source at its canonical URL and record the raw-response SHA-256.
+    - Compare published last-updated dates and exact table rows against this artifact.
+    - Reconcile every retained, excluded, removed, denied, and unknown entry by exact ID.
+    - Re-run the provenance tests before protocol or production catalog mutation.
+    - Record the new retrieval date, source digests, repository commit, and Beads evidence.
+
+sources:
+  interactions_supported:
+    kind: provider_interactions_availability
+    url: https://ai.google.dev/gemini-api/docs/interactions-overview
+    section: "Supported models & agents; exact Model ID column"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a"
+  interactions_state:
+    kind: provider_interactions_feature
+    url: https://ai.google.dev/gemini-api/docs/interactions-overview
+    section: "Why use the Interactions API; store and previous_interaction_id"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a"
+  image_generation_output_config:
+    kind: provider_interactions_feature
+    url: https://ai.google.dev/gemini-api/docs/image-generation
+    section: "Interactions optional configurations; aspect ratios and image size tables"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:8af46dc5b2d43334d0e68dc73df267dfb292f38086b38883a7ea16905b55bd21"
+  model_lifecycle_index:
+    kind: provider_model_lifecycle
+    url: https://ai.google.dev/gemini-api/docs/models
+    section: "Gemini 3 stable/preview groups; Previous models"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:722755dd1fec10bffa4396ef9e9dd8b823671a50bd1876385500324ded297e52"
+  thinking_controls:
+    kind: provider_interactions_thinking
+    url: https://ai.google.dev/gemini-api/docs/thinking
+    section: "Controlling thinking; Model / Levels Supported table"
+    published_last_updated: "2026-07-06"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:94f414c6982dfdda33ce753ffae394c5abbf9deb926f1cc4c6fce44676f641da"
+  developer_pricing:
+    kind: provider_developer_pricing
+    url: https://ai.google.dev/gemini-api/docs/pricing
+    section: "Exact model Standard pricing tables"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:df78b251d5b18fbfd4880ca56351bb1c88f62d710de85c8db653d24952453a7e"
+  lifecycle_changelog:
+    kind: provider_lifecycle_changelog
+    url: https://ai.google.dev/gemini-api/docs/changelog
+    section: "May 7, May 25, and May 28 2026 model lifecycle entries"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:2deb26cb12b665bbf2f70d2901ba03ec2ee91428e315c3691be9703e22fa86bf"
+  file_input_methods:
+    kind: provider_interactions_input_transport
+    url: https://ai.google.dev/gemini-api/docs/file-input-methods
+    section: "Input method comparison; Gemini File API; External HTTP / Signed URLs"
+    published_last_updated: "2026-07-06"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:5ca9e220788de121fe803ae67159b5bcd643d7a385070d01c21ced708b7ee62f"
+  model_gemini_3_5_flash:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash
+    section: "gemini-3.5-flash property table and Versions"
+    published_last_updated: "2026-06-24"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:7c0f39d99f7a0f30dd95c7902a2b008b32b71a2176cbe963e0b14d58d9ccc643"
+  model_gemini_3_1_pro_preview:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview
+    section: "gemini-3.1-pro-preview property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:37fda140d566ee32c1017a0e294f9012c891287bae42779b89a11d5129762cb8"
+  model_gemini_3_1_flash_lite:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite
+    section: "gemini-3.1-flash-lite property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:3ada7b07847a43defcc3fb5c68e460c9256967845a241316e84510f86cace8fd"
+  model_gemini_3_flash_preview:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview
+    section: "gemini-3-flash-preview property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:cc9160686215e90a856d5ac100c98da55ca5702add120d92acb88901fbfce6ae"
+  model_gemini_2_5_pro:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro
+    section: "gemini-2.5-pro property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:546e340fb46a1a378235413a17dc9fe35508ce4146c65edc007521054029c9e0"
+  model_gemini_2_5_flash:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash
+    section: "gemini-2.5-flash property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:f1a199c5e4a59b6567743ecd4b26a02a95cdd8bd1f5b1a97926e328746458b65"
+  model_gemini_2_5_flash_lite:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite
+    section: "gemini-2.5-flash-lite property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:b5a013b5ab4ca3bcf2e47eea3ec3d293e9f9af6bbe62e2537ffe09f441b052e4"
+  model_gemini_3_pro_image:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3-pro-image
+    section: "gemini-3-pro-image property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:26957affc199ca888da0e97b7b90b4cbeef4dad6ae5e1f1ce5c9c7f02d12c1ae"
+  model_gemini_3_1_flash_image:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image
+    section: "gemini-3.1-flash-image property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:57880128e11b6e9f3017eeb800dac2159c85d38c3d48ab6c93bce83a97e2ab82"
+  model_gemini_2_5_flash_image:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-image
+    section: "gemini-2.5-flash-image property table and Versions"
+    published_last_updated: "2026-06-23"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:87ad5f25c1aa794ee99fd8cf95c05765b88f34dc1216e9e72702771ac88cde6c"
+  sdk_2_11_release:
+    kind: sdk_wire_shape_only
+    url: https://github.com/googleapis/python-genai/releases/tag/v2.11.0
+    section: "google-genai v2.11.0 release and installed Interaction types"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:45e9e4b64a1ae1acb17c58212cfd722d65052fdb19eb09b5db61840a78b0cd04"
+    installed_file_digests:
+      google/genai/interactions.py: "sha256:d1d02313731f20436af94853c68ed68352ec0f0df9226f5de3b48370ba6a68ed"
+      google/genai/_gaos/types/interactions/interaction.py: "sha256:89bd74fed496f190f9288c3117408d51e9a629f5788193705da957df8dd581ec"
+      google/genai/_gaos/types/interactions/usage.py: "sha256:eed8994c15e2ef0e36acd0016fd8d8e599df79222036fb5a8133e0e3606fc7d7"
+      google/genai/_gaos/types/interactions/tool.py: "sha256:c540bb6d7eca83d5e793898c6a38f27245b6ad5ad05a6285d951d1b8d44ef3e7"
+  product_implementation:
+    kind: repository_implementation
+    url: plugins/pipes/gemini_manifold.py
+    section: "typed catalog policy, request builder, media/files, tools, reducer, usage"
+    published_last_updated: null
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:9894db3145b35b84916a2f6a2a26bcf9c417f4fa1b572d6333e6977c5c7cfd61"
+  product_tests:
+    kind: repository_test_evidence
+    url: tests/test_gemini_manifold.py
+    section: "catalog gates, request snapshots, media, tools, usage, public orchestration"
+    published_last_updated: null
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:40dff60b8ae85afe50518b6c86c297c7edb7e9b384dc4299503c5ed6ffe9169c"
+
+interactions_supported_ids:
+  models:
+    - gemini-3.5-flash
+    - gemini-3.1-pro-preview
+    - gemini-3.1-flash-lite
+    - gemini-3-flash-preview
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - gemini-2.5-flash-lite
+    - gemini-3-pro-image
+    - gemini-3.1-flash-image
+    - gemini-3.1-flash-tts-preview
+    - gemma-4-31b-it
+    - gemma-4-26b-a4b-it
+    - lyria-3-clip-preview
+    - lyria-3-pro-preview
+  agents:
+    - deep-research-preview-04-2026
+    - deep-research-max-preview-04-2026
+    - antigravity-preview-05-2026
+  evidence: interactions_supported
+
+product_scope_exclusions:
+  gemini-3.1-flash-tts-preview: "Speech-generation-only surface is outside the text/multimodal manifold contract."
+  gemma-4-31b-it: "Gemma family is outside the Gemini manifold product scope."
+  gemma-4-26b-a4b-it: "Gemma family is outside the Gemini manifold product scope."
+  lyria-3-clip-preview: "Music generation is outside the manifold output and storage contract."
+  lyria-3-pro-preview: "Music generation is outside the manifold output and storage contract."
+  deep-research-preview-04-2026: "Agent interactions require a separate agent lifecycle and are outside model discovery."
+  deep-research-max-preview-04-2026: "Agent interactions require a separate agent lifecycle and are outside model discovery."
+  antigravity-preview-05-2026: "Managed-agent execution is outside model discovery and tool authorization."
+
+shared_product_claims:
+  store:
+    decision: allow
+    evidence: [interactions_supported, interactions_state, product_implementation, product_tests]
+    reason: "Explicit store and same-scope continuation are implemented and tested for supported model interactions."
+  files:
+    decision: conditional_allow
+    evidence: [file_input_methods, product_implementation, product_tests]
+    reason: "Files transport is allowed only for a content modality established by the exact model page."
+  external_urls:
+    decision: conditional_allow
+    evidence: [file_input_methods, product_implementation, product_tests]
+    reason: "External URLs are allowed only for a content modality established by the exact model page; Gemini 2.0 exclusion is irrelevant to retained IDs."
+  file_search:
+    decision: deny
+    evidence: [product_implementation, product_tests]
+    reason: "Provider support does not imply product authorization; no file-search request implementation is exposed."
+  safety_settings:
+    decision: deny
+    evidence: [interactions_supported, product_implementation, product_tests]
+    reason: "Custom safety settings are an explicit Interactions limitation and were removed."
+
+models:
+  gemini-3.5-flash:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_3_5_flash
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image, video, audio, document]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: true, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking: {control: known, default: medium, levels: [minimal, low, medium, high]}
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: true
+      free_tier_tools: {google_search: paid_only, google_maps: paid_only}
+      input_per_million: {all_supported_input_modalities: 1.50}
+      output_per_million: {text_and_thinking: 9.00}
+      cached_input_per_million: {all_supported_input_modalities: 0.15}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: allow
+      response_format: allow
+      custom_function_calling: allow
+      tools: {google_search: allow, google_maps: allow, code_execution: allow, url_context: allow, file_search: deny}
+
+  gemini-3.1-pro-preview:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_3_1_pro_preview
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: preview
+      input_modalities: [text, image, video, audio, document]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: ai_studio_only, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking: {control: known, default: high, levels: [low, medium, high]}
+    standard_pricing:
+      threshold_semantics: whole_prompt_length_not_marginal
+      threshold_tokens: 200000
+      free_tier: false
+      free_tier_tools: {google_search: paid_only, google_maps: paid_only}
+      input_per_million: {at_or_below_threshold: 2.00, above_threshold: 4.00}
+      output_per_million: {at_or_below_threshold: 12.00, above_threshold: 18.00}
+      cached_input_per_million: {at_or_below_threshold: 0.20, above_threshold: 0.40}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: allow
+      response_format: allow
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: allow, code_execution: allow, url_context: allow, file_search: deny}
+
+  gemini-3.1-flash-lite:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_3_1_flash_lite
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image, video, audio, document]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: true, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking:
+      control: unknown
+      levels: []
+      reason: "No exact gemini-3.1-flash-lite row exists in the current Interactions controlling-thinking table."
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: true
+      free_tier_tools: {google_search: paid_only, google_maps: paid_only}
+      input_per_million: {text_image_video: 0.25, audio: 0.50}
+      output_per_million: {text_and_thinking: 1.50}
+      cached_input_per_million: {text_image_video: 0.025, audio: 0.05}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: deny
+      response_format: allow
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: deny, code_execution: allow, url_context: allow, file_search: deny}
+
+  gemini-3-flash-preview:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_3_flash_preview
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: preview
+      input_modalities: [text, image, video, audio, document]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: true, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking: {control: known, default: high, levels: [minimal, low, medium, high]}
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: true
+      free_tier_tools: {google_search: paid_only, google_maps: paid_only}
+      input_per_million: {text_image_video: 0.50, audio: 1.00}
+      output_per_million: {text_and_thinking: 3.00}
+      cached_input_per_million: {text_image_video: 0.05, audio: 0.10}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: allow
+      response_format: allow
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: deny, code_execution: allow, url_context: allow, file_search: deny}
+
+  gemini-2.5-pro:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_2_5_pro
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image, video, audio, document]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: true, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking: {control: known, default: null, levels: [low, medium, high]}
+    standard_pricing:
+      threshold_semantics: whole_prompt_length_not_marginal
+      threshold_tokens: 200000
+      free_tier: true
+      free_tier_tools:
+        google_search: paid_project_free_quota_then_charge
+        google_maps: paid_project_free_quota_then_charge
+      input_per_million: {at_or_below_threshold: 1.25, above_threshold: 2.50}
+      output_per_million: {at_or_below_threshold: 10.00, above_threshold: 15.00}
+      cached_input_per_million: {at_or_below_threshold: 0.125, above_threshold: 0.25}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: allow
+      response_format: allow
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: allow, code_execution: allow, url_context: allow, file_search: deny}
+
+  gemini-2.5-flash:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_2_5_flash
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image, video, audio]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: true, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking: {control: known, default: null, levels: [low, medium, high]}
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: true
+      free_tier_tools: {google_search: free_quota_500_rpd, google_maps: free_quota_500_rpd}
+      input_per_million: {text_image_video: 0.30, audio: 1.00}
+      output_per_million: {text_and_thinking: 2.50}
+      cached_input_per_million: {text_image_video: 0.03, audio: 0.10}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: allow
+      response_format: allow
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: allow, code_execution: allow, url_context: allow, file_search: deny}
+      document_input:
+        decision: deny
+        reason: "The exact model page does not list PDF/document input; do not inherit it from another 2.5 model."
+
+  gemini-2.5-flash-lite:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_2_5_flash_lite
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image, video, audio, document]
+      output_modalities: [text]
+      limits: {input_tokens: 1048576, output_tokens: 65536}
+      capabilities: {caching: true, code_execution: true, file_search: true, function_calling: true, google_maps: true, google_search: true, structured_outputs: true, thinking: true, url_context: true}
+    thinking: {control: known, default: "off", levels: [low, medium, high]}
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: true
+      free_tier_tools: {google_search: free_quota_500_rpd, google_maps: free_quota_500_rpd}
+      input_per_million: {text_image_video: 0.10, audio: 0.30}
+      output_per_million: {text_and_thinking: 0.40}
+      cached_input_per_million: {text_image_video: 0.01, audio: 0.03}
+    product_authorization:
+      discovery: allow
+      reasoning_controls: allow
+      response_format: allow
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: deny, code_execution: allow, url_context: allow, file_search: deny}
+
+  gemini-3-pro-image:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_3_pro_image
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image]
+      output_modalities: [text, image]
+      limits: {input_tokens: 65536, output_tokens: 32768}
+      capabilities: {caching: false, code_execution: false, file_search: false, function_calling: false, google_maps: false, google_search: true, structured_outputs: true, thinking: true, url_context: false}
+    thinking:
+      control: unknown
+      levels: []
+      reason: "The controlling-thinking table has no exact gemini-3-pro-image row."
+    image_output:
+      evidence: image_generation_output_config
+      resolutions: [1K, 2K, 4K]
+      aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: false
+      free_tier_tools: {google_search: paid_only, google_maps: unsupported}
+      input_per_million: {text_image: 2.00}
+      output_per_million: {text_and_thinking: 12.00, image: 120.00}
+      cached_input_per_million: null
+    product_authorization:
+      discovery: allow
+      reasoning_controls: deny
+      response_format: deny
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: deny, code_execution: deny, url_context: deny, file_search: deny}
+      document_input:
+        decision: deny
+        reason: "The exact model page lists only text and image input."
+
+  gemini-3.1-flash-image:
+    disposition: retain
+    evidence:
+      availability: interactions_supported
+      model: model_gemini_3_1_flash_image
+      thinking: thinking_controls
+      pricing: developer_pricing
+      product: [product_implementation, product_tests]
+    provider:
+      lifecycle: stable
+      input_modalities: [text, image, document]
+      output_modalities: [text, image]
+      limits: {input_tokens: 131072, output_tokens: 32768}
+      capabilities: {caching: false, code_execution: false, file_search: false, function_calling: false, google_maps: false, google_search: true, structured_outputs: false, thinking: true, url_context: false}
+    thinking:
+      control: unknown
+      levels: []
+      reason: "The controlling-thinking table has no exact gemini-3.1-flash-image row."
+    image_output:
+      evidence: image_generation_output_config
+      resolutions: ["512", 1K, 2K, 4K]
+      aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
+    standard_pricing:
+      threshold_semantics: none
+      free_tier: false
+      free_tier_tools: {google_search: paid_only, google_maps: unsupported}
+      input_per_million: {text_image: 0.50}
+      output_per_million: {text_and_thinking: 3.00, image: 60.00}
+      cached_input_per_million: null
+    product_authorization:
+      discovery: allow
+      reasoning_controls: deny
+      response_format: deny
+      custom_function_calling: deny
+      tools: {google_search: allow, google_maps: deny, code_execution: deny, url_context: deny, file_search: deny}
+
+current_catalog_reconciliation:
+  gemini-3.5-flash:
+    disposition: retain_with_changes
+    changes: [add_cached_pricing, preserve_exact_model_claims]
+  gemini-3.1-pro-preview:
+    disposition: retain_with_changes
+    changes: [add_cached_pricing, preserve_whole_prompt_threshold_semantics]
+  gemini-3.1-flash-lite:
+    disposition: retain_with_changes
+    changes: [deny_unproven_thinking_controls, split_audio_input_and_cache_pricing, deny_product_maps]
+  gemini-3.1-flash-lite-preview:
+    disposition: remove
+    evidence: [model_lifecycle_index, lifecycle_changelog]
+    reason: "Shut down May 25, 2026; exact ID is absent from the Interactions supported table."
+  gemini-3.1-flash-image-preview:
+    disposition: remove
+    evidence: [lifecycle_changelog, interactions_supported]
+    replacement: gemini-3.1-flash-image
+    reason: "Preview alias was deprecated for June 25, 2026 shutdown; stable replacement has exact Interactions evidence."
+  gemini-3-flash-preview:
+    disposition: retain_with_changes
+    changes: [split_audio_input_and_cache_pricing]
+  gemini-3-pro-image-preview:
+    disposition: remove
+    evidence: [lifecycle_changelog, interactions_supported]
+    replacement: gemini-3-pro-image
+    reason: "Preview alias was deprecated for June 25, 2026 shutdown; stable replacement has exact Interactions evidence."
+  gemini-2.5-pro:
+    disposition: retain_with_changes
+    changes: [add_medium_thinking, add_cached_pricing, preserve_whole_prompt_threshold_semantics]
+  gemini-2.5-flash:
+    disposition: retain_with_changes
+    changes: [remove_minimal_thinking, remove_unproven_document_input, split_audio_input_and_cache_pricing, remove_search_and_maps_free_tier_exclusions]
+  gemini-2.5-flash-image:
+    disposition: remove
+    evidence: [model_gemini_2_5_flash_image, interactions_supported]
+    reason: "Provider model exists, but exact ID is absent from the Interactions supported table."
+  gemini-2.5-flash-lite:
+    disposition: retain_with_changes
+    changes: [remove_minimal_thinking, split_audio_input_and_cache_pricing, remove_search_free_tier_exclusion]
+
+new_catalog_entries:
+  gemini-3-pro-image:
+    disposition: add
+    evidence: [interactions_supported, model_gemini_3_pro_image, developer_pricing]
+  gemini-3.1-flash-image:
+    disposition: add
+    evidence: [interactions_supported, model_gemini_3_1_flash_image, developer_pricing]
+
+unpriced_usage_ledger:
+  document_input_tokens:
+    state: unknown
+    reason: "Several model pages authorize PDF/document input, but their exact pricing rows omit a document modality; do not silently price DOCUMENT usage as text without authoritative evidence."
+    evidence: [developer_pricing]
+  tool_use_prompt_tokens:
+    state: unknown
+    reason: "SDK usage shape exposes tool-use modality accounting, but pricing docs do not publish a separate token rate; next protocol must either map it to documented input pricing with direct evidence or report it unpriced."
+    evidence: [sdk_2_11_release, developer_pricing]
+  cached_tokens:
+    state: known_by_model_and_input_modality
+    reason: "Current product reports cache cost as zero; protocol 3 must use each retained model's cached_input_per_million map or report unknown where null."
+    evidence: [sdk_2_11_release, developer_pricing]
+  image_output_tokens:
+    state: known_for_retained_image_models
+    reason: "Use the image output token rate for gemini-3-pro-image and gemini-3.1-flash-image; do not reuse preview/batch rates."
+    evidence: [developer_pricing]

@@ -10,14 +10,15 @@ version: 0.0.0
 requirements:
 """
 
-import json
+import base64
 import datetime
 import inspect
-import re
-import base64
+import json
 import os
-from collections.abc import Callable, Awaitable
-from typing import Any, TYPE_CHECKING
+import re
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
+
 import pydantic_core
 from fastapi import Request
 
@@ -40,9 +41,7 @@ class LeanLogger:
 
     def _recursively_truncate(self, data: Any) -> Any:
         if isinstance(data, dict):
-            return {
-                key: self._recursively_truncate(value) for key, value in data.items()
-            }
+            return {key: self._recursively_truncate(value) for key, value in data.items()}
         if isinstance(data, list):
             return [self._recursively_truncate(item) for item in data]
         if isinstance(data, str) and len(data) > self.MAX_VALUE_LENGTH:
@@ -56,14 +55,10 @@ class LeanLogger:
         caller_name = inspect.stack()[2].function
         print(f"[{timestamp}] [{level}] [{__name__}.{caller_name}] {message}")
         if data:
-            serializable_data = pydantic_core.to_jsonable_python(
-                data, serialize_unknown=True
-            )
+            serializable_data = pydantic_core.to_jsonable_python(data, serialize_unknown=True)
             sanitized_data = self._recursively_truncate(serializable_data)
             pretty_data = json.dumps(sanitized_data, indent=2, default=str)
-            indented_data = "\n".join(
-                [f"  {line}" for line in pretty_data.splitlines()]
-            )
+            indented_data = "\n".join([f"  {line}" for line in pretty_data.splitlines()])
             print(indented_data)
 
 
@@ -107,7 +102,7 @@ class Pipe:
             return "Error: Could not find the chat object in the database."
 
         _log(f"Chat with ID {chat_id} found in DB.", data=chat)
-        chat_data: "ChatObjectDataTD" = chat.chat  # type: ignore
+        chat_data: ChatObjectDataTD = chat.chat  # type: ignore
 
         # 3. Find the latest user message to get the correctly ordered file list.
         latest_user_message = next(
@@ -122,9 +117,7 @@ class Pipe:
         else:
             _log("No files found in the latest user message.")
 
-        return (
-            f"Hello! I'm {__name__}. Inspection complete. See server logs for details."
-        )
+        return f"Hello! I'm {__name__}. Inspection complete. See server logs for details."
 
     def _get_raw_file_bytes(
         self, chat_history_files: list["FileAttachmentTD"]
@@ -144,9 +137,7 @@ class Pipe:
 
             try:
                 if file_type == "image":
-                    base64_string = re.sub(
-                        r"^data:image/.+;base64,", "", file_info["url"]
-                    )
+                    base64_string = re.sub(r"^data:image/.+;base64,", "", file_info["url"])
                     file_bytes = base64.b64decode(base64_string)
                     detail = "Decoded from base64 data URI."
 
@@ -193,9 +184,7 @@ class Pipe:
                         level="SUCCESS",
                     )
                 else:
-                    raise ValueError(
-                        f"Unsupported file type '{file_type}' or processing failed."
-                    )
+                    raise ValueError(f"Unsupported file type '{file_type}' or processing failed.")
 
             except Exception as e:
                 result = {

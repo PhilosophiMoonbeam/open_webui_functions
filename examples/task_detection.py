@@ -11,9 +11,10 @@ requirements:
 """
 
 from typing import (
-    Any,
     TYPE_CHECKING,
+    Any,
 )
+
 from pydantic import BaseModel
 
 if TYPE_CHECKING:

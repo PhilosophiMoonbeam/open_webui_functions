@@ -50,18 +50,17 @@ funding_url: https://github.com/sponsors/your-username
 #
 
 # Imports should come AFTER the documentation.
-from collections.abc import Iterator, AsyncGenerator, Generator, Callable, Awaitable
-from pydantic import BaseModel, Field
+from collections.abc import AsyncGenerator, Generator, Iterator
 
 # You may need to import Request for type hinting `__request__`
 from fastapi import Request
-from starlette.responses import StreamingResponse
 
 # --- Importing from the Open WebUI Backend ---
 # You can import and use modules directly from the Open WebUI backend.
 # These are just examples; explore the backend codebase for more.
 from open_webui.utils.misc import get_last_user_message
-from open_webui.models.users import UserModel
+from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 
 class Pipe:
@@ -130,15 +129,7 @@ class Pipe:
         __chat_id__: str | None = None,
         __request__: Request | None = None,
         __tools__: dict[str, dict] | None = None,
-    ) -> (
-        str
-        | dict
-        | BaseModel
-        | StreamingResponse
-        | Generator
-        | AsyncGenerator
-        | Iterator
-    ):
+    ) -> str | dict | BaseModel | StreamingResponse | Generator | AsyncGenerator | Iterator:
         """
         This is the main entry point for the pipe's logic. It is called on every request.
         This method can be `async def` (as shown) or a regular `def`.
@@ -250,9 +241,7 @@ class Pipe:
         file_info = f"{len(files)} file(s) attached."
 
         # Access chat_id (must check for None)
-        chat_id_info = (
-            f"Chat ID: {__chat_id__}" if __chat_id__ else "No Chat ID provided."
-        )
+        chat_id_info = f"Chat ID: {__chat_id__}" if __chat_id__ else "No Chat ID provided."
 
         # Access tools
         tools = __tools__ or {}

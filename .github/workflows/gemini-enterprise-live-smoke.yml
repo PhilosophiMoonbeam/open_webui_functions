@@ -1,0 +1,115 @@
+name: Optional Gemini Enterprise Interactions Live Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Audited Enterprise model ID to probe
+        required: true
+        type: string
+      api_version:
+        description: Interactions API version to probe with google-genai 2.11.0
+        required: true
+        default: v1beta1
+        type: choice
+        options:
+          - v1beta1
+          - v1
+
+permissions:
+  contents: read
+
+jobs:
+  enterprise:
+    name: Enterprise API live smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: gemini-enterprise-live-${{ inputs.api_version }}
+      cancel-in-progress: false
+    environment: gemini-live-enterprise
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Require trusted default-branch dispatch
+        env:
+          ACTUAL_REF: ${{ github.ref }}
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$ACTUAL_REF" != "$EXPECTED_REF" ]]; then
+            echo "::error::Enterprise live smoke must run from the repository default branch."
+            exit 1
+          fi
+      - name: Validate and mask Enterprise identity and scope
+        env:
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GEMINI_ENTERPRISE_PROJECT: ${{ vars.GEMINI_ENTERPRISE_PROJECT }}
+          GEMINI_ENTERPRISE_LOCATION: ${{ vars.GEMINI_ENTERPRISE_LOCATION }}
+          GEMINI_ENTERPRISE_MODEL: ${{ inputs.model }}
+        run: |
+          test -n "$GCP_WORKLOAD_IDENTITY_PROVIDER"
+          test -n "$GCP_SERVICE_ACCOUNT"
+          test -n "$GEMINI_ENTERPRISE_PROJECT"
+          test -n "$GEMINI_ENTERPRISE_LOCATION"
+          if [[ ! "$GEMINI_ENTERPRISE_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "::error::Enterprise model must be a bare model ID."
+            exit 1
+          fi
+          echo "::add-mask::$GCP_WORKLOAD_IDENTITY_PROVIDER"
+          echo "::add-mask::$GCP_SERVICE_ACCOUNT"
+          echo "::add-mask::$GEMINI_ENTERPRISE_PROJECT"
+          echo "::add-mask::$GEMINI_ENTERPRISE_LOCATION"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - run: uv sync --locked
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Run redacted Enterprise API tests
+        env:
+          RUN_GEMINI_ENTERPRISE_LIVE_TESTS: "1"
+          GEMINI_ENTERPRISE_PROJECT: ${{ vars.GEMINI_ENTERPRISE_PROJECT }}
+          GEMINI_ENTERPRISE_LOCATION: ${{ vars.GEMINI_ENTERPRISE_LOCATION }}
+          GEMINI_ENTERPRISE_MODEL: ${{ inputs.model }}
+          GEMINI_ENTERPRISE_API_VERSION: ${{ inputs.api_version }}
+        run: >-
+          uv run pytest -ra tests/live -m "live and enterprise_api"
+          --junitxml=enterprise-live-results.xml
+      - name: Verify exact smoke matrix and record sanitized evidence
+        env:
+          GEMINI_ENTERPRISE_PROJECT: ${{ vars.GEMINI_ENTERPRISE_PROJECT }}
+          GEMINI_ENTERPRISE_LOCATION: ${{ vars.GEMINI_ENTERPRISE_LOCATION }}
+          GEMINI_ENTERPRISE_MODEL: ${{ inputs.model }}
+          GEMINI_ENTERPRISE_API_VERSION: ${{ inputs.api_version }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          root = ET.parse("enterprise-live-results.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          totals = {
+              name: sum(int(suite.attrib.get(name, "0")) for suite in suites)
+              for name in ("tests", "failures", "errors", "skipped")
+          }
+          if totals != {"tests": 3, "failures": 0, "errors": 0, "skipped": 0}:
+              raise SystemExit(f"unexpected Enterprise live matrix totals: {totals}")
+          PY
+          project_hash="$(printf '%s' "$GEMINI_ENTERPRISE_PROJECT" | sha256sum | cut -d' ' -f1)"
+          {
+            echo "### Gemini Enterprise Interactions live evidence"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- google-genai: \`2.11.0\`"
+            echo "- Model: \`$GEMINI_ENTERPRISE_MODEL\`"
+            echo "- API version: \`$GEMINI_ENTERPRISE_API_VERSION\`"
+            echo "- Location: \`$GEMINI_ENTERPRISE_LOCATION\`"
+            echo "- Project SHA-256: \`$project_hash\`"
+            echo "- Result: 3 passed, 0 skipped"
+          } >> "$GITHUB_STEP_SUMMARY"

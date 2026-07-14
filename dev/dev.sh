@@ -278,7 +278,8 @@ build_frontend "$FRONTEND_DIR"
 setup_pip_venv "backend" "backend" "$BACKEND_DIR" "$BACKEND_VENV_DIR" "$BACKEND_DIR/requirements.txt"
 
 # 3. Setup Updater Environment
-setup_pip_venv "updater" "updater" "$PROJECT_ROOT" "$UPDATER_VENV_DIR" "$PROJECT_ROOT/requirements.txt"
+echo "Synchronizing updater environment from pyproject.toml and uv.lock..."
+(cd "$PROJECT_ROOT" && uv sync --no-dev)
 
 
 echo "Setup complete. Launching tmux session..."

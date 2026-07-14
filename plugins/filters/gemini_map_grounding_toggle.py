@@ -6,10 +6,11 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.0.0
+version: 2.0.0
 """
 
 from typing import TYPE_CHECKING, cast
+
 from pydantic import BaseModel
 
 # This block is skipped at runtime.
@@ -42,5 +43,5 @@ class Filter:
             metadata_features = cast(Features, {})
             metadata["features"] = metadata_features
 
-        metadata_features["google_maps_grounding"] = True
+        metadata_features["google_maps"] = True
         return body

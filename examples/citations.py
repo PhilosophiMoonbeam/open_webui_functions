@@ -10,16 +10,13 @@ version: 0.0.0
 requirements:
 """
 
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator, Iterator
 from typing import (
-    Any,
-    AsyncGenerator,
-    Awaitable,
-    Generator,
-    Iterator,
-    Callable,
-    Literal,
     TYPE_CHECKING,
+    Any,
+    Literal,
 )
+
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
@@ -29,11 +26,11 @@ if TYPE_CHECKING:
 
 class Pipe:
     class Valves(BaseModel):
-        LOG_LEVEL: Literal[
-            "TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"
-        ] = Field(
-            default="INFO",
-            description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+        LOG_LEVEL: Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"] = (
+            Field(
+                default="INFO",
+                description="Select logging level. Use `docker logs -f open-webui` to view logs.",
+            )
         )
 
     def __init__(self):
@@ -44,19 +41,11 @@ class Pipe:
         self,
         body: dict[str, Any],
         __event_emitter__: Callable[["Event"], Awaitable[None]],
-    ) -> (
-        str
-        | dict[str, Any]
-        | StreamingResponse
-        | Iterator
-        | AsyncGenerator
-        | Generator
-        | None
-    ):
+    ) -> str | dict[str, Any] | StreamingResponse | Iterator | AsyncGenerator | Generator | None:
 
         self.__event_emitter__ = __event_emitter__
 
-        sources: list["Source"] = [
+        sources: list[Source] = [
             {
                 "source": {"name": "example search query"},
                 "document": ["", ""],
@@ -81,7 +70,7 @@ class Pipe:
             },
         ]
 
-        sources_test: "ChatCompletionEvent" = {
+        sources_test: ChatCompletionEvent = {
             "type": "chat:completion",
             "data": {
                 "content": "This is an example response [1][2]. This sentence has citations from the second query [3][4].",

@@ -11,3 +11,9 @@ dev/.dev_state/
 docs/.obsidian/
 docs/knowledge_for_llms/
 .pytest_cache/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
