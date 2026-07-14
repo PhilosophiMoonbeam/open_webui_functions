@@ -121,6 +121,11 @@ def test_generate_content_archive_is_explicitly_excluded_from_suite() -> None:
     assert "thinking_gemini.py" not in manifest
 
 
+def test_greenfield_release_excludes_retired_dependency_and_catalog_tools() -> None:
+    assert not (ROOT / "requirements.txt").exists()
+    assert not (ROOT / "utils" / "gemini_yaml_wizard.py").exists()
+
+
 def test_ci_and_release_workflows_cover_all_contract_surfaces() -> None:
     ci_path = ROOT / ".github" / "workflows" / "python-ci.yml"
     release_path = ROOT / ".github" / "workflows" / "release.yml"

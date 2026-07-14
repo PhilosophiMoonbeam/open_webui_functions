@@ -1231,6 +1231,23 @@ CatalogServiceName = Literal["developer", "enterprise"]
 CatalogContentKind = Literal["text", "image", "video", "audio", "document"]
 CatalogThinkingLevel = Literal["minimal", "low", "medium", "high"]
 CatalogExcludedFeature = Literal["google_search", "google_maps"]
+CatalogImageResolution = Literal["512", "1K", "2K", "4K"]
+CatalogImageAspectRatio = Literal[
+    "1:1",
+    "1:4",
+    "1:8",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:1",
+    "4:3",
+    "4:5",
+    "5:4",
+    "8:1",
+    "9:16",
+    "16:9",
+    "21:9",
+]
 
 
 class _PipeCatalogModel(BaseModel):
@@ -1247,6 +1264,19 @@ class CatalogLimits(_PipeCatalogModel):
 class CatalogContent(_PipeCatalogModel):
     inputs: frozenset[CatalogContentKind]
     outputs: frozenset[CatalogContentKind]
+
+
+class CatalogImageOutput(_PipeCatalogModel):
+    resolutions: tuple[CatalogImageResolution, ...] = Field(min_length=1)
+    aspect_ratios: tuple[CatalogImageAspectRatio, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_options(self) -> "CatalogImageOutput":
+        if len(self.resolutions) != len(set(self.resolutions)):
+            raise ValueError("image resolutions must be unique")
+        if len(self.aspect_ratios) != len(set(self.aspect_ratios)):
+            raise ValueError("image aspect ratios must be unique")
+        return self
 
 
 class CatalogThinking(_PipeCatalogModel):
@@ -1337,6 +1367,7 @@ class CatalogSupportedService(_PipeCatalogModel):
     lifecycle: Literal["stable", "preview"]
     limits: CatalogLimits
     content: CatalogContent
+    image_output: CatalogImageOutput | None = None
     interactions: CatalogInteractions
     pricing: CatalogPricing
 
@@ -1348,6 +1379,8 @@ class CatalogSupportedService(_PipeCatalogModel):
             raise ValueError("output pricing must exactly cover authorized output modalities")
         if self.interactions.external_urls and not self.interactions.tools.url_context:
             raise ValueError("external URL input requires the URL-context tool")
+        if ("image" in self.content.outputs) != (self.image_output is not None):
+            raise ValueError("image output options must exist exactly for image-output models")
         return self
 
 
@@ -1442,6 +1475,7 @@ class CatalogClaimEvidence(_PipeCatalogModel):
     properties: str
     thinking: str
     pricing: str
+    image_output: str | None = None
 
 
 class CatalogProviderCapabilities(_PipeCatalogModel):
@@ -1461,6 +1495,7 @@ class CatalogProviderClaim(_PipeCatalogModel):
     lifecycle: Literal["stable", "preview"]
     limits: CatalogLimits
     content: CatalogContent
+    image_output: CatalogImageOutput | None = None
     capabilities: CatalogProviderCapabilities
     thinking: CatalogThinking
     pricing: CatalogPricing
@@ -1476,7 +1511,7 @@ class CatalogProductAuthorization(_PipeCatalogModel):
 
 class AppStateModelCatalog(_PipeCatalogModel):
     schema_version: Literal[3]
-    provenance_sha256: Literal["9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"]
+    provenance_sha256: Literal["a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6"]
     freshness: CatalogFreshness
     sources: dict[str, CatalogSource] = Field(min_length=1)
     evidence: dict[str, CatalogEvidence] = Field(min_length=1)
@@ -1522,6 +1557,18 @@ class AppStateModelCatalog(_PipeCatalogModel):
                     raise ValueError(f"model '{model_id}' has wrong evidence kind for {field_name}")
                 if source.subject_model_ids and model_id not in source.subject_model_ids:
                     raise ValueError(f"model '{model_id}' evidence has an exact-ID mismatch")
+            image_evidence_id = claim.evidence.image_output
+            if (claim.image_output is None) != (image_evidence_id is None):
+                raise ValueError("image output claims require exact image-output evidence")
+            if image_evidence_id is not None:
+                image_evidence = self.evidence.get(image_evidence_id)
+                if image_evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown image evidence")
+                image_source = self.sources[image_evidence.source]
+                if image_source.kind != "provider_interactions_feature":
+                    raise ValueError(f"model '{model_id}' has wrong image evidence kind")
+                if model_id not in image_source.subject_model_ids:
+                    raise ValueError(f"model '{model_id}' image evidence has an exact-ID mismatch")
             for evidence_id in authorization.evidence:
                 evidence = self.evidence.get(evidence_id)
                 if evidence is None:
@@ -1574,6 +1621,7 @@ class AppStateModelCatalog(_PipeCatalogModel):
                         lifecycle=claim.lifecycle,
                         limits=claim.limits,
                         content=claim.content,
+                        image_output=claim.image_output,
                         interactions=self.product_authorizations[model_id].interactions,
                         pricing=claim.pricing,
                     ),
@@ -4162,25 +4210,18 @@ class Pipe:
             Default value is INFO.""",
             )
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
+        IMAGE_OUTPUT_FORMAT: Literal["Images & Text", "Images only"] = Field(
+            default="Images & Text",
+            description="Output format for image-generation models.",
+        )
+        IMAGE_RESOLUTION: CatalogImageResolution = Field(
             default="1K",
-            description="""Resolution for supported image-output models.
+            description="""Resolution for supported image-output models. Unsupported values use the provider default for the selected model.
             Default value is 1K.""",
         )
-        IMAGE_ASPECT_RATIO: Literal[
-            "1:1",
-            "2:3",
-            "3:2",
-            "3:4",
-            "4:3",
-            "4:5",
-            "5:4",
-            "9:16",
-            "16:9",
-            "21:9",
-        ] = Field(
+        IMAGE_ASPECT_RATIO: CatalogImageAspectRatio = Field(
             default="16:9",
-            description="""Aspect ratio for supported image-output models.
+            description="""Aspect ratio for supported image-output models. Unsupported values use the nearest supported ratio for the selected model.
             Default value is 16:9.""",
         )
 
@@ -4301,30 +4342,19 @@ class Pipe:
             Overrides the admin setting. Expected format: 'latitude,longitude' (e.g., '40.7128,-74.0060').
             Default value is None.""",
         )
-        IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
+        IMAGE_OUTPUT_FORMAT: Literal["Images & Text", "Images only", ""] | None = Field(
+            default=None,
+            description="Override the image-generation output format.",
+        )
+        IMAGE_RESOLUTION: CatalogImageResolution | None | Literal[""] = Field(
             default=None,
             description="""Resolution for supported image-output models.
-            Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
+            Default value is None (use the admin's setting). Possible values: 512, 1K, 2K, 4K""",
         )
-        IMAGE_ASPECT_RATIO: (
-            Literal[
-                "1:1",
-                "2:3",
-                "3:2",
-                "3:4",
-                "4:3",
-                "4:5",
-                "5:4",
-                "9:16",
-                "16:9",
-                "21:9",
-            ]
-            | None
-            | Literal[""]
-        ) = Field(
+        IMAGE_ASPECT_RATIO: CatalogImageAspectRatio | None | Literal[""] = Field(
             default=None,
             description="""Aspect ratio for supported image-output models.
-            Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
+            Default value is None (use the admin's setting).""",
         )
 
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
@@ -5122,6 +5152,78 @@ class Pipe:
     def _is_image_model(service_policy: CatalogSupportedService) -> bool:
         return "image" in service_policy.content.outputs
 
+    @staticmethod
+    def _parse_aspect_ratio(aspect_ratio: str) -> float | None:
+        try:
+            width_text, height_text = aspect_ratio.split(":", 1)
+            width = float(width_text)
+            height = float(height_text)
+            if width <= 0 or height <= 0:
+                return None
+            return width / height
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _nearest_supported_aspect_ratio(
+        cls,
+        requested_ratio: CatalogImageAspectRatio,
+        supported_ratios: tuple[CatalogImageAspectRatio, ...],
+    ) -> CatalogImageAspectRatio | None:
+        requested_value = cls._parse_aspect_ratio(requested_ratio)
+        if requested_value is None:
+            return None
+        candidates: list[tuple[float, CatalogImageAspectRatio]] = []
+        for supported_ratio in supported_ratios:
+            supported_value = cls._parse_aspect_ratio(supported_ratio)
+            if supported_value is None:
+                continue
+            distance = (
+                max(requested_value, supported_value) / min(requested_value, supported_value) - 1
+            )
+            candidates.append((distance, supported_ratio))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: candidate[0])[1]
+
+    @classmethod
+    def _resolve_image_output_options(
+        cls,
+        *,
+        model_id: str,
+        policy: CatalogImageOutput,
+        requested_resolution: CatalogImageResolution,
+        requested_aspect_ratio: CatalogImageAspectRatio,
+    ) -> tuple[
+        CatalogImageResolution | None,
+        CatalogImageAspectRatio | None,
+        tuple[str, ...],
+    ]:
+        messages: list[str] = []
+        resolution: CatalogImageResolution | None = requested_resolution
+        if requested_resolution not in policy.resolutions:
+            resolution = None
+            messages.append(
+                f"Resolution {requested_resolution} is not supported by {model_id}; "
+                "using the provider default resolution."
+            )
+        aspect_ratio: CatalogImageAspectRatio | None = requested_aspect_ratio
+        if requested_aspect_ratio not in policy.aspect_ratios:
+            aspect_ratio = cls._nearest_supported_aspect_ratio(
+                requested_aspect_ratio, policy.aspect_ratios
+            )
+            if aspect_ratio is None:
+                messages.append(
+                    f"Aspect ratio {requested_aspect_ratio} is not supported by {model_id}; "
+                    "using the provider default aspect ratio."
+                )
+            else:
+                messages.append(
+                    f"Aspect ratio {requested_aspect_ratio} is not supported by {model_id}; "
+                    f"using nearest supported ratio {aspect_ratio}."
+                )
+        return resolution, aspect_ratio, tuple(messages)
+
     # endregion 2.2 Model retrival from Google API
 
     # region 2.3 Interactions request option assembly
@@ -5221,12 +5323,44 @@ class Pipe:
                 mime_type="application/json", schema_=json_schema["schema"]
             )
         elif self._is_image_model(selected_service.policy):
-            response_format = interaction_types.ImageResponseFormat(
-                image_size=valves.IMAGE_RESOLUTION,
-                aspect_ratio=valves.IMAGE_ASPECT_RATIO,
+            image_policy = selected_service.policy.image_output
+            if image_policy is None:
+                raise ValueError(f"Model '{model_id}' lacks image-output policy.")
+            image_size, aspect_ratio, fallback_messages = self._resolve_image_output_options(
+                model_id=model_id,
+                policy=image_policy,
+                requested_resolution=valves.IMAGE_RESOLUTION,
+                requested_aspect_ratio=valves.IMAGE_ASPECT_RATIO,
+            )
+            image_format = interaction_types.ImageResponseFormat(
+                image_size=image_size,
+                aspect_ratio=aspect_ratio,
                 delivery="inline",
                 mime_type="image/jpeg",
             )
+            response_format = (
+                image_format
+                if valves.IMAGE_OUTPUT_FORMAT == "Images only"
+                else [
+                    interaction_types.TextResponseFormat(mime_type="text/plain"),
+                    image_format,
+                ]
+            )
+            metadata_state = cast(dict[str, object], __metadata__)
+            if fallback_messages:
+                metadata_state["image_config_fallback_status"] = " ".join(fallback_messages)
+            effective_parts = [
+                value
+                for value in (
+                    f"aspect ratio {aspect_ratio}" if aspect_ratio else None,
+                    f"resolution {image_size}" if image_size else None,
+                )
+                if value is not None
+            ]
+            if effective_parts:
+                metadata_state["image_generation_config_status"] = (
+                    "Requesting image output with " + " and ".join(effective_parts) + "."
+                )
 
         tools: list[interaction_types.Tool] = []
         if not __metadata__.get("task"):
@@ -5913,6 +6047,10 @@ class Pipe:
             [tool.declaration for tool in tool_registry.values()],
         )
         request_options.system_instruction = builder.system_prompt
+        if fallback_status := metadata_state.pop("image_config_fallback_status", None):
+            event_emitter.emit_status(str(fallback_status))
+        if image_config_status := metadata_state.pop("image_generation_config_status", None):
+            event_emitter.emit_status(str(image_config_status))
 
         store_interaction = (
             self._resolve_store_policy(
@@ -5938,6 +6076,18 @@ class Pipe:
             log.warning("Removing an unsupported system prompt from the request.")
 
         model = cast(interaction_types.Model, model_id)
+        response_format = request_options.response_format
+        if isinstance(response_format, list):
+            serialized_response_format: object = [
+                item.model_dump(mode="json", exclude_none=True)
+                if isinstance(item, BaseModel)
+                else item
+                for item in response_format
+            ]
+        elif isinstance(response_format, BaseModel):
+            serialized_response_format = response_format.model_dump(mode="json", exclude_none=True)
+        else:
+            serialized_response_format = response_format
         common_request = {
             "model": model,
             "input": continuation.input,
@@ -5950,11 +6100,7 @@ class Pipe:
             "tools": [
                 tool.model_dump(mode="json", exclude_none=True) for tool in request_options.tools
             ],
-            "response_format": (
-                request_options.response_format.model_dump(mode="json", exclude_none=True)
-                if isinstance(request_options.response_format, BaseModel)
-                else request_options.response_format
-            ),
+            "response_format": serialized_response_format,
         }
         common_request = {key: value for key, value in common_request.items() if value is not None}
         log.debug(f"Passing Interaction request to {api_name} (Tier: {tier}).")

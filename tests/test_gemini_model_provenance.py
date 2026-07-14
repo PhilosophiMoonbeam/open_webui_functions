@@ -293,6 +293,19 @@ def test_protocol_3_catalog_matches_every_provenance_claim_model_by_model() -> N
             "inputs": provider["input_modalities"],
             "outputs": provider["output_modalities"],
         }
+        image_output = cast(dict[str, object] | None, model.get("image_output"))
+        if image_output is None:
+            assert claim.get("image_output") is None
+            assert cast(dict[str, object], claim["evidence"]).get("image_output") is None
+        else:
+            assert claim["image_output"] == {
+                "resolutions": image_output["resolutions"],
+                "aspect_ratios": image_output["aspect_ratios"],
+            }
+            assert (
+                cast(dict[str, object], claim["evidence"])["image_output"]
+                == (image_output["evidence"])
+            )
         provider_capabilities = cast(dict[str, object], provider["capabilities"])
         assert claim["capabilities"] == {
             key: value is not False

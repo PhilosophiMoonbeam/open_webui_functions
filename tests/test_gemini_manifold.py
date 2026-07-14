@@ -539,6 +539,25 @@ def _selected_service(
             "inputs": inputs or ["text", "image", "video", "audio", "document"],
             "outputs": ["text", "image"] if image else ["text"],
         },
+        "image_output": (
+            {
+                "resolutions": ["1K", "2K", "4K"],
+                "aspect_ratios": [
+                    "1:1",
+                    "2:3",
+                    "3:2",
+                    "3:4",
+                    "4:3",
+                    "4:5",
+                    "5:4",
+                    "9:16",
+                    "16:9",
+                    "21:9",
+                ],
+            }
+            if image
+            else None
+        ),
         "interactions": {
             "store": store,
             "files": files,
@@ -688,12 +707,14 @@ async def test_interaction_options_map_generation_thinking_and_schema(
 async def test_interaction_options_build_image_and_maps_formats(pipe_instance_fixture):
     pipe, _ = pipe_instance_fixture
     pipe.valves.MAPS_GROUNDING_COORDINATES = "45.5,-73.6"
+    pipe.valves.IMAGE_OUTPUT_FORMAT = "Images only"
+    metadata = {
+        "canonical_model_id": "gemini-test",
+        "features": {"google_maps": True},
+    }
     options = await pipe._build_interaction_request_options(
         {},
-        {
-            "canonical_model_id": "gemini-test",
-            "features": {"google_maps": True},
-        },
+        metadata,
         pipe.valves,
         _interaction_policy(image=True),
     )
@@ -701,6 +722,40 @@ async def test_interaction_options_build_image_and_maps_formats(pipe_instance_fi
     assert options.response_format.type == "image"
     assert options.tools[0].type == "google_maps"
     assert options.tools[0].latitude == 45.5
+    assert metadata["image_generation_config_status"] == (
+        "Requesting image output with aspect ratio 16:9 and resolution 1K."
+    )
+
+
+@pytest.mark.asyncio
+async def test_interaction_image_options_use_catalog_fallback_and_multiformat(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    pipe.valves.IMAGE_OUTPUT_FORMAT = "Images & Text"
+    pipe.valves.IMAGE_RESOLUTION = "512"
+    pipe.valves.IMAGE_ASPECT_RATIO = "1:8"
+    metadata = cast(Metadata, {"canonical_model_id": "gemini-test", "features": {}})
+
+    options = await pipe._build_interaction_request_options(
+        {}, metadata, pipe.valves, _interaction_policy(image=True)
+    )
+
+    assert isinstance(options.response_format, list)
+    assert [item.type for item in options.response_format] == ["text", "image"]
+    image_format = options.response_format[1]
+    assert isinstance(image_format, interaction_types.ImageResponseFormat)
+    assert image_format.image_size is None
+    assert image_format.aspect_ratio == "9:16"
+    emitted_metadata = cast(dict[str, object], metadata)
+    assert emitted_metadata["image_config_fallback_status"] == (
+        "Resolution 512 is not supported by gemini-test; using the provider default "
+        "resolution. Aspect ratio 1:8 is not supported by gemini-test; using nearest "
+        "supported ratio 9:16."
+    )
+    assert emitted_metadata["image_generation_config_status"] == (
+        "Requesting image output with aspect ratio 9:16."
+    )
 
 
 @pytest.mark.asyncio
@@ -771,9 +826,13 @@ async def test_installed_catalog_request_options_match_every_developer_policy(
         metadata = cast(Metadata, {"canonical_model_id": model_id, "features": {}})
         options = await pipe._build_interaction_request_options({}, metadata, pipe.valves, selected)
         if "image" in developer.content.outputs:
-            assert isinstance(options.response_format, interaction_types.ImageResponseFormat), (
-                model_id
-            )
+            assert developer.image_output is not None, model_id
+            assert isinstance(options.response_format, list), model_id
+            assert [item.type for item in options.response_format] == ["text", "image"], model_id
+            image_format = options.response_format[1]
+            assert isinstance(image_format, interaction_types.ImageResponseFormat), model_id
+            assert image_format.image_size in developer.image_output.resolutions, model_id
+            assert image_format.aspect_ratio in developer.image_output.aspect_ratios, model_id
         else:
             assert isinstance(options.response_format, interaction_types.TextResponseFormat), (
                 model_id
@@ -5865,12 +5924,14 @@ async def test_public_pipe_builds_canonical_request_for_every_developer_model(
     assert created.tools == []
     image_output = model_id in {"gemini-3-pro-image", "gemini-3.1-flash-image"}
     assert created.response_format is not None
-    expected_format = (
-        interaction_types.ImageResponseFormat
-        if image_output
-        else interaction_types.TextResponseFormat
-    )
-    assert isinstance(created.response_format, expected_format)
+    if image_output:
+        assert isinstance(created.response_format, list)
+        text_format, image_format = created.response_format
+        assert isinstance(text_format, interaction_types.TextResponseFormat)
+        assert isinstance(image_format, interaction_types.ImageResponseFormat)
+        assert [text_format.type, image_format.type] == ["text", "image"]
+    else:
+        assert isinstance(created.response_format, interaction_types.TextResponseFormat)
     scripted.assert_exhausted()
 
 

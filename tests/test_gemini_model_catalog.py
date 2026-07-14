@@ -51,7 +51,7 @@ def test_protocol_3_catalog_is_evidence_bound_and_actionable() -> None:
     assert set(catalog.product_authorizations) == EXPECTED_IDS
     assert set(catalog.runtime_models()) == EXPECTED_IDS
     assert catalog.provenance_sha256 == (
-        "9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"
+        "a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6"
     )
 
 
@@ -73,6 +73,35 @@ def test_pricing_is_explicit_by_modality_cache_state_and_whole_prompt_threshold(
     assert pro_text.tiers[0].up_to_prompt_tokens == 200_000
     assert pro_text.tiers[1].price_per_million == 4.0
     assert isinstance(image.cached_input["image"], CatalogUnpricedRate)
+
+
+def test_image_output_options_are_exact_model_evidence_not_family_defaults() -> None:
+    catalog = ModelCatalog.model_validate(_raw_catalog())
+    pro = catalog.provider_claims["gemini-3-pro-image"]
+    flash = catalog.provider_claims["gemini-3.1-flash-image"]
+    assert pro.image_output is not None
+    assert flash.image_output is not None
+    assert pro.image_output.resolutions == ("1K", "2K", "4K")
+    assert "512" not in pro.image_output.resolutions
+    assert flash.image_output.resolutions == ("512", "1K", "2K", "4K")
+    assert flash.image_output.aspect_ratios == (
+        "1:1",
+        "1:4",
+        "1:8",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:1",
+        "4:3",
+        "4:5",
+        "5:4",
+        "8:1",
+        "9:16",
+        "16:9",
+        "21:9",
+    )
+    for model_id, claim in catalog.provider_claims.items():
+        assert (claim.image_output is not None) == ("image" in claim.content.outputs), model_id
 
 
 @pytest.mark.parametrize(
@@ -147,6 +176,24 @@ def test_yaml_loader_rejects_duplicate_and_merge_keys_before_parsing(text: str) 
                 }
             ),
             "contradict",
+        ),
+        (
+            lambda raw: raw["provider_claims"]["gemini-3-pro-image"]["evidence"].update(
+                image_output=None
+            ),
+            "image-output evidence",
+        ),
+        (
+            lambda raw: raw["provider_claims"]["gemini-3-pro-image"]["image_output"].update(
+                resolutions=["1K", "1K"]
+            ),
+            "image resolutions must be unique",
+        ),
+        (
+            lambda raw: raw["provider_claims"]["gemini-2.5-flash"].update(
+                image_output={"resolutions": ["1K"], "aspect_ratios": ["1:1"]}
+            ),
+            "image-output evidence",
         ),
     ],
 )

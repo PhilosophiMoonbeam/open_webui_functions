@@ -78,6 +78,22 @@ Custom Open WebUI functions are deliberately narrower:
 - Repeated call IDs must have identical names/arguments; results are reused rather than executed
   twice.
 
+### Image generation controls
+
+For image-output models, `IMAGE_OUTPUT_FORMAT` selects `Images & Text` (the default) or
+`Images only`. Resolution and aspect ratio are validated against exact model evidence from
+Google's [image generation documentation](https://ai.google.dev/gemini-api/docs/image-generation)
+(checked 2026-07-14), never inferred from a model family:
+
+| Model | Resolutions | Aspect ratios |
+| --- | --- | --- |
+| `gemini-3-pro-image` | `1K`, `2K`, `4K` | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
+| `gemini-3.1-flash-image` | `512`, `1K`, `2K`, `4K` | `1:1`, `1:4`, `1:8`, `2:3`, `3:2`, `3:4`, `4:1`, `4:3`, `4:5`, `5:4`, `8:1`, `9:16`, `16:9`, `21:9` |
+
+If a selected resolution is unsupported, the request omits it and lets the provider choose its
+default. If an aspect ratio is unsupported, the pipe chooses the closest supported ratio
+deterministically. Both adjustments emit a status event so the effective request is visible.
+
 ## Continuation, storage, and privacy
 
 `STORE_INTERACTIONS` controls future provider-side Interaction storage. Effective storage is

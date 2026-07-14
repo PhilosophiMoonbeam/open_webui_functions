@@ -37,6 +37,11 @@ companion with a 2.x component.
   including for administrators, without disclosing the identifier or backing path.
 - Custom function rounds support both same-scope stored continuation and complete signed stateless
   replay for temporary, task, and privacy-opt-out requests.
+- Image generation supports `Images & Text` or `Images only`, including the provider-documented
+  `512` option for `gemini-3.1-flash-image`. Resolution and aspect-ratio choices are bound to exact
+  per-model evidence; unsupported selections use deterministic, status-reported fallback.
+- The obsolete flat-schema YAML wizard is removed, and the project retains `uv` as its sole Python
+  dependency workflow.
 
 ## Upgrade sequence
 

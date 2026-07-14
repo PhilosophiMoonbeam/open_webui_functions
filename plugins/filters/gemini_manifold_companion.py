@@ -91,6 +91,23 @@ class _CatalogModel(BaseModel):
 
 
 CatalogContentKind = Literal["text", "image", "video", "audio", "document"]
+CatalogImageResolution = Literal["512", "1K", "2K", "4K"]
+CatalogImageAspectRatio = Literal[
+    "1:1",
+    "1:4",
+    "1:8",
+    "2:3",
+    "3:2",
+    "3:4",
+    "4:1",
+    "4:3",
+    "4:5",
+    "5:4",
+    "8:1",
+    "9:16",
+    "16:9",
+    "21:9",
+]
 CatalogEvidenceKind = Literal[
     "provider_interactions_availability",
     "provider_interactions_feature",
@@ -153,6 +170,19 @@ class CatalogLimits(_CatalogModel):
 class CatalogContent(_CatalogModel):
     inputs: frozenset[CatalogContentKind]
     outputs: frozenset[CatalogContentKind]
+
+
+class CatalogImageOutput(_CatalogModel):
+    resolutions: tuple[CatalogImageResolution, ...] = Field(min_length=1)
+    aspect_ratios: tuple[CatalogImageAspectRatio, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_options(self) -> "CatalogImageOutput":
+        if len(self.resolutions) != len(set(self.resolutions)):
+            raise ValueError("image resolutions must be unique")
+        if len(self.aspect_ratios) != len(set(self.aspect_ratios)):
+            raise ValueError("image aspect ratios must be unique")
+        return self
 
 
 class CatalogThinking(_CatalogModel):
@@ -243,6 +273,7 @@ class CatalogSupportedService(_CatalogModel):
     lifecycle: Literal["stable", "preview"]
     limits: CatalogLimits
     content: CatalogContent
+    image_output: CatalogImageOutput | None = None
     interactions: CatalogInteractions
     pricing: CatalogPricing
 
@@ -254,6 +285,8 @@ class CatalogSupportedService(_CatalogModel):
             raise ValueError("output pricing must exactly cover authorized output modalities")
         if self.interactions.external_urls and not self.interactions.tools.url_context:
             raise ValueError("external URL input requires the URL-context tool")
+        if ("image" in self.content.outputs) != (self.image_output is not None):
+            raise ValueError("image output options must exist exactly for image-output models")
         return self
 
 
@@ -291,6 +324,7 @@ class CatalogClaimEvidence(_CatalogModel):
     properties: str
     thinking: str
     pricing: str
+    image_output: str | None = None
 
 
 class CatalogProviderCapabilities(_CatalogModel):
@@ -310,6 +344,7 @@ class CatalogProviderClaim(_CatalogModel):
     lifecycle: Literal["stable", "preview"]
     limits: CatalogLimits
     content: CatalogContent
+    image_output: CatalogImageOutput | None = None
     capabilities: CatalogProviderCapabilities
     thinking: CatalogThinking
     pricing: CatalogPricing
@@ -325,7 +360,7 @@ class CatalogProductAuthorization(_CatalogModel):
 
 class ModelCatalog(_CatalogModel):
     schema_version: Literal[3]
-    provenance_sha256: Literal["9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"]
+    provenance_sha256: Literal["a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6"]
     freshness: CatalogFreshness
     sources: dict[str, CatalogSource] = Field(min_length=1)
     evidence: dict[str, CatalogEvidence] = Field(min_length=1)
@@ -369,6 +404,18 @@ class ModelCatalog(_CatalogModel):
                     raise ValueError(f"model '{model_id}' has wrong evidence kind for {field_name}")
                 if source.subject_model_ids and model_id not in source.subject_model_ids:
                     raise ValueError(f"model '{model_id}' evidence has an exact-ID mismatch")
+            image_evidence_id = claim.evidence.image_output
+            if (claim.image_output is None) != (image_evidence_id is None):
+                raise ValueError("image output claims require exact image-output evidence")
+            if image_evidence_id is not None:
+                image_evidence = self.evidence.get(image_evidence_id)
+                if image_evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown image evidence")
+                image_source = self.sources[image_evidence.source]
+                if image_source.kind != "provider_interactions_feature":
+                    raise ValueError(f"model '{model_id}' has wrong image evidence kind")
+                if model_id not in image_source.subject_model_ids:
+                    raise ValueError(f"model '{model_id}' image evidence has an exact-ID mismatch")
             for evidence_id in authorization.evidence:
                 evidence = self.evidence.get(evidence_id)
                 if evidence is None:
@@ -421,6 +468,7 @@ class ModelCatalog(_CatalogModel):
                         lifecycle=claim.lifecycle,
                         limits=claim.limits,
                         content=claim.content,
+                        image_output=claim.image_output,
                         interactions=self.product_authorizations[model_id].interactions,
                         pricing=claim.pricing,
                     ),

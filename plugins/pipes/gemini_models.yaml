@@ -1,6 +1,6 @@
 # Gemini Interactions model policy catalog. Protocol 3 is a strict breaking boundary.
 schema_version: 3
-provenance_sha256: 9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10
+provenance_sha256: a135760c775ab500c538696b604c3781dab51d8a1e96b49728b433a2125fb8b6
 freshness:
   freshness_days: 30
   retrieved_at: '2026-07-14'
@@ -31,6 +31,16 @@ sources:
     retrieved_at: '2026-07-14'
     content_digest: sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a
     subject_model_ids: *id001
+  image_generation_output_config:
+    kind: provider_interactions_feature
+    url: https://ai.google.dev/gemini-api/docs/image-generation
+    section: Interactions optional configurations; aspect ratios and image size tables
+    published_last_updated: '2026-07-09'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:8af46dc5b2d43334d0e68dc73df267dfb292f38086b38883a7ea16905b55bd21
+    subject_model_ids:
+    - gemini-3-pro-image
+    - gemini-3.1-flash-image
   model_gemini_2_5_flash:
     kind: provider_model_properties
     url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash
@@ -141,6 +151,9 @@ evidence:
   interactions_supported:
     source: interactions_supported
     content_digest: sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a
+  image_generation_output_config:
+    source: image_generation_output_config
+    content_digest: sha256:8af46dc5b2d43334d0e68dc73df267dfb292f38086b38883a7ea16905b55bd21
   model_gemini_2_5_flash:
     source: model_gemini_2_5_flash
     content_digest: sha256:f1a199c5e4a59b6567743ecd4b26a02a95cdd8bd1f5b1a97926e328746458b65
@@ -909,6 +922,9 @@ provider_claims:
       outputs:
       - text
       - image
+    image_output:
+      resolutions: [1K, 2K, 4K]
+      aspect_ratios: ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9']
     thinking: &id009
       supported: false
       control: unknown
@@ -953,6 +969,7 @@ provider_claims:
       properties: model_gemini_3_pro_image
       thinking: thinking_controls
       pricing: developer_pricing
+      image_output: image_generation_output_config
   gemini-3.1-flash-image:
     model_id: gemini-3.1-flash-image
     availability: supported
@@ -977,6 +994,9 @@ provider_claims:
       outputs:
       - text
       - image
+    image_output:
+      resolutions: ['512', 1K, 2K, 4K]
+      aspect_ratios: ['1:1', '1:4', '1:8', '2:3', '3:2', '3:4', '4:1', '4:3', '4:5', '5:4', '8:1', '9:16', '16:9', '21:9']
     thinking: &id010
       supported: false
       control: unknown
@@ -1027,6 +1047,7 @@ provider_claims:
       properties: model_gemini_3_1_flash_image
       thinking: thinking_controls
       pricing: developer_pricing
+      image_output: image_generation_output_config
 product_authorizations:
   gemini-3.5-flash:
     model_id: gemini-3.5-flash

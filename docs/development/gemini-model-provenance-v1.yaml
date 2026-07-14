@@ -2,7 +2,7 @@ schema_version: 1
 artifact: gemini-interactions-model-claim-provenance
 scope: developer-api
 researched_at: "2026-07-14"
-repository_commit: "3a1232bf899373804214ee508a8a8a67e0460297"
+repository_commit: "a0fdd922acbce4357363635e41b338f101c20808"
 
 evidence_policy:
   freshness_days: 30
@@ -45,6 +45,13 @@ sources:
     published_last_updated: "2026-07-09"
     retrieved_at: "2026-07-14"
     content_digest: "sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a"
+  image_generation_output_config:
+    kind: provider_interactions_feature
+    url: https://ai.google.dev/gemini-api/docs/image-generation
+    section: "Interactions optional configurations; aspect ratios and image size tables"
+    published_last_updated: "2026-07-09"
+    retrieved_at: "2026-07-14"
+    content_digest: "sha256:8af46dc5b2d43334d0e68dc73df267dfb292f38086b38883a7ea16905b55bd21"
   model_lifecycle_index:
     kind: provider_model_lifecycle
     url: https://ai.google.dev/gemini-api/docs/models
@@ -463,6 +470,10 @@ models:
       control: unknown
       levels: []
       reason: "The controlling-thinking table has no exact gemini-3-pro-image row."
+    image_output:
+      evidence: image_generation_output_config
+      resolutions: [1K, 2K, 4K]
+      aspect_ratios: ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
     standard_pricing:
       threshold_semantics: none
       free_tier: false
@@ -498,6 +509,10 @@ models:
       control: unknown
       levels: []
       reason: "The controlling-thinking table has no exact gemini-3.1-flash-image row."
+    image_output:
+      evidence: image_generation_output_config
+      resolutions: ["512", 1K, 2K, 4K]
+      aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"]
     standard_pricing:
       threshold_semantics: none
       free_tier: false

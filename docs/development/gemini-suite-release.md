@@ -15,6 +15,10 @@ is `gemini-suite/v3.0.0`.
 - The Paid, URL Context, and Enterprise toggles are present in the same bundle.
 - Archived `thinking_gemini.py` is excluded.
 - Unsupported custom safety configuration is absent from valves, metadata, and Interaction payloads.
+- Image resolution, aspect ratio, and text/image output choices are exact catalog evidence, with
+  deterministic, user-visible fallback for unsupported selections.
+- The retired flat-schema YAML wizard and root `requirements.txt` are absent; `uv` and catalog
+  protocol 3 are the only supported dependency and catalog paths.
 - Individual v3 tags for any suite member are rejected by both the helper and release workflow.
 
 ## Preflight and deterministic build
