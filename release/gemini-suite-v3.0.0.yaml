@@ -1,0 +1,72 @@
+schema_version: 1
+suite: gemini-suite
+suite_version: 3.0.0
+tag: gemini-suite/v3.0.0
+release_policy: coordinated_only
+protocols:
+  google_genai: 2.11.0
+  grounding_envelope: 1
+  model_catalog: 1
+install_order:
+  - gemini_manifold_companion
+  - gemini_reasoning_toggle
+  - gemini_maps_grounding_toggle
+  - gemini_url_context_toggle
+  - gemini_paid_api
+  - gemini_enterprise_toggle
+  - gemini_manifold_google_genai
+artifacts:
+  - id: gemini_manifold_google_genai
+    role: pipe
+    version: 3.0.0
+    path: plugins/pipes/gemini_manifold.py
+    sha256: 11f373d2bf092200c542ec3dd540e6872a35b6b4554cfd954e3cdf0327c4b9ae
+    bytes: 277580
+  - id: gemini_manifold_companion
+    role: companion
+    version: 3.0.0
+    path: plugins/filters/gemini_manifold_companion.py
+    sha256: 32e13e6c03a3f90320d19fc41b368afa381eec46694abe30e69d6afae4072fb4
+    bytes: 53784
+  - id: gemini_model_catalog
+    role: catalog
+    version: 1
+    path: plugins/pipes/gemini_models.yaml
+    sha256: 61ae746366b64adcb0c8234d4418a85ba1084e90b088b0cbe2dec86c4f9dd856
+    bytes: 9587
+  - id: gemini_reasoning_toggle
+    role: toggle
+    version: 2.0.0
+    path: plugins/filters/gemini_reasoning_toggle.py
+    sha256: b3cea5bdb645a05f79b124728f1f9798e22a766ccf58f858647c3373a97de0ac
+    bytes: 2243
+  - id: gemini_maps_grounding_toggle
+    role: toggle
+    version: 2.0.0
+    path: plugins/filters/gemini_map_grounding_toggle.py
+    sha256: d7caa7dcf2b0fa8e70b94aced11b6811ee350472ce266f6b2f85674643a9e747
+    bytes: 1828
+  - id: gemini_url_context_toggle
+    role: toggle
+    version: 1.0.0
+    path: plugins/filters/gemini_url_context_toggle.py
+    sha256: bf33aea28ab89ee4794f55d41287a5710a23370f0dc89e5c0b0bc259f9671bfb
+    bytes: 1716
+  - id: gemini_paid_api
+    role: toggle
+    version: 1.0.0
+    path: plugins/filters/gemini_paid_api.py
+    sha256: 8c149a6a903b34a864e3738efd3192f67e93c53d16cc8c3d93b743a4789c1ff8
+    bytes: 1438
+  - id: gemini_enterprise_toggle
+    role: toggle
+    version: 1.0.0
+    path: plugins/filters/gemini_enterprise_toggle.py
+    sha256: 730c604e012bed6b34c860f22a7f5b3dea41a32aa323f779bf8edd6d12feaee0
+    bytes: 3324
+  - id: gemini_suite_release_notes
+    role: release_notes
+    version: 3.0.0
+    path: release/gemini-suite-v3.0.0.md
+    sha256: ff26e6a208da07361e385bfddcee1282159d4a703d982333c0744727cecc70a3
+    bytes: 3215

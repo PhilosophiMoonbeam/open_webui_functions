@@ -1,87 +1,86 @@
 # Open WebUI Functions
 
-This repository contains a collection of Open WebUI plugins I have personally coded for my own use. I’m sharing them here in case they are useful to others, but please keep in mind that these are developed primarily to satisfy my own needs and workflows.
+This repository contains Open WebUI pipes and filters developed primarily for the author's own
+workflows and shared for others who find them useful.
 
 > [!CAUTION]
-> **Use at your own risk.** Running third-party plugins in your Open WebUI instance involves executing code that can access your environment and APIs. I am not a security expert, and I cannot guarantee the absolute safety or stability of these scripts. Always review the code before installing.
+> Open WebUI functions execute code with access to your Open WebUI process, configured APIs, and
+> data. Review every file and its dependencies before installation.
 
-## Project Philosophy & Stability
+## Stability
 
-- **Personal Use First:** I develop these plugins as my own motivation and needs arise. As such, I don't always prioritize making them perfectly intuitive for third parties. You may find some "quirks" that make sense for my setup but require adjustment for yours.
-- **Master vs. Tags:** The `master` branch is my active development area and should be considered "Canary" or "Dev" software—it is **not guaranteed to work** at any given moment. 
-- **Stable Versions:** For a more reliable experience, please use the [latest Version Tags](https://github.com/suurt8ll/open_webui_functions/tags) to find checkpoints I consider stable.
-- **Feedback:** Questions, Issues, and Pull Requests are very welcome! I am happy to help or collaborate, though I will respond to them only as my personal time allows.
+- `master` is active development and may be temporarily inconsistent.
+- Immutable tags and their release artifacts are the stable checkpoints.
+- Breaking multi-plugin protocols are released as coordinated suites, not as unrelated files.
 
 ## Plugins
 
-The plugins are organized by type within the `plugins/` directory:
+### Gemini Interactions suite
 
--   `plugins/pipes/`: Pipe plugins that integrate custom models and behaviors.
-    -   `gemini_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) | Provides support for Google's Gemini Studio API and Vertex AI. See the [Detailed Documentation](docs/plugins/pipes/gemini_manifold.md).
-    -   `venice_manifold.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/venice_image_generation) | Enables image creation using any diffusion model offered by Venice.ai API.
--   `plugins/filters/`: Filter plugins that modify request and response data.
-    -   `gemini_manifold_companion.py`: A companion filter for the Gemini Manifold pipe providing enhanced functionality like Google Search grounding. See the [Detailed Documentation](docs/plugins/filters/gemini_manifold_companion.md).
-    -   `system_prompt_injector.py`: Allows changing chat options like system prompt and temperature directly from the chatbox. Pairs well with the Open WebUI "Prompts" feature.
+Gemini suite 3.0.0 integrates Open WebUI with the Google Gen AI SDK
+`google-genai==2.11.0` Interactions API. It consists of:
 
-## Installation/Updating
+- `gemini_manifold.py` 3.0.0: Developer API `v1` pipe with catalog-gated Enterprise routing.
+- `gemini_manifold_companion.py` 3.0.0: request integration, durable grounding protocol 1,
+  citations, and catalog protocol 1.
+- Reason 2.0.0, Maps 2.0.0, URL Context 1.0.0, Paid API 1.0.0, and Enterprise 1.0.0 toggles.
+- The immutable model catalog shipped in the same release.
 
-### Option 1: Manual (Copy-Paste)
-1. Open your Open WebUI instance and navigate to **Admin Panel** -> **Functions** -> **New Function** (or click an existing one to update).
-2. Copy the entire content of the desired `.py` file (ideally from a **Tag**, not Master) and paste it into the editor.
-3. **CRITICAL:** Ensure the `id` field in the Open WebUI interface matches the `id` defined in the file's frontmatter (docstring). Some logic within these plugins depends on these IDs being exact.
+Install these artifacts from the same `gemini-suite/v3.0.0` release and verify the attached
+manifest and checksums. The pipe and companion are not backward compatible with 2.x. See the
+[pipe guide](docs/plugins/pipes/gemini_manifold.md),
+[companion guide](docs/plugins/filters/gemini_manifold_companion.md), and
+[release procedure](docs/development/gemini-suite-release.md).
 
-   *Example from `gemini_manifold.py`:*
-   ```python
-   """
-   title: Gemini Manifold google_genai
-   id: gemini_manifold_google_genai
-   ...
-   """
-   ```
+The catalog currently marks all Enterprise model/service combinations `unverified`; the pipe
+therefore denies Enterprise generation before a network request. The Developer API is the
+deterministically validated supported surface; credentialed live evidence is tracked separately.
 
-### Option 2: Automated (One-Time Sync)
-Use the included utility script to automatically create/update multiple functions at once via the Open WebUI API.
+### Other plugins
 
-1. **Clone the repo:** `git clone https://github.com/suurt8ll/open_webui_functions.git`
-2. **Configure:** Copy `dev/.env.install.example` to `dev/.env.install`.
-   - Set `ONE_TIME_RUN=true`.
-   - Set `API_KEY` (see [this doc page](https://docs.openwebui.com/reference/monitoring/#authentication-setup-for-api-key-) for help).
-   - List the files you want to install in `FILEPATHS`.
-   - Set `HOST`, `PORT`, etc.
-3. **Setup Environment:** Install [uv](https://docs.astral.sh/uv/) and synchronize the locked project environment:
-   ```bash
-   uv sync
-   ```
-4. **Run Sync:**
-   ```bash
-   uv run python dev/function_updater.py --env dev/.env.install
-   ```
+- `plugins/pipes/venice_manifold.py`: Venice.ai image generation pipe.
+- `plugins/filters/system_prompt_injector.py`: chat-level system prompt and temperature controls.
+- Additional standalone filters are under `plugins/filters/`.
 
-## Utilities & Development
+## Installation and updates
 
-- **`utils/`**: Contains shared code like `manifold_types.py` used by multiple plugins.
-- **`examples/`**: Test scripts and example plugins demonstrating specific capabilities.
-- **`dev/`**: Tools for active development, including `function_updater.py` for monitoring file changes and `dev.sh` for environment setup.
+For standalone plugins, copy the file from an immutable tag into Open WebUI's **Admin Panel →
+Functions** editor. Preserve the exact frontmatter `id`.
 
-## Development Checks
+For Gemini 3.0, do not copy or update one file independently. Follow the manifest `install_order`:
+install the companion and toggles first, then the pipe. The catalog URL is pinned to the same
+prospective suite tag and becomes available only after that tag exists. Community entries are
+separate published objects and must be staged together in one maintenance window.
 
-`pyproject.toml` and `uv.lock` are the canonical Python environment definition. Local
-development is pinned to Python 3.11 to match the Open WebUI Docker runtime. Run
-`make quality` to format and lint maintained Python, then execute the complete read-only
-quality gate. Use `make check` to run the same gate without modifying files.
+The optional one-time synchronizer remains available for non-suite development workflows:
 
-## Archived Functions
+```shell
+uv sync --locked
+uv run python dev/function_updater.py --env dev/.env.install
+```
 
-The `plugins/archived/` directory contains old functions that are no longer actively developed or maintained.
+Do not use it to bypass the Gemini suite manifest/version checks.
 
-## Contributing
+## Development
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. As this is a personal project, please be patient with response times.
+`pyproject.toml` and `uv.lock` define the environment. Python 3.11 matches the target Open WebUI
+runtime. Use:
 
-## License
+```shell
+make quality  # formats/fixes, then runs the complete gate
+make check    # read-only CI-equivalent gate
+```
 
-MIT License. See the `LICENSE` file for details.
+Optional credential-gated Gemini smoke commands are documented in
+[tests/live/README.md](tests/live/README.md). They redact output and skip without explicit opt-in.
 
-## Acknowledgements
+## Archived functions
 
-Thanks to the Open WebUI team and all contributors. Special thanks to Matthew for the groundwork on `thinking_gemini.py`.
+`plugins/archived/` is excluded from maintained quality and release surfaces. In particular,
+`thinking_gemini.py` remains historical GenerateContent code and is not compatible with or part
+of the Gemini Interactions suite.
+
+## Contributing and license
+
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). The repository is available
+under the [MIT License](LICENSE).

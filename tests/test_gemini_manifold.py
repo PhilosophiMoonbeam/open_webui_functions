@@ -1,12 +1,26 @@
 import asyncio
+import base64
+import hashlib
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Literal, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
+import httpx
 import pytest
 import pytest_asyncio
+import yaml
 from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer
+from fastapi import FastAPI
+from google import genai
+from google.genai import interactions as interaction_types
+from plugins.filters.gemini_map_grounding_toggle import Filter as MapsToggleFilter
+from plugins.filters.gemini_reasoning_toggle import Filter as ReasoningToggleFilter
+from plugins.filters.gemini_url_context_toggle import Filter as URLContextToggleFilter
+from utils.manifold_types import Body, Event, Metadata
 
 # --- Mock problematic Open WebUI modules BEFORE they are imported by your plugin ---
 mock_chats_module = MagicMock()
@@ -36,23 +50,59 @@ sys.modules["open_webui.storage.provider"] = mock_storage_module
 sys.modules["open_webui.utils.misc"] = mock_misc_module
 
 
-from plugins.filters.gemini_manifold_companion import EventEmitter
+import plugins.pipes.gemini_manifold as gemini_manifold_module
+from plugins.filters.gemini_manifold_companion import (
+    DEFAULT_MODEL_CONFIG_PATH,
+    EventEmitter,
+    ModelCatalogError,
+)
+from plugins.filters.gemini_manifold_companion import (
+    Filter as CompanionFilter,
+)
+from plugins.filters.gemini_manifold_companion import (
+    GroundingEnvelope as CompanionGroundingEnvelope,
+)
 from plugins.pipes.gemini_manifold import (
+    CATALOG_MODEL_IDS,
+    AsyncInteractionsBoundary,
+    AsyncInteractionStream,
     ContentBuildError,
+    EndpointIdentity,
+    FilesAPIError,
     FilesAPIManager,
     GeminiContentBuilder,
     GeminiPDFProcessor,
+    GenAIClientBinding,
+    GenerationFailureKind,
+    InteractionEnvelopeV1,
+    InteractionExecutionError,
+    InteractionReducer,
+    InteractionRequestOptions,
+    InteractionsSDKBoundary,
     LocalFileSource,
+    NormalizedInteractionUsage,
     PDFMitigationManager,
     PDFMitigationOutcome,
     PDFProcessingError,
     Pipe,
+    PipeEventEmitter,
     PreparedPDFPart,
     PreparedPDFResult,
     genai_errors,
-)  # gemini_types is google.genai.types
+)
 from plugins.pipes.gemini_manifold import (
     types as gemini_types,
+)
+
+from tests.fakes.genai_interactions import (
+    FakeGenAIClient,
+    FakeInteractions,
+    FakeInteractionStream,
+)
+from tests.fixtures.interactions import (
+    completed_interaction,
+    completed_reasoning_stream,
+    completed_stream,
 )
 
 # region Test Constants
@@ -65,16 +115,69 @@ USER_EMAIL_WHITELISTED = "whitelisted_user@example.com"
 ADMIN_FREE_KEY = "admin_default_free_key"
 ADMIN_PAID_KEY = "admin_default_paid_key"
 ADMIN_GEMINI_BASE_URL = "https://admin.default.gemini.api.com"
-ADMIN_VERTEX_PROJECT = "admin_default_vertex_project"
-ADMIN_VERTEX_LOCATION = "admin_default_vertex_location"
+ADMIN_ENTERPRISE_PROJECT = "admin_default_enterprise_project"
+ADMIN_ENTERPRISE_LOCATION = "admin_default_enterprise_location"
 
 # User Credentials
 USER_FREE_KEY = "user_specific_free_key"
 USER_PAID_KEY = "user_specific_paid_key"
 USER_GEMINI_BASE_URL = "https://user.specific.gemini.api.com"
-USER_VERTEX_PROJECT = "user_specific_vertex_project"
-USER_VERTEX_LOCATION = "user_specific_vertex_location"
+USER_ENTERPRISE_PROJECT = "user_specific_enterprise_project"
+USER_ENTERPRISE_LOCATION = "user_specific_enterprise_location"
 # endregion Test Constants
+
+
+def _developer_identity() -> EndpointIdentity:
+    return EndpointIdentity(
+        service="developer",
+        credential_fingerprint="test-credential",
+        api_version="v1",
+    )
+
+
+def _client_error(code: int, status: str, message: str) -> genai_errors.ClientError:
+    return genai_errors.ClientError(
+        code,
+        {"error": {"code": code, "message": message, "status": status}},
+    )
+
+
+def test_catalogued_model_ids_and_image_policy_default_deny() -> None:
+    catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+    raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog_models = raw_catalog["models"]
+
+    assert set(catalog_models) == CATALOG_MODEL_IDS
+    assert Pipe._is_image_model("gemini-2.5-flash-image", catalog_models) is True
+    assert Pipe._is_image_model("gemini-future-unknown", catalog_models) is False
+
+
+@pytest.mark.parametrize("version", [None, "2.1.0", "3.0.1", "invalid"])
+def test_pipe_rejects_mismatched_companion_protocol(version: str | None) -> None:
+    features = {} if version is None else {"gemini_manifold_companion_version": version}
+
+    with pytest.raises(ValueError, match="protocol mismatch"):
+        Pipe._check_companion_filter_version(MagicMock(), features)
+
+
+def test_pipe_accepts_exact_companion_protocol_pair() -> None:
+    Pipe._check_companion_filter_version(
+        MagicMock(), {"gemini_manifold_companion_version": "3.0.0"}
+    )
+
+
+def test_companion_catalog_default_is_version_pinned_and_fails_visibly() -> None:
+    assert "/gemini-suite/v3.0.0/" in DEFAULT_MODEL_CONFIG_PATH
+    assert "/master/" not in DEFAULT_MODEL_CONFIG_PATH
+    CompanionFilter._load_model_config.cache_clear()
+    with (
+        patch(
+            "plugins.filters.gemini_manifold_companion.urllib.request.urlopen",
+            side_effect=TimeoutError("offline"),
+        ),
+        pytest.raises(ModelCatalogError, match="unavailable or invalid"),
+    ):
+        CompanionFilter._load_model_config(DEFAULT_MODEL_CONFIG_PATH)
 
 
 # region Fixtures
@@ -90,19 +193,18 @@ def mock_pipe_valves_data():
         "USER_MUST_PROVIDE_AUTH_CONFIG": False,
         "AUTH_WHITELIST": None,
         "GEMINI_API_BASE_URL": ADMIN_GEMINI_BASE_URL,
-        "USE_VERTEX_AI": False,
-        "VERTEX_PROJECT": None,
-        "VERTEX_LOCATION": "global",
+        "USE_ENTERPRISE": False,
+        "ENTERPRISE_PROJECT": None,
+        "ENTERPRISE_LOCATION": "global",
         "MODEL_WHITELIST": "*",
         "MODEL_BLACKLIST": None,
         "CACHE_MODELS": True,
-        "THINKING_BUDGET": 8192,
-        "SHOW_THINKING_SUMMARY": True,
+        "THINKING_LEVEL": "high",
+        "THINKING_SUMMARIES": "auto",
         "USE_FILES_API": True,
         "PDF_LIMIT_MITIGATION": True,
         "THINKING_MODEL_PATTERN": r"gemini-2.5",
         "LOG_LEVEL": "INFO",
-        "ENABLE_URL_CONTEXT_TOOL": False,
     }
 
 
@@ -166,7 +268,9 @@ def test_pipe_initialization_with_api_key_prefers_free(mock_pipe_valves_data):
 
             MockedGenAIClientConstructor.assert_called_once_with(
                 api_key=ADMIN_FREE_KEY,  # Should prefer the free key
-                http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+                http_options=gemini_types.HttpOptions(
+                    api_version="v1", base_url=ADMIN_GEMINI_BASE_URL
+                ),
             )
         finally:
             Pipe._get_or_create_genai_client.cache_clear()
@@ -175,13 +279,13 @@ def test_pipe_initialization_with_api_key_prefers_free(mock_pipe_valves_data):
 def test_get_user_client_no_auth_provided_raises_error(mock_pipe_valves_data):
     """
     Tests that genai.Client is NOT called and an error is raised when no API keys
-    or Vertex project are provided.
+    or Enterprise project are provided.
     """
-    # Configure valves to have no API keys and no Vertex AI project
+    # Configure valves to have no API keys and no Gemini Enterprise project
     mock_pipe_valves_data["GEMINI_FREE_API_KEY"] = None
     mock_pipe_valves_data["GEMINI_PAID_API_KEY"] = None
-    mock_pipe_valves_data["USE_VERTEX_AI"] = False
-    mock_pipe_valves_data["VERTEX_PROJECT"] = None
+    mock_pipe_valves_data["USE_ENTERPRISE"] = False
+    mock_pipe_valves_data["ENTERPRISE_PROJECT"] = None
 
     with (
         patch("plugins.pipes.gemini_manifold.genai.Client") as MockedGenAIClientConstructor,
@@ -191,7 +295,7 @@ def test_get_user_client_no_auth_provided_raises_error(mock_pipe_valves_data):
         pipe_instance = Pipe()
         pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
 
-        with pytest.raises(ValueError, match="Neither VERTEX_PROJECT nor a Gemini API key"):
+        with pytest.raises(ValueError, match="Neither ENTERPRISE_PROJECT nor a Gemini API key"):
             pipe_instance._get_user_client(pipe_instance.valves, USER_EMAIL_REGULAR)
 
         MockedGenAIClientConstructor.assert_not_called()
@@ -222,63 +326,2184 @@ def test_client_creation_uses_available_gemini_api_key(
 
     pipe.valves.GEMINI_FREE_API_KEY = keys_provided["GEMINI_FREE_API_KEY"]
     pipe.valves.GEMINI_PAID_API_KEY = keys_provided["GEMINI_PAID_API_KEY"]
-    pipe.valves.USE_VERTEX_AI = False
+    pipe.valves.USE_ENTERPRISE = False
 
     pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=expected_key,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=ADMIN_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_client_creation_uses_vertex_ai_when_configured(pipe_instance_fixture):
+def test_client_creation_uses_enterprise_when_configured(pipe_instance_fixture):
     """
-    Tests that Vertex AI client is created when USE_VERTEX_AI is True and VERTEX_PROJECT is provided.
+    Tests that Gemini Enterprise client is created when USE_ENTERPRISE is True and ENTERPRISE_PROJECT is provided.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    pipe.valves.USE_VERTEX_AI = True
-    pipe.valves.VERTEX_PROJECT = "test_vertex_project_id"
-    pipe.valves.VERTEX_LOCATION = "europe-west4"
+    pipe.valves.USE_ENTERPRISE = True
+    pipe.valves.ENTERPRISE_PROJECT = "test_enterprise_project_id"
+    pipe.valves.ENTERPRISE_LOCATION = "europe-west4"
 
     pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
 
     MockedGenAIClientConstructor.assert_called_once_with(
-        vertexai=True, project="test_vertex_project_id", location="europe-west4"
+        enterprise=True,
+        project="test_enterprise_project_id",
+        location="europe-west4",
+        http_options=gemini_types.HttpOptions(
+            api_version="v1beta1", base_url=ADMIN_GEMINI_BASE_URL
+        ),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 def test_client_creation_falls_back_to_gemini_api_with_warning(pipe_instance_fixture):
     """
-    Tests fallback to Gemini Developer API with a warning when USE_VERTEX_AI is True,
-    but VERTEX_PROJECT is not provided.
+    Tests fallback to Gemini Developer API with a warning when USE_ENTERPRISE is True,
+    but ENTERPRISE_PROJECT is not provided.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
-    pipe.valves.USE_VERTEX_AI = True
-    pipe.valves.VERTEX_PROJECT = None
+    pipe.valves.USE_ENTERPRISE = True
+    pipe.valves.ENTERPRISE_PROJECT = None
     pipe.valves.GEMINI_FREE_API_KEY = "fallback_free_key"
     pipe.valves.GEMINI_PAID_API_KEY = "fallback_paid_key"  # Should not be used
 
     with patch("plugins.pipes.gemini_manifold.log.warning") as mock_log_warning:
         pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
         mock_log_warning.assert_called_once_with(
-            "Vertex AI is enabled but no project is set. Using Gemini Developer API."
+            "Gemini Enterprise is enabled but no project is set. Using Gemini Developer API."
         )
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key="fallback_free_key",  # Should fall back to the free key
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=ADMIN_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
 # endregion Test _get_or_create_genai_client
+
+
+def _interaction_policy(*, image: bool = False) -> dict[str, dict]:
+    return {
+        "gemini-test": {
+            "content": {"outputs": ["text", "image"] if image else ["text"]},
+            "interactions": {
+                "response_format": True,
+                "thinking": {
+                    "supported": True,
+                    "levels": ["minimal", "low", "medium", "high"],
+                    "summaries": True,
+                },
+                "tools": {
+                    "google_search": True,
+                    "code_execution": True,
+                    "url_context": True,
+                    "google_maps": True,
+                },
+            },
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filter_type", "feature"),
+    [
+        (ReasoningToggleFilter, "reasoning"),
+        (URLContextToggleFilter, "url_context"),
+        (MapsToggleFilter, "google_maps"),
+    ],
+)
+async def test_toggle_filters_write_canonical_feature_schema(filter_type, feature):
+    body = {"metadata": {"features": {}}}
+    result = await filter_type().inlet(body)
+    assert result["metadata"]["features"] == {feature: True}
+
+
+@pytest.mark.asyncio
+async def test_interaction_options_map_generation_thinking_safety_and_schema(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    metadata = {
+        "canonical_model_id": "gemini-test",
+        "features": {"reasoning": True},
+        "merged_custom_params": {"reasoning_effort": "medium"},
+        "safety_settings": [{"type": "harassment", "threshold": "block_only_high"}],
+    }
+    options = await pipe._build_interaction_request_options(
+        {
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "max_tokens": 123,
+            "stop": "END",
+            "seed": 7,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+        },
+        metadata,
+        pipe.valves,
+        _interaction_policy(),
+    )
+
+    assert isinstance(options, InteractionRequestOptions)
+    assert options.generation_config.thinking_level == "medium"
+    assert options.generation_config.thinking_summaries == "auto"
+    assert options.generation_config.stop_sequences == ["END"]
+    assert options.safety_settings[0].type == "harassment"
+    assert isinstance(options.response_format, interaction_types.TextResponseFormat)
+    assert options.response_format.model_dump(by_alias=True)["schema"] == {"type": "object"}
+
+
+@pytest.mark.asyncio
+async def test_interaction_options_build_image_and_maps_formats(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    pipe.valves.MAPS_GROUNDING_COORDINATES = "45.5,-73.6"
+    options = await pipe._build_interaction_request_options(
+        {},
+        {
+            "canonical_model_id": "gemini-test",
+            "features": {"google_maps": True},
+        },
+        pipe.valves,
+        _interaction_policy(image=True),
+    )
+    assert options.response_format is not None
+    assert options.response_format.type == "image"
+    assert options.tools[0].type == "google_maps"
+    assert options.tools[0].latitude == 45.5
+
+
+@pytest.mark.asyncio
+async def test_task_interaction_options_disable_tools(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    options = await pipe._build_interaction_request_options(
+        {},
+        {
+            "canonical_model_id": "gemini-test",
+            "task": "title_generation",
+            "features": {"google_search_tool": True},
+        },
+        pipe.valves,
+        _interaction_policy(),
+    )
+    assert options.tools == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "metadata", "message"),
+    [
+        ({"top_k": 10}, {"features": {}}, "top_k"),
+        (
+            {},
+            {"features": {}, "merged_custom_params": {"reasoning_effort": 8192}},
+            "reasoning_effort",
+        ),
+        ({}, {"features": {"url_context": True}}, "does not support requested tools"),
+        (
+            {},
+            {
+                "features": {},
+                "safety_settings": [{"type": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"}],
+            },
+            "canonical lowercase",
+        ),
+    ],
+)
+async def test_interaction_options_reject_legacy_or_unsupported_configuration(
+    pipe_instance_fixture, body, metadata, message
+):
+    pipe, _ = pipe_instance_fixture
+    metadata["canonical_model_id"] = "gemini-test"
+    policy = _interaction_policy()
+    if "url_context" in metadata.get("features", {}):
+        policy["gemini-test"]["interactions"]["tools"]["url_context"] = False
+    with pytest.raises(ValueError, match=message):
+        await pipe._build_interaction_request_options(body, metadata, pipe.valves, policy)
+
+
+def test_endpoint_identity_isolates_model_project_service_and_base_url():
+    developer = _developer_identity().for_model("gemini-2.5-flash")
+    assert developer.scope == developer.model_copy().scope
+    assert developer.scope != developer.for_model("gemini-2.5-pro").scope
+    assert (
+        developer.scope != developer.model_copy(update={"base_url": "https://proxy.example"}).scope
+    )
+    assert (
+        developer.scope
+        != EndpointIdentity(
+            service="enterprise",
+            credential_fingerprint="test-credential",
+            project="project-a",
+            location="global",
+            api_version="v1beta1",
+            model="gemini-2.5-flash",
+        ).scope
+    )
+
+
+@pytest.mark.asyncio
+async def test_cached_client_lifecycle_closes_async_resources(pipe_instance_fixture):
+    pipe, constructor = pipe_instance_fixture
+    client = constructor.return_value
+    client.aio.aclose = AsyncMock()
+    Pipe._cached_client_bindings = []
+
+    pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
+    await Pipe.aclose_cached_clients()
+
+    client.aio.aclose.assert_awaited_once_with()
+    assert Pipe._get_or_create_genai_client.cache_info().currsize == 0
+
+
+def test_logger_capture_redacts_signed_state_credentials_and_locations(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    companion = object.__new__(CompanionFilter)
+    secrets = {
+        "api_key": "raw-api-key",
+        "authorization": "Bearer raw-token",
+        "credential_fingerprint": "credential-hash",
+        "uri": "https://signed.example/file?token=raw-url-token",
+        "gemini_interaction": {
+            "steps": [{"type": "thought", "signature": "opaque-thought-signature"}]
+        },
+        "nested": {"tool_signature": "opaque-tool-signature", "safe": "visible"},
+    }
+
+    captures: list[str] = []
+    for formatter in (pipe.plugin_stdout_format, companion.plugin_stdout_format):
+        extra = {"payload": secrets}
+        record = MagicMock()
+        record.__getitem__.side_effect = {"extra": extra}.__getitem__
+        formatter(record)
+        captures.append(str(extra["_plugin_serialized_data"]))
+
+    captured = "\n".join(captures)
+    assert "visible" in captured
+    for secret in (
+        "raw-api-key",
+        "raw-token",
+        "credential-hash",
+        "raw-url-token",
+        "opaque-thought-signature",
+        "opaque-tool-signature",
+    ):
+        assert secret not in captured
+    assert captured.count("[REDACTED]") >= 12
+
+
+@pytest.mark.parametrize(
+    ("error", "kind", "retryable"),
+    [
+        (_client_error(429, "RESOURCE_EXHAUSTED", "quota"), GenerationFailureKind.RATE_LIMIT, True),
+        (
+            _client_error(403, "PERMISSION_DENIED", "denied"),
+            GenerationFailureKind.PERMISSION,
+            False,
+        ),
+        (httpx.ReadTimeout("timed out"), GenerationFailureKind.TRANSPORT, True),
+        (
+            InteractionExecutionError(GenerationFailureKind.INTERACTION_STATUS, "budget_exceeded"),
+            GenerationFailureKind.INTERACTION_STATUS,
+            False,
+        ),
+    ],
+)
+def test_generation_failure_policy_is_typed(error, kind, retryable):
+    failure = Pipe._classify_generation_failure(error)
+    assert failure.kind is kind
+    assert failure.retryable_across_endpoint is retryable
+
+
+def _emitted_text(emissions, kind: str) -> str:
+    return "".join(emission.text or "" for emission in emissions if emission.kind == kind)
+
+
+class _FakeInteractionStream:
+    def __init__(self, events: list[interaction_types.InteractionSSEEvent], error=None):
+        self.events = iter(events)
+        self.error = error
+        self.error_raised = False
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self.events)
+        except StopIteration:
+            if self.error is not None and not self.error_raised:
+                self.error_raised = True
+                raise self.error from None
+            raise StopAsyncIteration from None
+
+    async def close(self):
+        self.closed = True
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        await self.close()
+
+
+def test_interaction_reducer_stream_and_unary_are_golden_equivalent():
+    steps = [
+        interaction_types.ModelOutputStep(
+            type="model_output",
+            content=[interaction_types.TextContent(type="text", text="answer")],
+        ),
+        interaction_types.ThoughtStep(
+            type="thought",
+            signature=base64.b64encode(b"opaque").decode("ascii"),
+            summary=[interaction_types.TextContent(type="text", text="reason")],
+        ),
+    ]
+    usage = interaction_types.Usage(
+        total_input_tokens=10,
+        total_output_tokens=5,
+        total_thought_tokens=2,
+        total_cached_tokens=3,
+        total_tool_use_tokens=1,
+        total_tokens=18,
+    )
+    unary = InteractionReducer()
+    unary_emissions = unary.consume_interaction(
+        interaction_types.Interaction(
+            id="interaction-1", status="completed", steps=steps, usage=usage
+        )
+    )
+    unary.finalize_steps()
+
+    streamed = InteractionReducer()
+    stream_emissions = []
+    stream_emissions += streamed.consume_event(
+        interaction_types.InteractionCreatedEvent(
+            event_id="e1",
+            interaction=interaction_types.InteractionSseEventInteraction(
+                id="interaction-1", status="in_progress"
+            ),
+        )
+    )
+    stream_emissions += streamed.consume_event(
+        interaction_types.StepStart(
+            event_id="e2",
+            index=0,
+            step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+        )
+    )
+    stream_emissions += streamed.consume_event(
+        interaction_types.StepDelta(
+            event_id="e3", index=0, delta=interaction_types.TextDelta(text="answer")
+        )
+    )
+    streamed.consume_event(interaction_types.StepStop(event_id="e4", index=0))
+    stream_emissions += streamed.consume_event(
+        interaction_types.StepStart(
+            event_id="e5",
+            index=1,
+            step=interaction_types.ThoughtStep(type="thought"),
+        )
+    )
+    stream_emissions += streamed.consume_event(
+        interaction_types.StepDelta(
+            event_id="e6",
+            index=1,
+            delta=interaction_types.ThoughtSummaryDelta(
+                content=interaction_types.TextContent(type="text", text="reason")
+            ),
+        )
+    )
+    streamed.consume_event(interaction_types.StepStop(event_id="e7", index=1))
+    stream_emissions += streamed.consume_event(
+        interaction_types.InteractionCompletedEvent(
+            event_id="e8",
+            interaction=interaction_types.InteractionSseEventInteraction(
+                id="interaction-1", status="completed", steps=steps, usage=usage
+            ),
+        )
+    )
+    streamed.finalize_steps()
+
+    assert _emitted_text(stream_emissions, "content") == _emitted_text(unary_emissions, "content")
+    assert _emitted_text(stream_emissions, "reasoning") == _emitted_text(
+        unary_emissions, "reasoning"
+    )
+    assert streamed.state.steps == unary.state.steps
+    assert streamed.state.usage == unary.state.usage
+    assert streamed.state.status == unary.state.status == "completed"
+
+
+def test_interaction_reducer_dedupes_events_and_rejects_illegal_lifecycle():
+    reducer = InteractionReducer()
+    start = interaction_types.StepStart(
+        event_id="same",
+        index=0,
+        step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+    )
+    reducer.consume_event(start)
+    assert reducer.consume_event(start) == []
+    with pytest.raises(InteractionExecutionError, match="inactive step"):
+        reducer.consume_event(
+            interaction_types.StepDelta(
+                event_id="new", index=1, delta=interaction_types.TextDelta(text="bad")
+            )
+        )
+    reducer.consume_event(interaction_types.StepStop(event_id="stop", index=0))
+    with pytest.raises(InteractionExecutionError, match="Invalid step.stop"):
+        reducer.consume_event(interaction_types.StepStop(event_id="stop-again", index=0))
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "incomplete", "budget_exceeded"])
+def test_interaction_reducer_terminal_failure_statuses_are_not_success(status: str):
+    reducer = InteractionReducer()
+    with pytest.raises(InteractionExecutionError, match=status):
+        reducer.consume_event(
+            interaction_types.InteractionStatusUpdate(
+                event_id="terminal",
+                interaction_id="interaction",
+                status=cast(interaction_types.InteractionStatusUpdateStatus, status),
+            )
+        )
+    assert reducer.state.terminal is True
+    assert reducer.state.status == status
+
+
+def test_interaction_reducer_error_unknown_event_step_content_and_delta_fail_closed():
+    with pytest.raises(InteractionExecutionError, match="server exploded"):
+        InteractionReducer().consume_event(
+            interaction_types.ErrorEvent(
+                event_id="error",
+                error=interaction_types.Error(code="500", message="server exploded"),
+            )
+        )
+
+    unknown_event = interaction_types.UnknownInteractionSSEEvent(raw={"event_type": "future"})
+    with pytest.raises(InteractionExecutionError, match="Unknown Interaction event"):
+        InteractionReducer().consume_event(unknown_event)
+
+    unknown_step_reducer = InteractionReducer()
+    with pytest.raises(InteractionExecutionError, match="Unknown Interaction step"):
+        unknown_step_reducer.consume_interaction(
+            interaction_types.Interaction(
+                status="completed",
+                steps=[interaction_types.UnknownStep(raw={"type": "future"})],
+            )
+        )
+
+    unknown_content_reducer = InteractionReducer()
+    with pytest.raises(InteractionExecutionError, match="Unknown Interaction content"):
+        unknown_content_reducer.consume_interaction(
+            interaction_types.Interaction(
+                status="completed",
+                steps=[
+                    interaction_types.ModelOutputStep(
+                        type="model_output",
+                        content=[interaction_types.UnknownContent(raw={"type": "future"})],
+                    )
+                ],
+            )
+        )
+
+    unknown_delta_reducer = InteractionReducer()
+    unknown_delta_reducer.consume_event(
+        interaction_types.StepStart(
+            index=0,
+            step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+        )
+    )
+    with pytest.raises(InteractionExecutionError, match="Unknown Interaction delta"):
+        unknown_delta_reducer.consume_event(
+            interaction_types.StepDelta(
+                index=0,
+                delta=interaction_types.UnknownStepDeltaData(raw={"type": "future"}),
+            )
+        )
+
+
+def test_interaction_reducer_media_tool_source_and_usage_mapping():
+    reducer = InteractionReducer()
+    steps: list[interaction_types.Step] = [
+        interaction_types.ModelOutputStep(
+            type="model_output",
+            content=[
+                interaction_types.ImageContent(type="image", mime_type="image/png", data="aW1hZ2U=")
+            ],
+        ),
+        interaction_types.FunctionCallStep(
+            type="function_call", id="call", name="lookup", arguments={"q": "x"}
+        ),
+        interaction_types.GoogleSearchResultStep(
+            type="google_search_result", call_id="search-call", result=[]
+        ),
+    ]
+    emissions = reducer.consume_interaction(
+        interaction_types.Interaction(
+            id="interaction",
+            status="completed",
+            usage=interaction_types.Usage(
+                total_input_tokens=100,
+                total_output_tokens=20,
+                total_thought_tokens=5,
+                total_cached_tokens=40,
+                total_tool_use_tokens=3,
+                total_tokens=128,
+            ),
+            steps=steps,
+        )
+    )
+
+    assert {emission.kind for emission in emissions} >= {"media", "tool", "source", "status"}
+    assert reducer.state.usage == InteractionsSDKBoundary.normalize_usage(
+        interaction_types.Usage(
+            total_input_tokens=100,
+            total_output_tokens=20,
+            total_thought_tokens=5,
+            total_cached_tokens=40,
+            total_tool_use_tokens=3,
+            total_tokens=128,
+        )
+    )
+    reducer.finalize_steps()
+    assert reducer.state.grounding.tool_records[0].tool == "google_search"
+
+
+def test_interactions_usage_normalizes_modality_breakdowns():
+    usage = interaction_types.Usage(
+        total_input_tokens=12,
+        total_output_tokens=8,
+        total_tokens=20,
+        output_tokens_by_modality=[interaction_types.ModalityTokens(modality="image", tokens=3)],
+    )
+
+    normalized = InteractionsSDKBoundary.normalize_usage(usage)
+
+    assert normalized.output_by_modality == [{"modality": "image", "tokens": 3}]
+
+
+@pytest.mark.parametrize(
+    ("is_paid_api", "include_image_price", "expected"),
+    [
+        (
+            True,
+            True,
+            {
+                "input_cost": 0.00008,
+                "cache_cost": 0.0,
+                "output_cost": 0.00009,
+                "image_output_cost": 0.0003,
+                "total_cost": 0.00047,
+            },
+        ),
+        (
+            True,
+            False,
+            {
+                "input_cost": 0.00008,
+                "cache_cost": 0.0,
+                "output_cost": 0.00009,
+                "image_output_cost": 0.0,
+                "total_cost": 0.00017,
+            },
+        ),
+        (
+            False,
+            True,
+            {
+                "input_cost": 0.0,
+                "cache_cost": 0.0,
+                "output_cost": 0.0,
+                "image_output_cost": 0.0,
+                "total_cost": 0.0,
+            },
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_interactions_usage_costs_image_output_once(
+    pipe_instance_fixture,
+    is_paid_api: bool,
+    include_image_price: bool,
+    expected: dict[str, float],
+):
+    pipe, _ = pipe_instance_fixture
+    app = FastAPI()
+    pricing = {
+        "input": [{"price_per_million": 1.0}],
+        "output": [{"price_per_million": 2.0}],
+    }
+    if include_image_price:
+        pricing["image_output"] = [{"price_per_million": 30.0}]
+    app.state._state["gemini_model_config"] = {"gemini-test": {"pricing": pricing}}
+    metadata = cast(
+        Metadata,
+        {"canonical_model_id": "gemini-test", "is_paid_api": is_paid_api},
+    )
+    usage = NormalizedInteractionUsage(
+        input_tokens=100,
+        output_tokens=50,
+        thought_tokens=5,
+        cached_tokens=20,
+        total_tokens=155,
+        output_by_modality=[{"modality": "image", "tokens": 10}],
+    )
+
+    result = pipe._get_interaction_usage_data(usage, app.state, metadata, 0.0)
+
+    assert result["cost_details"] == expected
+
+
+def test_interactions_migration_removal_guard():
+    source = (Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_manifold.py").read_text(
+        encoding="utf-8"
+    )
+    forbidden = [
+        "generate_content",
+        "GenerateContentResponse",
+        "_unified_response_processor",
+        "_process_part",
+        "_get_usage_data",
+        "gemini_parts",
+        "usage_metadata",
+        ".candidates",
+        "types.Candidate",
+        '"interaction_steps"',
+        '"interaction_original_content"',
+        '"interaction_endpoint_scope"',
+        '"interaction_schema_version"',
+    ]
+
+    assert [name for name in forbidden if name in source] == []
+    type_source = (Path(__file__).parents[1] / "utils" / "manifold_types.py").read_text(
+        encoding="utf-8"
+    )
+    assert "gemini_parts" not in type_source
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        interaction_types.UserInputStep.model_construct(type="user_input", content=[]),
+        interaction_types.ModelOutputStep.model_construct(type="model_output", content=[]),
+        interaction_types.ThoughtStep.model_construct(type="thought", summary=[]),
+        interaction_types.FunctionCallStep.model_construct(
+            type="function_call", id="call", name="fn", arguments={}
+        ),
+        interaction_types.FunctionResultStep.model_construct(
+            type="function_result", call_id="call", result="ok"
+        ),
+        interaction_types.CodeExecutionCallStep.model_construct(
+            type="code_execution_call",
+            arguments=interaction_types.CodeExecutionCallArguments.model_construct(code=None),
+        ),
+        interaction_types.CodeExecutionResultStep.model_construct(
+            type="code_execution_result", result=""
+        ),
+        interaction_types.URLContextCallStep.model_construct(type="url_context_call"),
+        interaction_types.URLContextResultStep.model_construct(type="url_context_result"),
+        interaction_types.GoogleSearchCallStep.model_construct(type="google_search_call"),
+        interaction_types.GoogleSearchResultStep.model_construct(type="google_search_result"),
+        interaction_types.FileSearchCallStep.model_construct(type="file_search_call"),
+        interaction_types.FileSearchResultStep.model_construct(type="file_search_result"),
+        interaction_types.GoogleMapsCallStep.model_construct(type="google_maps_call"),
+        interaction_types.GoogleMapsResultStep.model_construct(type="google_maps_result"),
+        interaction_types.MCPServerToolCallStep.model_construct(type="mcp_server_tool_call"),
+        interaction_types.MCPServerToolResultStep.model_construct(type="mcp_server_tool_result"),
+    ],
+    ids=lambda step: str(step.type),
+)
+def test_interaction_reducer_accepts_every_exact_step_variant(step):
+    reducer = InteractionReducer()
+    reducer.consume_interaction(interaction_types.Interaction(status="completed", steps=[step]))
+    reducer.finalize_steps()
+    assert reducer.state.steps[0]["type"] == step.type
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        interaction_types.TextDelta.model_construct(type="text", text="text"),
+        interaction_types.ImageDelta.model_construct(type="image", data="aQ=="),
+        interaction_types.AudioDelta.model_construct(type="audio", data="YQ=="),
+        interaction_types.DocumentDelta.model_construct(type="document", data="ZA=="),
+        interaction_types.VideoDelta.model_construct(type="video", data="dg=="),
+        interaction_types.ThoughtSummaryDelta.model_construct(type="thought_summary", content=None),
+        interaction_types.ThoughtSignatureDelta.model_construct(
+            type="thought_signature", signature="c2ln"
+        ),
+        interaction_types.TextAnnotationDelta.model_construct(
+            type="text_annotation_delta", annotations=[]
+        ),
+        interaction_types.ArgumentsDelta.model_construct(type="arguments_delta", arguments='{"x":'),
+        interaction_types.CodeExecutionCallDelta.model_construct(type="code_execution_call"),
+        interaction_types.URLContextCallDelta.model_construct(type="url_context_call"),
+        interaction_types.GoogleSearchCallDelta.model_construct(type="google_search_call"),
+        interaction_types.MCPServerToolCallDelta.model_construct(type="mcp_server_tool_call"),
+        interaction_types.FileSearchCallDelta.model_construct(type="file_search_call"),
+        interaction_types.GoogleMapsCallDelta.model_construct(type="google_maps_call"),
+        interaction_types.RetrievalCallDelta(
+            type="retrieval_call",
+            arguments=interaction_types.RetrievalCallArguments(queries=[]),
+        ),
+        interaction_types.CodeExecutionResultDelta.model_construct(type="code_execution_result"),
+        interaction_types.URLContextResultDelta.model_construct(type="url_context_result"),
+        interaction_types.GoogleSearchResultDelta.model_construct(type="google_search_result"),
+        interaction_types.MCPServerToolResultDelta.model_construct(type="mcp_server_tool_result"),
+        interaction_types.FileSearchResultDelta.model_construct(type="file_search_result"),
+        interaction_types.GoogleMapsResultDelta.model_construct(type="google_maps_result"),
+        interaction_types.RetrievalResultDelta.model_construct(type="retrieval_result"),
+        interaction_types.FunctionResultDelta.model_construct(type="function_result"),
+    ],
+    ids=lambda delta: str(delta.type),
+)
+def test_interaction_reducer_accepts_every_exact_delta_variant(delta):
+    reducer = InteractionReducer()
+    reducer.consume_event(
+        interaction_types.StepStart(
+            index=0,
+            step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+        )
+    )
+    emissions = reducer.consume_event(interaction_types.StepDelta(index=0, delta=delta))
+    if delta.type in {"image", "audio", "document", "video"}:
+        assert emissions == []
+    assert reducer.state.terminal is False
+
+
+def test_interaction_reducer_annotations_and_tool_calls_are_correlated_equally():
+    annotation = interaction_types.URLCitation(
+        type="url_citation", url="https://example.test", title="Example"
+    )
+    steps: list[interaction_types.Step] = [
+        interaction_types.ModelOutputStep(
+            type="model_output",
+            content=[
+                interaction_types.TextContent(type="text", text="cited", annotations=[annotation])
+            ],
+        ),
+        interaction_types.GoogleSearchCallStep.model_construct(
+            type="google_search_call", id="search-1"
+        ),
+        interaction_types.GoogleSearchResultStep.model_construct(
+            type="google_search_result", call_id="search-1", result=[]
+        ),
+    ]
+    reducer = InteractionReducer()
+    reducer.consume_interaction(interaction_types.Interaction(status="completed", steps=steps))
+    reducer.finalize_steps()
+
+    assert reducer.state.grounding.sources[0].kind == "url"
+    assert reducer.state.grounding.tool_records[0].phase == "call"
+    assert reducer.state.grounding.tool_records[0].call_id == "search-1"
+    assert reducer.state.grounding.tool_records[1].phase == "result"
+    assert reducer.state.grounding.tool_records[1].call_id == "search-1"
+
+
+@pytest.mark.parametrize("include_annotation_delta", [False, True])
+def test_grounding_reducer_final_annotations_are_preserved_and_deduplicated(
+    include_annotation_delta: bool,
+) -> None:
+    annotation = interaction_types.URLCitation(
+        type="url_citation",
+        url="https://example.test/source",
+        title="Source",
+        start_index=0,
+        end_index=5,
+    )
+    reducer = InteractionReducer()
+    reducer.consume_event(
+        interaction_types.StepStart(
+            index=0,
+            step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+        )
+    )
+    reducer.consume_event(
+        interaction_types.StepDelta(
+            index=0,
+            delta=interaction_types.TextDelta(type="text", text="cited"),
+        )
+    )
+    if include_annotation_delta:
+        reducer.consume_event(
+            interaction_types.StepDelta(
+                index=0,
+                delta=interaction_types.TextAnnotationDelta(
+                    type="text_annotation_delta", annotations=[annotation]
+                ),
+            )
+        )
+    reducer.consume_event(
+        interaction_types.InteractionCompletedEvent(
+            event_id="final",
+            interaction=interaction_types.InteractionSseEventInteraction(
+                id="interaction",
+                status="completed",
+                steps=[
+                    interaction_types.ModelOutputStep(
+                        type="model_output",
+                        content=[
+                            interaction_types.TextContent(
+                                type="text", text="cited", annotations=[annotation]
+                            )
+                        ],
+                    )
+                ],
+            ),
+        )
+    )
+    reducer.finalize_steps()
+
+    assert [source.uri for source in reducer.state.grounding.sources] == [
+        "https://example.test/source"
+    ]
+    assert len(reducer.state.grounding.citations) == 1
+    assert reducer.state.original_content == "cited"
+
+
+def test_grounding_envelope_is_identical_for_stream_and_unary_snapshots() -> None:
+    annotation = interaction_types.URLCitation(
+        type="url_citation",
+        url="https://example.test/source",
+        start_index=0,
+        end_index=5,
+    )
+    steps: list[interaction_types.Step] = [
+        interaction_types.ModelOutputStep(
+            type="model_output",
+            content=[
+                interaction_types.TextContent(type="text", text="cited", annotations=[annotation])
+            ],
+        ),
+        interaction_types.GoogleSearchCallStep(
+            type="google_search_call",
+            id="search",
+            arguments=interaction_types.GoogleSearchCallArguments(queries=["query"]),
+        ),
+        interaction_types.GoogleSearchResultStep(
+            type="google_search_result",
+            call_id="search",
+            result=[interaction_types.GoogleSearchResult(search_suggestions="suggestion")],
+        ),
+    ]
+    unary = InteractionReducer()
+    unary.consume_interaction(interaction_types.Interaction(status="completed", steps=steps))
+    unary.finalize_steps()
+
+    streamed = InteractionReducer()
+    streamed.consume_event(
+        interaction_types.StepStart(
+            index=0,
+            step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+        )
+    )
+    streamed.consume_event(
+        interaction_types.StepDelta(
+            index=0, delta=interaction_types.TextDelta(type="text", text="cited")
+        )
+    )
+    streamed.consume_event(
+        interaction_types.InteractionCompletedEvent(
+            event_id="complete",
+            interaction=interaction_types.InteractionSseEventInteraction(
+                id="interaction",
+                status="completed",
+                steps=steps,
+            ),
+        )
+    )
+    streamed.finalize_steps()
+
+    assert streamed.state.grounding == unary.state.grounding
+
+
+def test_grounding_reducer_normalizes_exact_tools_without_signatures() -> None:
+    secret = "provider-signature-must-not-cross-envelope"
+    steps: list[interaction_types.Step] = [
+        interaction_types.GoogleSearchCallStep(
+            type="google_search_call",
+            id="search",
+            arguments=interaction_types.GoogleSearchCallArguments(queries=["query"]),
+            search_type="web_search",
+            signature=secret,
+        ),
+        interaction_types.GoogleSearchResultStep(
+            type="google_search_result",
+            call_id="search",
+            result=[interaction_types.GoogleSearchResult(search_suggestions="try this")],
+            signature=secret,
+        ),
+        interaction_types.URLContextCallStep(
+            type="url_context_call",
+            id="url",
+            arguments=interaction_types.URLContextCallArguments(urls=["https://example.test"]),
+            signature=secret,
+        ),
+        interaction_types.URLContextResultStep(
+            type="url_context_result",
+            call_id="url",
+            result=[
+                interaction_types.URLContextResult(url="https://example.test", status="paywall")
+            ],
+            is_error=True,
+            signature=secret,
+        ),
+        interaction_types.GoogleMapsCallStep(
+            type="google_maps_call",
+            id="maps",
+            arguments=interaction_types.GoogleMapsCallArguments(queries=["coffee"]),
+            signature=secret,
+        ),
+        interaction_types.GoogleMapsResultStep(
+            type="google_maps_result",
+            call_id="maps",
+            result=[
+                interaction_types.GoogleMapsResult(
+                    widget_context_token="widget",
+                    places=[
+                        interaction_types.GoogleMapsResultPlaces(
+                            name="Cafe", place_id="place", url="https://maps.example/place"
+                        )
+                    ],
+                )
+            ],
+            signature=secret,
+        ),
+    ]
+    reducer = InteractionReducer()
+    reducer.consume_interaction(interaction_types.Interaction(status="completed", steps=steps))
+    reducer.consume_event(
+        interaction_types.StepStart(
+            index=len(steps),
+            step=interaction_types.ModelOutputStep(type="model_output", content=[]),
+        )
+    )
+    reducer.consume_event(
+        interaction_types.StepDelta(
+            index=len(steps),
+            delta=interaction_types.RetrievalCallDelta(
+                type="retrieval_call",
+                arguments=interaction_types.RetrievalCallArguments(queries=["private docs"]),
+                retrieval_type="vertex_ai_search",
+                signature=secret,
+            ),
+        )
+    )
+    reducer.consume_event(
+        interaction_types.StepDelta(
+            index=len(steps),
+            delta=interaction_types.RetrievalResultDelta(
+                type="retrieval_result", is_error=True, signature=secret
+            ),
+        )
+    )
+    reducer.finalize_steps()
+
+    envelope = reducer.state.grounding
+    assert [(record.tool, record.phase) for record in envelope.tool_records] == [
+        ("google_search", "call"),
+        ("google_search", "result"),
+        ("url_context", "call"),
+        ("url_context", "result"),
+        ("google_maps", "call"),
+        ("google_maps", "result"),
+        ("retrieval", "call"),
+        ("retrieval", "result"),
+    ]
+    assert envelope.tool_records[1].search_suggestions == ["try this"]
+    assert envelope.tool_records[3].statuses == ["paywall"]
+    assert envelope.tool_records[5].widget_context_tokens == ["widget"]
+    assert envelope.tool_records[6].step_index == len(steps)
+    serialized = envelope.model_dump_json()
+    assert "signature" not in serialized
+    assert secret not in serialized
+
+
+def test_companion_multiblock_citations_fail_safe_for_provider_unicode() -> None:
+    envelope = CompanionGroundingEnvelope.model_validate(
+        {
+            "protocol_version": 1,
+            "visible_content_sha256": "unused",
+            "grounded_text_sha256": "unused",
+            "text_blocks": [
+                {"step_index": 0, "content_index": 0, "text": "alpha"},
+                {"step_index": 2, "content_index": 0, "text": "café"},
+            ],
+            "sources": [{"id": "url:one", "kind": "url", "uri": "https://example.test"}],
+            "citations": [
+                {
+                    "source_id": "url:one",
+                    "block_index": 0,
+                    "start": 0,
+                    "end": 5,
+                    "index_unit": "provider",
+                },
+                {
+                    "source_id": "url:one",
+                    "block_index": 1,
+                    "start": 0,
+                    "end": 5,
+                    "index_unit": "provider",
+                },
+                {
+                    "source_id": "url:one",
+                    "block_index": 1,
+                    "start": 0,
+                    "end": 4,
+                    "index_unit": "unicode_codepoints",
+                },
+            ],
+        }
+    )
+
+    cited, warnings = CompanionFilter._insert_citation_markers(envelope, "alpha <media> café")
+
+    assert cited == "alpha[1] <media> café[1]"
+    assert warnings == 1
+
+
+def test_companion_overlapping_and_duplicate_citations_are_deterministic() -> None:
+    envelope = CompanionGroundingEnvelope.model_validate(
+        {
+            "protocol_version": 1,
+            "visible_content_sha256": "unused",
+            "grounded_text_sha256": "unused",
+            "text_blocks": [{"step_index": 0, "content_index": 0, "text": "answer"}],
+            "sources": [
+                {"id": "url:one", "kind": "url", "uri": "https://one.example"},
+                {"id": "url:two", "kind": "url", "uri": "https://two.example"},
+            ],
+            "citations": [
+                {
+                    "source_id": source_id,
+                    "block_index": 0,
+                    "start": start,
+                    "end": 6,
+                    "index_unit": "unicode_codepoints",
+                }
+                for source_id, start in (("url:one", 0), ("url:one", 0), ("url:two", 2))
+            ],
+        }
+    )
+
+    cited, warnings = CompanionFilter._insert_citation_markers(envelope, "answer")
+
+    assert cited == "answer[1][2]"
+    assert warnings == 0
+
+
+@pytest.mark.asyncio
+async def test_companion_resolves_only_known_redirect_sources() -> None:
+    companion = CompanionFilter()
+    envelope = CompanionGroundingEnvelope.model_validate(
+        {
+            "protocol_version": 1,
+            "visible_content_sha256": "unused",
+            "grounded_text_sha256": "unused",
+            "sources": [
+                {
+                    "id": "url:redirect",
+                    "kind": "url",
+                    "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/token",
+                },
+                {
+                    "id": "url:direct",
+                    "kind": "url",
+                    "uri": "https://example.test/direct",
+                },
+            ],
+        }
+    )
+    emitter = MagicMock(spec=EventEmitter)
+    with patch.object(
+        companion,
+        "_resolve_url",
+        AsyncMock(return_value=("https://resolved.example/source", True)),
+    ) as resolve:
+        await companion._emit_grounding_sources(envelope, emitter)
+
+    resolve.assert_awaited_once()
+    payload = emitter.emit_sources.call_args.args[0]
+    assert [item["source"] for item in payload["metadata"]] == [
+        "https://resolved.example/source",
+        "https://example.test/direct",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_companion_digest_prevents_duplicate_or_edited_grounding() -> None:
+    visible = "cited"
+    envelope = {
+        "protocol_version": 1,
+        "visible_content_sha256": hashlib.sha256(visible.encode()).hexdigest(),
+        "grounded_text_sha256": hashlib.sha256(visible.encode()).hexdigest(),
+        "text_blocks": [{"step_index": 0, "content_index": 0, "text": visible}],
+        "sources": [
+            {
+                "id": "url:one",
+                "kind": "url",
+                "uri": "https://example.test/source",
+                "title": "Source",
+            }
+        ],
+        "citations": [
+            {
+                "source_id": "url:one",
+                "block_index": 0,
+                "start": 0,
+                "end": 5,
+                "index_unit": "provider",
+            }
+        ],
+    }
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": visible,
+                "gemini_interaction": {"grounding": envelope},
+            }
+        ]
+    }
+    events: list[dict[str, object]] = []
+
+    async def collect(event: dict[str, object]) -> None:
+        events.append(event)
+
+    companion = CompanionFilter()
+    await companion.outlet(body, MagicMock(), {}, collect)  # type: ignore[arg-type]
+    await companion.outlet(body, MagicMock(), {}, collect)  # type: ignore[arg-type]
+
+    assert body["messages"][-1]["content"] == "cited[1]"
+    assert [event["type"] for event in events].count("source") == 1
+    assert any(
+        event["type"] == "status"
+        and "edited" in str(cast(dict[str, object], event["data"])["description"])
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_companion_loads_grounding_from_durable_chat_across_workers() -> None:
+    grounding = {
+        "protocol_version": 1,
+        "visible_content_sha256": hashlib.sha256(b"answer").hexdigest(),
+        "grounded_text_sha256": hashlib.sha256(b"answer").hexdigest(),
+        "text_blocks": [{"step_index": 0, "content_index": 0, "text": "answer"}],
+    }
+    chat = MagicMock()
+    chat.chat = {
+        "history": {"messages": {"message": {"gemini_interaction": {"grounding": grounding}}}}
+    }
+    mock_chats_module.Chats.get_chat_by_id_and_user_id = AsyncMock(return_value=chat)
+
+    loaded = await CompanionFilter._load_grounding_envelope(
+        cast(Body, {"messages": [{"role": "assistant", "content": "answer"}]}),
+        {"chat_id": "chat", "message_id": "message", "user_id": "user"},
+    )
+
+    assert loaded is not None
+    assert loaded.visible_content_sha256 == grounding["visible_content_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_request_local_pipe_emitters_are_concurrency_isolated() -> None:
+    first_events: list[Event] = []
+    second_events: list[Event] = []
+
+    async def first(event: Event) -> None:
+        first_events.append(event)
+
+    async def second(event: Event) -> None:
+        second_events.append(event)
+
+    first_emitter = PipeEventEmitter(first)
+    second_emitter = PipeEventEmitter(second)
+    first_emitter.emit_status("first", done=True)
+    second_emitter.emit_status("second", done=True)
+    await asyncio.gather(first_emitter.flush(), second_emitter.flush())
+    await asyncio.gather(first_emitter.shutdown(), second_emitter.shutdown())
+
+    assert [cast(dict[str, object], event["data"])["description"] for event in first_events] == [
+        "first"
+    ]
+    assert [cast(dict[str, object], event["data"])["description"] for event in second_events] == [
+        "second"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emitter_class", [EventEmitter, PipeEventEmitter])
+@pytest.mark.parametrize("callback_error", [None, RuntimeError, asyncio.CancelledError])
+async def test_request_local_emitters_finish_after_callback_success_or_error(
+    emitter_class: type[EventEmitter] | type[PipeEventEmitter],
+    callback_error: type[BaseException] | None,
+) -> None:
+    delivered: list[dict[str, object]] = []
+
+    async def callback(event: dict[str, object]) -> None:
+        if callback_error is not None:
+            raise callback_error()
+        delivered.append(event)
+
+    emitter = emitter_class(callback)  # type: ignore[arg-type]
+    emitter.emit_status("done", done=True)
+    await asyncio.wait_for(emitter.flush(), timeout=1)
+    await asyncio.wait_for(emitter.shutdown(), timeout=1)
+
+    if callback_error is None:
+        assert len(delivered) == 1
+
+
+def _completed_event(event_id: str = "completed"):
+    return interaction_types.InteractionCompletedEvent(
+        event_id=event_id,
+        interaction=interaction_types.InteractionSseEventInteraction(
+            id="interaction-stream",
+            status="completed",
+            steps=[
+                interaction_types.ModelOutputStep(
+                    type="model_output",
+                    content=[interaction_types.TextContent(type="text", text="done")],
+                )
+            ],
+            usage=interaction_types.Usage(
+                total_input_tokens=2, total_output_tokens=1, total_tokens=3
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_interaction_stream_closes_and_emits_done_only_on_completed(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    stream = _FakeInteractionStream([_completed_event()])
+    boundary = MagicMock()
+    emitter = MagicMock(spec=EventEmitter)
+    emitter.start_time = 0.0
+    app = FastAPI()
+    app.state._state["gemini_model_config"] = {}
+
+    chunks = [
+        chunk
+        async for chunk in pipe_instance._present_interaction_stream(
+            stream=cast(AsyncInteractionStream, stream),
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            app=app,
+            event_emitter=emitter,
+            metadata=cast("Metadata", {}),
+        )
+    ]
+
+    assert stream.closed is True
+    assert chunks[-1] == "data: [DONE]"
+    assert chunks[0] == {"choices": [{"delta": {"content": "done"}}]}
+
+
+@pytest.mark.asyncio
+async def test_interaction_stream_resumes_same_id_and_event_cursor(pipe_instance_fixture):
+    pipe_instance, _ = pipe_instance_fixture
+    created = interaction_types.InteractionCreatedEvent(
+        event_id="cursor-1",
+        interaction=interaction_types.InteractionSseEventInteraction(
+            id="interaction-stream", status="in_progress"
+        ),
+    )
+    first = _FakeInteractionStream([created], error=ConnectionError("dropped"))
+    resumed = _FakeInteractionStream([_completed_event("cursor-2")])
+    boundary = MagicMock()
+    boundary.get = AsyncMock(return_value=resumed)
+    emitter = MagicMock(spec=EventEmitter)
+    emitter.start_time = 0.0
+    app = FastAPI()
+    app.state._state["gemini_model_config"] = {}
+
+    chunks = [
+        chunk
+        async for chunk in pipe_instance._present_interaction_stream(
+            stream=cast(AsyncInteractionStream, first),
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            app=app,
+            event_emitter=emitter,
+            metadata=cast("Metadata", {}),
+        )
+    ]
+
+    boundary.get.assert_awaited_once_with(
+        "interaction-stream", stream=True, last_event_id="cursor-1"
+    )
+    assert first.closed and resumed.closed
+    assert chunks[-1] == "data: [DONE]"
+
+
+@pytest.mark.asyncio
+async def test_interaction_stream_empty_error_and_cancel_never_emit_done(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    emitter = MagicMock(spec=EventEmitter)
+    emitter.start_time = 0.0
+    app = FastAPI()
+    boundary = MagicMock()
+    boundary.cancel = AsyncMock()
+
+    empty = _FakeInteractionStream([])
+    with pytest.raises(InteractionExecutionError, match="without a terminal status"):
+        _ = [
+            chunk
+            async for chunk in pipe_instance._present_interaction_stream(
+                stream=cast(AsyncInteractionStream, empty),
+                interactions=cast(AsyncInteractionsBoundary, boundary),
+                app=app,
+                event_emitter=emitter,
+                metadata=cast("Metadata", {}),
+            )
+        ]
+    assert empty.closed
+
+    failed = _FakeInteractionStream(
+        [interaction_types.ErrorEvent(error=interaction_types.Error(code="500", message="failed"))]
+    )
+    with pytest.raises(InteractionExecutionError, match="failed"):
+        _ = [
+            chunk
+            async for chunk in pipe_instance._present_interaction_stream(
+                stream=cast(AsyncInteractionStream, failed),
+                interactions=cast(AsyncInteractionsBoundary, boundary),
+                app=app,
+                event_emitter=emitter,
+                metadata=cast("Metadata", {}),
+            )
+        ]
+    assert failed.closed
+
+    cancelled = _FakeInteractionStream([], error=asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        _ = [
+            chunk
+            async for chunk in pipe_instance._present_interaction_stream(
+                stream=cast(AsyncInteractionStream, cancelled),
+                interactions=cast(AsyncInteractionsBoundary, boundary),
+                app=app,
+                event_emitter=emitter,
+                metadata=cast("Metadata", {}),
+            )
+        ]
+    assert cancelled.closed
+    boundary.cancel.assert_not_awaited()
+
+
+def _authorized_tool(
+    function: AsyncMock,
+    *,
+    direct: bool = False,
+    parameters: dict | None = None,
+) -> dict[str, object]:
+    return {
+        "callable": function,
+        "direct": direct,
+        "spec": {
+            "name": "backend_name",
+            "description": "Look up a value",
+            "parameters": parameters
+            or {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }
+
+
+def _function_policy(enabled: bool = True) -> dict[str, object]:
+    return {"interactions": {"custom_function_calling": enabled}}
+
+
+def test_open_webui_tool_registry_uses_authorized_mapping_name_and_task_gating():
+    function = AsyncMock(return_value={"ok": True})
+    registry = Pipe._resolve_open_webui_tools(
+        {"catalog_lookup": _authorized_tool(function)},
+        model_id="gemini-3.5-flash",
+        model_policy=_function_policy(),
+        is_task=False,
+    )
+
+    assert list(registry) == ["catalog_lookup"]
+    assert registry["catalog_lookup"].declaration.name == "catalog_lookup"
+    assert registry["catalog_lookup"].declaration.parameters == {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    }
+    assert (
+        Pipe._resolve_open_webui_tools(
+            {"catalog_lookup": _authorized_tool(function)},
+            model_id="gemini-3.5-flash",
+            model_policy=_function_policy(),
+            is_task=True,
+        )
+        == {}
+    )
+
+
+@pytest.mark.parametrize(
+    ("tools", "policy", "message"),
+    [
+        ({"lookup": _authorized_tool(AsyncMock())}, _function_policy(False), "not approved"),
+        ({"bad-name": _authorized_tool(AsyncMock())}, _function_policy(), "Invalid"),
+        ({"lookup": _authorized_tool(AsyncMock(), direct=True)}, _function_policy(), "direct"),
+        ({"lookup": {"spec": {}}}, _function_policy(), "no authorized callable"),
+        (
+            {
+                "lookup": _authorized_tool(
+                    AsyncMock(),
+                    parameters={
+                        "type": "object",
+                        "properties": {"__user__": {"type": "string"}},
+                    },
+                )
+            },
+            _function_policy(),
+            "reserved",
+        ),
+    ],
+)
+def test_open_webui_tool_registry_fails_closed(tools, policy, message):
+    with pytest.raises(ValueError, match=message):
+        Pipe._resolve_open_webui_tools(
+            tools,
+            model_id="gemini-3.5-flash",
+            model_policy=policy,
+            is_task=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_interaction_options_add_custom_function_and_allowed_tools(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    function = interaction_types.Function(
+        name="lookup", parameters={"type": "object", "properties": {}}
+    )
+    options = await pipe._build_interaction_request_options(
+        {},
+        cast(Metadata, {"canonical_model_id": "gemini-test"}),
+        pipe.valves,
+        _interaction_policy(),
+        [function],
+    )
+
+    assert function in options.tools
+    assert options.generation_config.tool_choice is not None
+    assert options.generation_config.tool_choice.allowed_tools is not None
+    assert options.generation_config.tool_choice.allowed_tools.mode == "auto"
+    assert options.generation_config.tool_choice.allowed_tools.tools == ["lookup"]
+
+
+def _function_call(call_id: str, arguments: dict | None = None, name: str = "lookup"):
+    return interaction_types.FunctionCallStep(
+        id=call_id, name=name, arguments=arguments or {"query": "value"}
+    )
+
+
+def _tool_interaction(interaction_id: str, *calls):
+    return interaction_types.Interaction(
+        id=interaction_id, status="requires_action", steps=list(calls)
+    )
+
+
+def _final_interaction(text: str = "finished"):
+    return interaction_types.Interaction(
+        id="final",
+        status="completed",
+        steps=[
+            interaction_types.ModelOutputStep(content=[interaction_types.TextContent(text=text)])
+        ],
+    )
+
+
+def _tool_registry(function: AsyncMock):
+    return Pipe._resolve_open_webui_tools(
+        {"lookup": _authorized_tool(function)},
+        model_id="gemini-3.5-flash",
+        model_policy=_function_policy(),
+        is_task=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_custom_function_loop_executes_sequentially_and_continues_with_results(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    order: list[str] = []
+
+    async def lookup(query: object):
+        order.append(cast(str, query))
+        return {"query": query}
+
+    function = AsyncMock(side_effect=lookup)
+    boundary = MagicMock()
+    boundary.create = AsyncMock(
+        side_effect=[
+            _tool_interaction(
+                "round-1",
+                _function_call("call-1", {"query": "first"}),
+                _function_call("call-2", {"query": "second"}),
+            ),
+            _final_interaction(),
+        ]
+    )
+
+    emissions, reduction = await pipe._run_custom_function_loop(
+        interactions=cast(AsyncInteractionsBoundary, boundary),
+        common_request={"model": "gemini-3.5-flash", "input": "go", "store": True},
+        registry=_tool_registry(function),
+    )
+
+    assert order == ["first", "second"]
+    assert reduction.status == "completed"
+    assert reduction.original_content == "finished"
+    assert all(emission.kind != "tool" for emission in emissions)
+    continuation = boundary.create.await_args_list[1].kwargs
+    assert continuation["previous_interaction_id"] == "round-1"
+    assert [item["call_id"] for item in continuation["input"]] == ["call-1", "call-2"]
+    assert all(item["type"] == "function_result" for item in continuation["input"])
+
+
+@pytest.mark.asyncio
+async def test_custom_function_errors_are_sanitized_and_strict_args_never_invoke(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    function = AsyncMock(side_effect=RuntimeError("secret backend detail"))
+    registry = _tool_registry(function)
+    records = {}
+
+    invalid = await pipe._execute_custom_function_call(
+        _function_call("invalid", {"query": "ok", "extra": "denied"}), registry, records
+    )
+    failed = await pipe._execute_custom_function_call(_function_call("failed"), registry, records)
+    unauthorized = await pipe._execute_custom_function_call(
+        _function_call("unknown", name="not_declared"), registry, records
+    )
+
+    assert invalid.is_error is True and "Unexpected arguments" in cast(str, invalid.result)
+    assert function.await_count == 1
+    assert failed.is_error is True
+    assert "RuntimeError" in cast(str, failed.result)
+    assert "secret backend detail" not in cast(str, failed.result)
+    assert unauthorized.is_error is True
+
+
+@pytest.mark.asyncio
+async def test_custom_function_result_serialization_timeout_and_size_bounds(
+    pipe_instance_fixture, monkeypatch
+):
+    pipe, _ = pipe_instance_fixture
+    serial = AsyncMock(return_value={"b": 2, "a": 1})
+    result = await pipe._execute_custom_function_call(
+        _function_call("json"), _tool_registry(serial), {}
+    )
+    assert result.result == '{"a":1,"b":2}'
+
+    monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_MAX_RESULT_BYTES", 3)
+    oversized = await pipe._execute_custom_function_call(
+        _function_call("large"), _tool_registry(AsyncMock(return_value="large")), {}
+    )
+    assert oversized.is_error is True and "exceeded" in cast(str, oversized.result)
+
+    async def slow(**_kwargs):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_TIMEOUT_SECONDS", 0.001)
+    timed_out = await pipe._execute_custom_function_call(
+        _function_call("slow"), _tool_registry(AsyncMock(side_effect=slow)), {}
+    )
+    assert timed_out.is_error is True and timed_out.result == "Tool execution timed out."
+
+
+@pytest.mark.asyncio
+async def test_custom_function_duplicate_call_is_idempotent_and_conflict_fails(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    function = AsyncMock(return_value="ok")
+    registry = _tool_registry(function)
+    records = {}
+    first = await pipe._execute_custom_function_call(_function_call("same"), registry, records)
+    duplicate = await pipe._execute_custom_function_call(_function_call("same"), registry, records)
+
+    assert duplicate is first
+    function.assert_awaited_once()
+    with pytest.raises(InteractionExecutionError, match="reused with different"):
+        await pipe._execute_custom_function_call(
+            _function_call("same", {"query": "changed"}), registry, records
+        )
+
+
+@pytest.mark.asyncio
+async def test_custom_function_loop_enforces_store_and_round_bounds(
+    pipe_instance_fixture, monkeypatch
+):
+    pipe, _ = pipe_instance_fixture
+    function = AsyncMock(return_value="again")
+    registry = _tool_registry(function)
+    boundary = MagicMock()
+    boundary.create = AsyncMock(
+        side_effect=[
+            _tool_interaction("one", _function_call("one")),
+            _tool_interaction("two", _function_call("two")),
+        ]
+    )
+    with pytest.raises(ValueError, match="store=true"):
+        await pipe._run_custom_function_loop(
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            common_request={"model": "gemini-3.5-flash", "input": "go", "store": False},
+            registry=registry,
+        )
+
+    monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_MAX_ROUNDS", 2)
+    with pytest.raises(InteractionExecutionError, match="2-round"):
+        await pipe._run_custom_function_loop(
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            common_request={"model": "gemini-3.5-flash", "input": "go", "store": True},
+            registry=registry,
+        )
+
+
+@pytest.mark.asyncio
+async def test_custom_function_loop_enforces_call_bounds_and_nonempty_identity(
+    pipe_instance_fixture, monkeypatch
+):
+    pipe, _ = pipe_instance_fixture
+    registry = _tool_registry(AsyncMock(return_value="ok"))
+    boundary = MagicMock()
+    boundary.create = AsyncMock(
+        return_value=_tool_interaction(
+            "too-many",
+            _function_call("one"),
+            _function_call("two"),
+        )
+    )
+    monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_MAX_CALLS_PER_ROUND", 1)
+    with pytest.raises(InteractionExecutionError, match="per-round"):
+        await pipe._run_custom_function_loop(
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            common_request={"model": "gemini-3.5-flash", "input": "go", "store": True},
+            registry=registry,
+        )
+
+    monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_MAX_CALLS_PER_ROUND", 16)
+    monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_MAX_TOTAL_CALLS", 1)
+    with pytest.raises(InteractionExecutionError, match="total function"):
+        await pipe._run_custom_function_loop(
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            common_request={"model": "gemini-3.5-flash", "input": "go", "store": True},
+            registry=registry,
+        )
+
+    boundary.create = AsyncMock(return_value=_tool_interaction("bad-id", _function_call("")))
+    with pytest.raises(InteractionExecutionError, match="non-empty"):
+        await pipe._run_custom_function_loop(
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            common_request={"model": "gemini-3.5-flash", "input": "go", "store": True},
+            registry=registry,
+        )
+
+
+def _interaction_envelope(
+    *,
+    interaction_id: str | None = "parent-interaction",
+    endpoint_scope: str = "scope",
+    model_id: str = "gemini-3.5-flash",
+    store: bool = True,
+    status: Literal[
+        "in_progress",
+        "requires_action",
+        "completed",
+        "failed",
+        "cancelled",
+        "incomplete",
+        "budget_exceeded",
+    ] = "completed",
+    visible_content: str = "parent answer",
+    steps: list[dict] | None = None,
+) -> dict[str, object]:
+    return InteractionEnvelopeV1(
+        interaction_id=interaction_id,
+        endpoint_scope=endpoint_scope,
+        model_id=model_id,
+        store=store,
+        status=status,
+        visible_content=visible_content,
+        steps=steps
+        or [
+            {
+                "type": "model_output",
+                "content": [{"type": "text", "text": visible_content}],
+            }
+        ],
+    ).model_dump(mode="json", exclude_none=False)
+
+
+def _continuation_builder(pipe, *, parent_content: str = "parent answer") -> GeminiContentBuilder:
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity().for_model("gemini-3.5-flash")
+    builder = GeminiContentBuilder(
+        messages_body=[
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": parent_content},
+            {"role": "user", "content": "next"},
+        ],
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe.pdf_mitigation_manager,
+    )
+    builder.messages_body = cast(
+        list,
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": parent_content},
+            {"role": "user", "content": "next"},
+        ],
+    )
+    builder.messages_db = cast(
+        list,
+        [
+            {"id": "u1", "role": "user", "content": "first"},
+            {
+                "id": "a1",
+                "role": "assistant",
+                "content": "parent answer",
+                "gemini_interaction": _interaction_envelope(),
+            },
+            {"id": "u2", "role": "user", "content": "next"},
+        ],
+    )
+    return builder
+
+
+def test_interaction_envelope_is_strict_and_versioned(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    builder = _continuation_builder(pipe)
+    assert builder.messages_db is not None
+    valid = builder._parse_interaction_envelope(builder.messages_db[1])
+    assert valid is not None and valid.version == 1
+
+    malformed = dict(builder.messages_db[1])
+    malformed["gemini_interaction"] = {**_interaction_envelope(), "legacy": True}
+    with pytest.raises(ContentBuildError, match="malformed or uses an unsupported version"):
+        builder._parse_interaction_envelope(malformed)  # type: ignore
+    future = dict(builder.messages_db[1])
+    future["gemini_interaction"] = {**_interaction_envelope(), "version": 2}
+    with pytest.raises(ContentBuildError, match="unsupported version"):
+        builder._parse_interaction_envelope(future)  # type: ignore
+
+
+def test_continuation_uses_only_current_input_for_same_scope_completed_parent(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    builder = _continuation_builder(pipe)
+    full_input = cast(
+        list[interaction_types.StepParam],
+        [
+            {"type": "user_input", "content": [{"type": "text", "text": "first"}]},
+            {
+                "type": "model_output",
+                "content": [{"type": "text", "text": "parent answer"}],
+            },
+            {"type": "user_input", "content": [{"type": "text", "text": "next"}]},
+        ],
+    )
+    decision = builder.select_continuation(
+        full_input, store=True, endpoint_scope="scope", model_id="gemini-3.5-flash"
+    )
+
+    assert decision.used_server_state is True
+    assert decision.previous_interaction_id == "parent-interaction"
+    assert decision.input == [full_input[-1]]
+
+
+@pytest.mark.parametrize(
+    ("change", "value"),
+    [
+        ("endpoint_scope", "foreign"),
+        ("model_id", "other-model"),
+        ("status", "failed"),
+        ("store", False),
+        ("interaction_id", None),
+    ],
+)
+def test_continuation_replays_full_ledger_for_ineligible_parent(
+    pipe_instance_fixture, change, value
+):
+    pipe, _ = pipe_instance_fixture
+    builder = _continuation_builder(pipe)
+    assert builder.messages_db is not None
+    builder.messages_db[1]["gemini_interaction"] = _interaction_envelope(**{change: value})
+    full_input = cast(
+        list[interaction_types.StepParam],
+        [
+            {"type": "user_input", "content": [{"type": "text", "text": "first"}]},
+            {"type": "user_input", "content": [{"type": "text", "text": "next"}]},
+        ],
+    )
+
+    decision = builder.select_continuation(
+        full_input, store=True, endpoint_scope="scope", model_id="gemini-3.5-flash"
+    )
+
+    assert decision.used_server_state is False
+    assert decision.previous_interaction_id is None
+    assert decision.input == full_input
+
+
+def test_continuation_edit_privacy_and_non_gemini_parent_force_replay(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    full_input = cast(
+        list[interaction_types.StepParam],
+        [
+            {"type": "user_input", "content": [{"type": "text", "text": "first"}]},
+            {"type": "user_input", "content": [{"type": "text", "text": "next"}]},
+        ],
+    )
+    edited = _continuation_builder(pipe, parent_content="edited")
+    assert edited.messages_db is not None
+    assert not edited.select_continuation(
+        full_input, store=True, endpoint_scope="scope", model_id="gemini-3.5-flash"
+    ).used_server_state
+    assert not edited.select_continuation(
+        full_input, store=False, endpoint_scope="scope", model_id="gemini-3.5-flash"
+    ).used_server_state
+    edited.messages_db[1].pop("gemini_interaction")
+    assert not edited.select_continuation(
+        full_input, store=True, endpoint_scope="scope", model_id="gemini-3.5-flash"
+    ).used_server_state
+
+
+@pytest.mark.parametrize(
+    ("admin", "user", "temp", "task", "expected"),
+    [
+        (True, None, False, False, True),
+        (True, False, False, False, False),
+        (False, True, False, False, False),
+        (True, True, True, False, False),
+        (True, True, False, True, False),
+    ],
+)
+def test_interaction_storage_policy_is_explicit_and_privacy_monotonic(
+    admin, user, temp, task, expected
+):
+    assert (
+        Pipe._resolve_store_policy(
+            admin_allows=admin,
+            user_preference=user,
+            is_temp=temp,
+            is_task=task,
+        )
+        is expected
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_reduction_persists_one_envelope_idempotently(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id = AsyncMock()
+    app = FastAPI()
+    app.state._state["gemini_model_config"] = {}
+    emitter = MagicMock(spec=EventEmitter)
+    emitter.start_time = 0.0
+    metadata = cast(
+        Metadata,
+        {
+            "chat_id": "chat",
+            "message_id": "message",
+            "canonical_model_id": "gemini-3.5-flash",
+            "gemini_endpoint_scope": "scope",
+            "gemini_effective_store": True,
+        },
+    )
+    reduction = gemini_manifold_module.InteractionReduction(
+        interaction_id="stored-id",
+        status="completed",
+        terminal=True,
+        steps=[
+            {
+                "type": "model_output",
+                "content": [{"type": "text", "text": "answer"}],
+            }
+        ],
+        original_content="answer",
+        last_event_id="cursor-final",
+    )
+
+    for _ in range(2):
+        _ = [
+            chunk
+            async for chunk in pipe._finalize_reduction(reduction, app.state, emitter, metadata)
+        ]
+
+    mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.assert_awaited_once()
+    awaited = mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.await_args
+    assert awaited is not None
+    payload = awaited.kwargs["message"]
+    assert set(payload) == {"gemini_interaction"}
+    envelope = InteractionEnvelopeV1.model_validate(payload["gemini_interaction"])
+    assert envelope.interaction_id == "stored-id"
+    assert envelope.steps == reduction.steps
+    assert envelope.visible_content == "answer"
+    assert envelope.last_event_id == "cursor-final"
+
+
+@pytest.mark.asyncio
+async def test_stateless_envelope_drops_server_id_and_temp_chat_never_persists(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id = AsyncMock()
+    app = FastAPI()
+    emitter = MagicMock(spec=EventEmitter)
+    emitter.start_time = 0.0
+    reduction = gemini_manifold_module.InteractionReduction(
+        interaction_id="ephemeral-server-id",
+        status="completed",
+        terminal=True,
+        steps=[],
+        original_content="answer",
+    )
+    stateless = cast(
+        Metadata,
+        {
+            "chat_id": "persisted-chat",
+            "message_id": "stateless-message",
+            "canonical_model_id": "gemini-3.5-flash",
+            "gemini_endpoint_scope": "scope",
+            "gemini_effective_store": False,
+        },
+    )
+    _ = [item async for item in pipe._finalize_reduction(reduction, app.state, emitter, stateless)]
+    awaited = mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.await_args
+    assert awaited is not None
+    envelope = InteractionEnvelopeV1.model_validate(awaited.kwargs["message"]["gemini_interaction"])
+    assert envelope.store is False
+    assert envelope.interaction_id is None
+
+    mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.reset_mock()
+    temporary = cast(
+        Metadata,
+        {
+            "chat_id": "local",
+            "message_id": "temporary-message",
+            "canonical_model_id": "gemini-3.5-flash",
+            "gemini_endpoint_scope": "scope",
+            "gemini_effective_store": False,
+        },
+    )
+    _ = [item async for item in pipe._finalize_reduction(reduction, app.state, emitter, temporary)]
+    mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_message_generation_guard_blocks_duplicate_create_until_stream_finishes(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    release = asyncio.Event()
+    calls = 0
+
+    async def stream():
+        await release.wait()
+        yield "data: [DONE]"
+
+    async def execute():
+        nonlocal calls
+        calls += 1
+        return stream()
+
+    key = ("chat", "message")
+    first = await pipe._execute_message_once(key, execute)
+    with pytest.raises(RuntimeError, match="already in progress or completed"):
+        await pipe._execute_message_once(key, execute)
+    release.set()
+    assert not isinstance(first, dict)
+    assert [item async for item in first] == ["data: [DONE]"]
+    assert calls == 1
+
+    second = await pipe._execute_message_once(key, execute)
+    assert not isinstance(second, dict)
+    assert [item async for item in second] == ["data: [DONE]"]
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_message_generation_guard_does_not_share_missing_or_local_keys(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+
+    async def execute():
+        return {"ok": True}
+
+    assert await pipe._execute_message_once(("", ""), execute) == {"ok": True}
+    assert await pipe._execute_message_once(("local", "message"), execute) == {"ok": True}
+    assert pipe._generation_inflight == set()
+
+
+@pytest.mark.asyncio
+async def test_message_gates_and_completion_memory_are_bounded_and_reclaimed(
+    pipe_instance_fixture, monkeypatch
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    key = ("chat", "message")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def holder() -> None:
+        async with pipe._message_guard(key):
+            entered.set()
+            await release.wait()
+
+    async def waiter() -> None:
+        await entered.wait()
+        async with pipe._message_guard(key):
+            return
+
+    holder_task = asyncio.create_task(holder())
+    await entered.wait()
+    waiter_task = asyncio.create_task(waiter())
+    await asyncio.sleep(0)
+    assert pipe._message_locks[key].users == 2
+    release.set()
+    await asyncio.gather(holder_task, waiter_task)
+    assert pipe._message_locks == {}
+
+    monkeypatch.setattr(gemini_manifold_module, "MESSAGE_COMPLETION_MAX_ENTRIES", 2)
+    pipe._remember_completed_message(("chat", "one"))
+    pipe._remember_completed_message(("chat", "two"))
+    pipe._remember_completed_message(("chat", "three"))
+    assert list(pipe._persisted_messages) == [("chat", "two"), ("chat", "three")]
+
+    calls = 0
+
+    async def execute() -> dict[str, bool]:
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="already in progress or completed"):
+        await pipe._execute_message_once(("chat", "three"), execute)
+    assert calls == 0
+    for completed_key in pipe._persisted_messages:
+        pipe._persisted_messages[completed_key] = 0.0
+    assert await pipe._execute_message_once(("chat", "three"), execute) == {"ok": True}
+    assert calls == 1
+    assert pipe._message_locks == {}
+
+
+@pytest.mark.asyncio
+async def test_pipe_shutdown_is_idempotent_closes_all_clients_and_clears_state(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    first = MagicMock()
+    first.aio.aclose = AsyncMock()
+    second = MagicMock()
+    second.aio.aclose = AsyncMock()
+    Pipe._cached_client_bindings = [
+        GenAIClientBinding(cast(genai.Client, first), _developer_identity()),
+        GenAIClientBinding(cast(genai.Client, second), _developer_identity()),
+    ]
+    pipe._remember_completed_message(("chat", "message"))
+    await pipe.file_content_cache.set("file", object())
+
+    await pipe.shutdown()
+    await pipe.shutdown()
+
+    first.aio.aclose.assert_awaited_once()
+    second.aio.aclose.assert_awaited_once()
+    assert Pipe._cached_client_bindings == []
+    assert pipe._persisted_messages == {}
+    assert pipe._message_locks == {}
+    assert await pipe.file_content_cache.get("file") is None
+
+
+@pytest.mark.asyncio
+async def test_pipe_shutdown_attempts_all_clients_and_is_final_after_failure(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    failed = MagicMock()
+    failed.aio.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
+    closed = MagicMock()
+    closed.aio.aclose = AsyncMock()
+    Pipe._cached_client_bindings = [
+        GenAIClientBinding(cast(genai.Client, failed), _developer_identity()),
+        GenAIClientBinding(cast(genai.Client, closed), _developer_identity()),
+    ]
+
+    with pytest.raises(ExceptionGroup, match="Failed to close"):
+        await pipe.shutdown()
+    await pipe.shutdown()
+
+    failed.aio.aclose.assert_awaited_once()
+    closed.aio.aclose.assert_awaited_once()
+    assert pipe._shutdown_complete is True
+
+
+@pytest.mark.asyncio
+async def test_previous_interaction_404_retries_once_as_full_root(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+
+    class NotFound(Exception):
+        status_code = 404
+
+    boundary = MagicMock()
+    boundary.create = AsyncMock(side_effect=[NotFound(), _final_interaction("replayed")])
+    full_input = cast(
+        list[interaction_types.StepParam],
+        [
+            {"type": "user_input", "content": [{"type": "text", "text": "old"}]},
+            {"type": "user_input", "content": [{"type": "text", "text": "new"}]},
+        ],
+    )
+
+    _emissions, reduction = await pipe._run_custom_function_loop(
+        interactions=cast(AsyncInteractionsBoundary, boundary),
+        common_request={
+            "model": "gemini-3.5-flash",
+            "input": [full_input[-1]],
+            "store": True,
+            "previous_interaction_id": "expired",
+        },
+        registry=_tool_registry(AsyncMock(return_value="unused")),
+        root_replay_input=full_input,
+    )
+
+    assert reduction.original_content == "replayed"
+    replay_request = boundary.create.await_args_list[1].kwargs
+    assert replay_request["input"] == full_input
+    assert "previous_interaction_id" not in replay_request
+    assert boundary.create.await_count == 2
 
 
 # region Test USER_MUST_PROVIDE_AUTH_CONFIG=True scenarios
@@ -330,17 +2555,17 @@ def test_user_must_auth_user_provides_gemini_key_uses_user_creds(pipe_instance_f
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_FREE_KEY,
-        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=USER_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
+def test_user_must_auth_user_tries_enterprise_no_user_gemini_key_errors(
     pipe_instance_fixture,
 ):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True. User tries Vertex without providing a fallback Gemini key.
-    Expected: ValueError because Vertex usage is denied and no fallback is available.
+    USER_MUST_PROVIDE_AUTH_CONFIG=True. User tries Enterprise without providing a fallback Gemini key.
+    Expected: ValueError because Enterprise usage is denied and no fallback is available.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
@@ -349,8 +2574,8 @@ def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
     pipe.valves.AUTH_WHITELIST = None
 
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,
-        VERTEX_PROJECT="user_tries_this_project",
+        USE_ENTERPRISE=True,
+        ENTERPRISE_PROJECT="user_tries_this_project",
         GEMINI_FREE_API_KEY=None,
         GEMINI_PAID_API_KEY=None,
     )
@@ -358,7 +2583,7 @@ def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    assert merged_valves.USE_VERTEX_AI is False
+    assert merged_valves.USE_ENTERPRISE is False
     assert merged_valves.GEMINI_FREE_API_KEY is None
     assert merged_valves.GEMINI_PAID_API_KEY is None
 
@@ -371,11 +2596,11 @@ def test_user_must_auth_user_tries_vertex_no_user_gemini_key_errors(
     Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
+def test_user_must_auth_user_tries_enterprise_with_user_gemini_key_falls_back(
     pipe_instance_fixture,
 ):
     """
-    USER_MUST_PROVIDE_AUTH_CONFIG=True. User tries Vertex but provides a Gemini key.
+    USER_MUST_PROVIDE_AUTH_CONFIG=True. User tries Enterprise but provides a Gemini key.
     Expected: Falls back to Gemini Developer API using the user's provided key.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
@@ -385,7 +2610,7 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
     pipe.valves.AUTH_WHITELIST = None
 
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,
+        USE_ENTERPRISE=True,
         GEMINI_FREE_API_KEY=USER_FREE_KEY,
         GEMINI_PAID_API_KEY=USER_PAID_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
@@ -394,8 +2619,8 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
         pipe.valves, user_valves_instance, USER_EMAIL_UNPRIVILEGED
     )
 
-    assert merged_valves.USE_VERTEX_AI is False
-    assert merged_valves.VERTEX_PROJECT is None
+    assert merged_valves.USE_ENTERPRISE is False
+    assert merged_valves.ENTERPRISE_PROJECT is None
     assert merged_valves.GEMINI_FREE_API_KEY == USER_FREE_KEY
     assert merged_valves.GEMINI_PAID_API_KEY == USER_PAID_KEY
 
@@ -403,7 +2628,7 @@ def test_user_must_auth_user_tries_vertex_with_user_gemini_key_falls_back(
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_FREE_KEY,  # Should prefer user's free key for fallback
-        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=USER_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -421,7 +2646,7 @@ def test_whitelist_user_no_uservalves_uses_admin_gemini_config(pipe_instance_fix
 
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.USE_VERTEX_AI = False
+    pipe.valves.USE_ENTERPRISE = False
 
     user_valves_instance = Pipe.UserValves()
     merged_valves = pipe._get_merged_valves(
@@ -432,22 +2657,22 @@ def test_whitelist_user_no_uservalves_uses_admin_gemini_config(pipe_instance_fix
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=ADMIN_FREE_KEY,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=ADMIN_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_whitelist_user_no_uservalves_uses_admin_vertex_config(pipe_instance_fixture):
+def test_whitelist_user_no_uservalves_uses_admin_enterprise_config(pipe_instance_fixture):
     """
-    Whitelisted user with no UserValves uses admin's Vertex config.
+    Whitelisted user with no UserValves uses admin's Enterprise config.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.USE_VERTEX_AI = True
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
+    pipe.valves.USE_ENTERPRISE = True
+    pipe.valves.ENTERPRISE_PROJECT = ADMIN_ENTERPRISE_PROJECT
 
     user_valves_instance = Pipe.UserValves()
     merged_valves = pipe._get_merged_valves(
@@ -457,9 +2682,12 @@ def test_whitelist_user_no_uservalves_uses_admin_vertex_config(pipe_instance_fix
     pipe._get_user_client(merged_valves, USER_EMAIL_WHITELISTED)
 
     MockedGenAIClientConstructor.assert_called_once_with(
-        vertexai=True,
-        project=ADMIN_VERTEX_PROJECT,
-        location=pipe.valves.VERTEX_LOCATION,
+        enterprise=True,
+        project=ADMIN_ENTERPRISE_PROJECT,
+        location=pipe.valves.ENTERPRISE_LOCATION,
+        http_options=gemini_types.HttpOptions(
+            api_version="v1beta1", base_url=ADMIN_GEMINI_BASE_URL
+        ),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -473,7 +2701,7 @@ def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fi
 
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = True
     pipe.valves.AUTH_WHITELIST = USER_EMAIL_WHITELISTED
-    pipe.valves.USE_VERTEX_AI = False
+    pipe.valves.USE_ENTERPRISE = False
     # Explicitly remove the admin's free key for this test case to ensure
     # we are testing the user's paid key override without ambiguity.
     pipe.valves.GEMINI_FREE_API_KEY = None
@@ -488,7 +2716,7 @@ def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fi
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_PAID_KEY,
-        http_options=gemini_types.HttpOptions(base_url=ADMIN_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=ADMIN_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -497,19 +2725,19 @@ def test_whitelist_user_provides_own_gemini_key_overrides_admin(pipe_instance_fi
 
 
 # region Test user's ability to override admin's settings
-def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
+def test_user_opts_out_of_admin_enterprise_to_user_gemini(pipe_instance_fixture):
     """
-    Admin uses Vertex. User opts-out to use their own Gemini key.
+    Admin uses Enterprise. User opts-out to use their own Gemini key.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = False
-    pipe.valves.USE_VERTEX_AI = True
-    pipe.valves.VERTEX_PROJECT = ADMIN_VERTEX_PROJECT
+    pipe.valves.USE_ENTERPRISE = True
+    pipe.valves.ENTERPRISE_PROJECT = ADMIN_ENTERPRISE_PROJECT
 
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=False,
+        USE_ENTERPRISE=False,
         GEMINI_FREE_API_KEY=USER_FREE_KEY,
         GEMINI_API_BASE_URL=USER_GEMINI_BASE_URL,
     )
@@ -519,32 +2747,37 @@ def test_user_opts_out_of_admin_vertex_to_user_gemini(pipe_instance_fixture):
 
     MockedGenAIClientConstructor.assert_called_once_with(
         api_key=USER_FREE_KEY,
-        http_options=gemini_types.HttpOptions(base_url=USER_GEMINI_BASE_URL),
+        http_options=gemini_types.HttpOptions(api_version="v1", base_url=USER_GEMINI_BASE_URL),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
 
-def test_user_opts_in_to_vertex_from_admin_gemini(pipe_instance_fixture):
+def test_user_opts_in_to_enterprise_from_admin_gemini(pipe_instance_fixture):
     """
-    Admin uses Gemini. User opts-in to use their own Vertex project.
+    Admin uses Gemini. User opts-in to use their own Enterprise project.
     """
     pipe, MockedGenAIClientConstructor = pipe_instance_fixture
     Pipe._get_or_create_genai_client.cache_clear()
 
     pipe.valves.USER_MUST_PROVIDE_AUTH_CONFIG = False
-    pipe.valves.USE_VERTEX_AI = False
+    pipe.valves.USE_ENTERPRISE = False
 
     user_valves_instance = Pipe.UserValves(
-        USE_VERTEX_AI=True,
-        VERTEX_PROJECT=USER_VERTEX_PROJECT,
-        VERTEX_LOCATION=USER_VERTEX_LOCATION,
+        USE_ENTERPRISE=True,
+        ENTERPRISE_PROJECT=USER_ENTERPRISE_PROJECT,
+        ENTERPRISE_LOCATION=USER_ENTERPRISE_LOCATION,
     )
     merged_valves = pipe._get_merged_valves(pipe.valves, user_valves_instance, USER_EMAIL_REGULAR)
 
     pipe._get_user_client(merged_valves, USER_EMAIL_REGULAR)
 
     MockedGenAIClientConstructor.assert_called_once_with(
-        vertexai=True, project=USER_VERTEX_PROJECT, location=USER_VERTEX_LOCATION
+        enterprise=True,
+        project=USER_ENTERPRISE_PROJECT,
+        location=USER_ENTERPRISE_LOCATION,
+        http_options=gemini_types.HttpOptions(
+            api_version="v1beta1", base_url=ADMIN_GEMINI_BASE_URL
+        ),
     )
     Pipe._get_or_create_genai_client.cache_clear()
 
@@ -593,7 +2826,8 @@ async def test_paid_api_toggle_selects_correct_key(
     # Mock the request app state which is now required early in pipe()
     mock_request = MagicMock()
     mock_request.app.state._state = {
-        "gemini_model_config": {model_id: {"pricing": {"free_tier": True}}}
+        "gemini_model_config": {model_id: {"pricing": {"free_tier": True}}},
+        "gemini_model_catalog_schema_version": 1,
     }
 
     def mock_toggle_side_effect(filter_id, metadata):
@@ -624,12 +2858,25 @@ async def test_paid_api_toggle_selects_correct_key(
 
         # Update: Pipe now adds 'merged_custom_params' to metadata before checking toggles.
         # We check that the toggle was called with the model ID present.
-        assert mock_toggle_status.called
-        args, _ = mock_toggle_status.call_args
+        paid_toggle_calls = [
+            toggle_call
+            for toggle_call in mock_toggle_status.call_args_list
+            if toggle_call.args and toggle_call.args[0] == "gemini_paid_api"
+        ]
+        assert paid_toggle_calls
+        args, _ = paid_toggle_calls[-1]
         assert args[0] == "gemini_paid_api"
         assert args[1]["model"]["id"] == model_id
 
-        # Assert the genai Client was initialized with the correct key
+        # The partial pipe harness intentionally stops before execution. Exercise
+        # the selected endpoint configuration directly.
+        if expected_api_key == ADMIN_PAID_KEY:
+            pipe.valves.GEMINI_FREE_API_KEY = None
+        else:
+            pipe.valves.GEMINI_PAID_API_KEY = None
+        pipe._get_user_client(pipe.valves, USER_EMAIL_REGULAR)
+
+        # Assert the genai Client was initialized with the routed key.
         MockedGenAIClientConstructor.assert_called()
         # Find the call that matches our expected key
         api_keys_used = [
@@ -649,17 +2896,9 @@ async def test_paid_api_toggle_selects_correct_key(
 
 
 # region Test FilesAPIManager
-def _client_error(code: int, status: str, message: str) -> genai_errors.ClientError:
-    return genai_errors.ClientError(
-        code,
-        {"error": {"code": code, "message": message, "status": status}},
-    )
-
-
 def _mock_files_client():
     client = MagicMock()
-    client._api_client.api_key = "test-api-key"
-    client.vertexai = False
+
     client.aio.files.get = AsyncMock()
     client.aio.files.upload = AsyncMock()
     return client
@@ -684,6 +2923,7 @@ async def test_files_api_manager_recovers_when_byte_upload_already_exists():
     event_emitter = MagicMock(spec=EventEmitter)
     manager = FilesAPIManager(
         client=client,
+        endpoint_identity=_developer_identity(),
         file_cache=SimpleMemoryCache(serializer=NullSerializer()),
         id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
         event_emitter=event_emitter,
@@ -722,6 +2962,7 @@ async def test_files_api_manager_recovers_when_path_upload_already_exists(tmp_pa
     event_emitter = MagicMock(spec=EventEmitter)
     manager = FilesAPIManager(
         client=client,
+        endpoint_identity=_developer_identity(),
         file_cache=SimpleMemoryCache(serializer=NullSerializer()),
         id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
         event_emitter=event_emitter,
@@ -755,6 +2996,7 @@ async def test_files_api_manager_retries_upload_conflict_recovery_get():
     event_emitter = MagicMock(spec=EventEmitter)
     manager = FilesAPIManager(
         client=client,
+        endpoint_identity=_developer_identity(),
         file_cache=SimpleMemoryCache(serializer=NullSerializer()),
         id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
         event_emitter=event_emitter,
@@ -771,6 +3013,98 @@ async def test_files_api_manager_retries_upload_conflict_recovery_get():
     assert result is existing_file
     assert client.aio.files.get.await_count == 2
     event_emitter.emit_toast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_files_cache_never_reuses_uri_across_endpoint_scope():
+    shared_cache = SimpleMemoryCache(serializer=NullSerializer())
+    shared_id_cache = SimpleMemoryCache(serializer=NullSerializer())
+    payload = b"same bytes across services"
+    developer = FilesAPIManager(
+        client=MagicMock(),
+        endpoint_identity=_developer_identity(),
+        file_cache=shared_cache,
+        id_hash_cache=shared_id_cache,
+        event_emitter=MagicMock(spec=EventEmitter),
+    )
+    enterprise_client = MagicMock()
+    enterprise = FilesAPIManager(
+        client=enterprise_client,
+        endpoint_identity=EndpointIdentity(
+            service="enterprise",
+            credential_fingerprint="project-credential",
+            api_version="v1beta1",
+            project="project",
+            location="global",
+        ),
+        file_cache=shared_cache,
+        id_hash_cache=shared_id_cache,
+        event_emitter=MagicMock(spec=EventEmitter),
+    )
+    content_hash = await developer._get_content_hash(payload, "owui-id")
+    developer_file = gemini_types.File(
+        name="files/developer",
+        uri="https://files.example/developer",
+        mime_type="image/png",
+        state=gemini_types.FileState.ACTIVE,
+    )
+    await shared_cache.set(developer._get_file_cache_key(content_hash), developer_file)
+    enterprise_file = gemini_types.File(
+        name="files/enterprise",
+        uri="https://files.example/enterprise",
+        mime_type="image/png",
+        state=gemini_types.FileState.ACTIVE,
+    )
+    enterprise_client.aio.files.get = AsyncMock(return_value=enterprise_file)
+
+    result = await enterprise.get_or_upload_file(
+        payload,
+        "image/png",
+        owui_file_id="owui-id",
+    )
+
+    assert developer._get_file_cache_key(content_hash) != enterprise._get_file_cache_key(
+        content_hash
+    )
+    assert result.uri == enterprise_file.uri
+    enterprise_client.aio.files.get.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_files_public_state_policy_processing_failed_and_expired():
+    client = MagicMock()
+    emitter = MagicMock(spec=EventEmitter)
+    manager = FilesAPIManager(
+        client=client,
+        endpoint_identity=_developer_identity(),
+        file_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        id_hash_cache=SimpleMemoryCache(serializer=NullSerializer()),
+        event_emitter=emitter,
+    )
+    processing = gemini_types.File(name="files/stateful", state=gemini_types.FileState.PROCESSING)
+    active = gemini_types.File(
+        name="files/stateful",
+        uri="https://files.example/active",
+        state=gemini_types.FileState.ACTIVE,
+        expiration_time=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    client.aio.files.get = AsyncMock(side_effect=[processing, active])
+
+    with patch("plugins.pipes.gemini_manifold.asyncio.sleep", new_callable=AsyncMock):
+        assert await manager._poll_for_active_state("files/stateful", "owui-id") is active
+
+    failed = gemini_types.File(
+        name="files/failed",
+        state=gemini_types.FileState.FAILED,
+        error=gemini_types.FileStatus(code=13, message="decode failed"),
+    )
+    client.aio.files.get = AsyncMock(return_value=failed)
+    with pytest.raises(FilesAPIError, match="decode failed"):
+        await manager._poll_for_active_state("files/failed", "owui-id")
+    emitter.emit_toast.assert_called_with(
+        "Google could not process 'owui-id'. Reason: decode failed", "error"
+    )
+    assert manager._calculate_ttl(datetime.now(UTC) - timedelta(seconds=1)) == 0
 
 
 # endregion Test FilesAPIManager
@@ -824,9 +3158,7 @@ async def test_get_file_data_resolves_open_webui_storage_path(tmp_path):
 
 @pytest.mark.asyncio
 async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
-    """
-    Tests conversion of a simple user text message into genai.types.Content.
-    """
+    """A simple user message becomes one canonical user-input step."""
     # Reset mocks for test isolation
     mock_chats_module.reset_mock()
     mock_misc_module.reset_mock()
@@ -841,7 +3173,6 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         "name": "Test User",
         "role": "user",
     }
-    # Create a mock for the new dependency
     mock_files_api_manager = MagicMock()
 
     # The builder fetches chat history, mock it to return None for this test
@@ -855,29 +3186,161 @@ async def test_builder_build_contents_simple_user_text(pipe_instance_fixture):
         user_data=mock_user_data,  # type: ignore
         event_emitter=mock_event_emitter,
         valves=pipe_instance.valves,
-        files_api_manager=mock_files_api_manager,  # Pass the new mock
+        files_api_manager=mock_files_api_manager,
         pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
     )
 
-    with patch("plugins.pipes.gemini_manifold.types.Part.from_text") as mock_part_from_text:
-        # The mock Part object needs a 'text' attribute for the new check in `build_contents`.
-        mock_text_part = MagicMock(spec=gemini_types.Part)
-        mock_text_part.text = "Hello!"
-        mock_part_from_text.return_value = mock_text_part
+    steps = await builder.build_contents()
 
-        contents = await builder.build_contents()
+    mock_misc_module.pop_system_message.assert_called_once_with(messages_body)
+    assert steps == [{"type": "user_input", "content": [{"type": "text", "text": "Hello!"}]}]
+    mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
 
-        mock_misc_module.pop_system_message.assert_called_once_with(messages_body)
-        mock_part_from_text.assert_called_once_with(text="Hello!")
-        assert len(contents) == 1
-        content_item = contents[0]
-        assert content_item.role == "user"
-        assert content_item.parts is not None
-        assert len(content_item.parts) == 1
-        assert content_item.parts[0] == mock_text_part
-        # A warning toast is emitted when messages_db is not found
-        # The call uses positional arguments (msg, toastType), so we match that here.
-        mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
+
+@pytest.mark.asyncio
+async def test_builder_separates_system_instruction_and_preserves_multi_turn_steps(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    messages = [
+        {"role": "system", "content": "Be exact."},
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "Answer"},
+        {"role": "user", "content": "Follow-up"},
+    ]
+    remaining = messages[1:]
+    mock_misc_module.pop_system_message.return_value = (messages[0], remaining)
+    mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = None
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=messages,  # type: ignore
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+
+    steps = await builder.build_contents()
+
+    assert builder.system_prompt == "Be exact."
+    assert steps == [
+        {"type": "user_input", "content": [{"type": "text", "text": "Question"}]},
+        {"type": "model_output", "content": [{"type": "text", "text": "Answer"}]},
+        {"type": "user_input", "content": [{"type": "text", "text": "Follow-up"}]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_builder_temp_chat_image_payload_uses_explicit_data(pipe_instance_fixture):
+    pipe_instance, _ = pipe_instance_fixture
+    image_bytes = b"temporary image"
+    image_url = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe"},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }
+    ]
+    mock_misc_module.pop_system_message.return_value = (None, messages)
+    files_manager = AsyncMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=messages,  # type: ignore
+        metadata_body={"chat_id": "local-temp-chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+
+    steps = await builder.build_contents()
+
+    assert steps == [
+        {
+            "type": "user_input",
+            "content": [
+                {"type": "text", "text": "Describe"},
+                {
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                },
+            ],
+        }
+    ]
+    files_manager.get_or_upload_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_builder_history_follows_active_parent_branch_and_excludes_sibling(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    messages = [
+        {"role": "user", "content": "root"},
+        {"role": "assistant", "content": "edited active answer"},
+        {"role": "user", "content": "active follow-up"},
+    ]
+    mock_misc_module.pop_system_message.return_value = (None, messages)
+    chat = MagicMock()
+    chat.chat = {
+        "history": {
+            "currentId": "active-user",
+            "messages": {
+                "root": {"id": "root", "parentId": None, "role": "user", "content": "root"},
+                "active-assistant": {
+                    "id": "active-assistant",
+                    "parentId": "root",
+                    "role": "assistant",
+                    "content": "edited active answer",
+                },
+                "active-user": {
+                    "id": "active-user",
+                    "parentId": "active-assistant",
+                    "role": "user",
+                    "content": "active follow-up",
+                },
+                "sibling": {
+                    "id": "sibling",
+                    "parentId": "root",
+                    "role": "assistant",
+                    "content": "wrong branch",
+                },
+            },
+        }
+    }
+    mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = chat
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=messages,  # type: ignore
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+
+    steps = await builder.build_contents()
+
+    assert [message["id"] for message in builder.messages_db or []] == [
+        "root",
+        "active-assistant",
+        "active-user",
+    ]
+    assert steps[1] == {
+        "type": "model_output",
+        "content": [{"type": "text", "text": "edited active answer"}],
+    }
+    assert "wrong branch" not in str(steps)
 
 
 @pytest.mark.asyncio
@@ -885,16 +3348,15 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
     pipe_instance_fixture,
 ):
     """
-    Tests that a user message with text and a YouTube URL is correctly
-    parsed into interleaved text and file_data parts.
+    Tests that text around a YouTube URL becomes ordered Interactions content.
     """
     # Reset mocks for test isolation
     mock_chats_module.reset_mock()
     mock_misc_module.reset_mock()
 
     pipe_instance, _ = pipe_instance_fixture
-    # Ensure we test the non-Vertex AI path for file_data creation
-    pipe_instance.valves.USE_VERTEX_AI = False
+    # Exercise canonical external-video content on the Developer endpoint.
+    pipe_instance.valves.USE_ENTERPRISE = False
 
     # Arrange: Inputs
     youtube_url = "https://www.youtube.com/watch?v=kpwNjdEPz7E"
@@ -912,7 +3374,6 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         "name": "Test User",
         "role": "user",
     }
-    # Create a mock for the new dependency
     mock_files_api_manager = MagicMock()
 
     # Mock DB and system prompt extraction
@@ -929,61 +3390,19 @@ async def test_builder_build_contents_youtube_link_mixed_with_text(
         pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
     )
 
-    # Mock part objects need 'text' attribute for new checks
-    mock_text_part_before_obj = MagicMock(spec=gemini_types.Part, name="TextPartBefore")
-    mock_text_part_before_obj.text = text_before_stripped
-    mock_text_part_after_obj = MagicMock(spec=gemini_types.Part, name="TextPartAfter")
-    mock_text_part_after_obj.text = text_after_stripped
+    steps = await builder.build_contents()
 
-    with patch("plugins.pipes.gemini_manifold.types.Part.from_text") as mock_part_from_text:
-
-        def from_text_side_effect(text):
-            if text == text_before_stripped:
-                return mock_text_part_before_obj
-            if text == text_after_stripped:
-                return mock_text_part_after_obj
-            generic_mock = MagicMock(spec=gemini_types.Part, name=f"GenericTextPart_{text[:10]}")
-            generic_mock.text = text
-            return generic_mock
-
-        mock_part_from_text.side_effect = from_text_side_effect
-
-        # Act
-        contents = await builder.build_contents()
-
-        # Assert
-        assert len(contents) == 1
-        content_item = contents[0]
-        assert content_item.role == "user"
-        assert content_item.parts is not None
-        assert len(content_item.parts) == 3
-
-        # Assertions for correct part segmentation and ordering
-        assert mock_part_from_text.call_count == 2
-        expected_calls = [
-            call(text=text_before_stripped),
-            call(text=text_after_stripped),
-        ]
-        mock_part_from_text.assert_has_calls(expected_calls, any_order=True)
-
-        # Part 1: Text before the YouTube link
-        assert content_item.parts[0] is mock_text_part_before_obj
-
-        # Part 2: The YouTube link
-        youtube_part = content_item.parts[1]
-        assert isinstance(youtube_part, gemini_types.Part)
-        assert hasattr(youtube_part, "file_data")
-        assert youtube_part.file_data is not None
-        assert youtube_part.file_data.file_uri == youtube_url
-        # A real file part should have a falsy .text attribute
-        assert not youtube_part.text
-
-        # Part 3: Text after the YouTube link
-        assert content_item.parts[2] is mock_text_part_after_obj
-
-        # A warning toast is emitted when messages_db is not found
-        # The call uses positional arguments (msg, toastType), so we match that here.
-        mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
+    assert steps == [
+        {
+            "type": "user_input",
+            "content": [
+                {"type": "text", "text": text_before_stripped},
+                {"type": "video", "uri": youtube_url, "mime_type": "video/mp4"},
+                {"type": "text", "text": text_after_stripped},
+            ],
+        }
+    ]
+    mock_event_emitter.emit_toast.assert_called_once_with(ANY, "warning")
 
 
 @pytest.mark.asyncio
@@ -1024,7 +3443,13 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
                     "parentId": None,
                     "role": "user",
                     "content": user_text_content,
-                    "files": [{"id": pdf_file_id, "type": "file"}],
+                    "files": [
+                        {
+                            "id": pdf_file_id,
+                            "type": "file",
+                            "content_type": pdf_mime_type,
+                        }
+                    ],
                 },
             },
         }
@@ -1034,10 +3459,9 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
     mock_chats_module.Chats.get_chat_by_id_and_user_id.return_value = mock_chat_from_db
     mock_misc_module.pop_system_message.return_value = (None, messages_body)
 
-    # Create a mock for the new dependency and its methods
     pipe_instance.valves.PDF_LIMIT_MITIGATION = False
     mock_files_api_manager = AsyncMock()
-    mock_files_api_manager.client.vertexai = False
+    mock_files_api_manager.endpoint_identity = _developer_identity()
     mock_gemini_file = MagicMock()
     mock_gemini_file.uri = "gs://fake-bucket/fake-file.pdf"
     mock_gemini_file.mime_type = pdf_mime_type
@@ -1056,11 +3480,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
     )
 
-    # REMOVED: No longer need to create a mock Part object for text.
-    # mock_text_part_obj = MagicMock(spec=gemini_types.Part, name="TextPart")
-
-    # Patch _get_file_source to be async.
-    # REMOVED: The patch for `types.Part.from_text` is removed to let the real method run.
+    # Resolve the OWUI attachment without touching host storage.
     with patch(
         "plugins.pipes.gemini_manifold.GeminiContentBuilder._get_file_source",
         new_callable=AsyncMock,
@@ -1089,23 +3509,19 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
         # This assertion is no longer needed as we are not mocking `from_text`
         # mock_part_from_text.assert_called_once_with(text=user_text_content)
 
-        assert len(contents) == 1
-        user_content_obj = contents[0]
-        assert user_content_obj.role == "user"
-        assert user_content_obj.parts is not None
-        assert len(user_content_obj.parts) == 2
-
-        # Assert the PDF part was created correctly
-        pdf_part = user_content_obj.parts[0]
-        assert isinstance(pdf_part, gemini_types.Part)
-        assert pdf_part.file_data is not None
-        assert pdf_part.file_data.file_uri == mock_gemini_file.uri
-        assert pdf_part.file_data.mime_type == mock_gemini_file.mime_type
-
-        # CHANGED: Assert the text part by inspecting its properties, not its identity
-        text_part = user_content_obj.parts[1]
-        assert isinstance(text_part, gemini_types.Part)
-        assert text_part.text == user_text_content
+        assert contents == [
+            {
+                "type": "user_input",
+                "content": [
+                    {
+                        "type": "document",
+                        "uri": mock_gemini_file.uri,
+                        "mime_type": pdf_mime_type,
+                    },
+                    {"type": "text", "text": user_text_content},
+                ],
+            }
+        ]
 
         mock_event_emitter.assert_not_called()
 
@@ -1169,7 +3585,7 @@ async def test_builder_build_contents_with_multiple_pdf_attachments(
     mock_misc_module.pop_system_message.return_value = (None, messages_body)
 
     mock_files_api_manager = AsyncMock()
-    mock_files_api_manager.client.vertexai = False
+    mock_files_api_manager.endpoint_identity = _developer_identity()
     first_gemini_file = MagicMock()
     first_gemini_file.uri = "gs://fake-bucket/first.pdf"
     first_gemini_file.mime_type = pdf_mime_type
@@ -1212,18 +3628,24 @@ async def test_builder_build_contents_with_multiple_pdf_attachments(
     ) as mock_get_file_source:
         contents = await builder.build_contents()
 
-    assert len(contents) == 1
-    user_content_obj = contents[0]
-    assert user_content_obj.parts is not None
-    assert len(user_content_obj.parts) == 3
-    assert all(part.file_data is not None for part in user_content_obj.parts[:2])
-    assert [
-        part.file_data.file_uri for part in user_content_obj.parts[:2] if part.file_data is not None
-    ] == [
-        first_gemini_file.uri,
-        second_gemini_file.uri,
+    assert contents == [
+        {
+            "type": "user_input",
+            "content": [
+                {
+                    "type": "document",
+                    "uri": first_gemini_file.uri,
+                    "mime_type": pdf_mime_type,
+                },
+                {
+                    "type": "document",
+                    "uri": second_gemini_file.uri,
+                    "mime_type": pdf_mime_type,
+                },
+                {"type": "text", "text": user_text_content},
+            ],
+        }
     ]
-    assert user_content_obj.parts[2].text == user_text_content
     assert mock_get_file_source.await_args_list == [
         call(first_pdf_id),
         call(second_pdf_id),
@@ -1236,7 +3658,9 @@ async def test_builder_build_contents_with_multiple_pdf_attachments(
 
 
 @pytest.mark.asyncio
-async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_fixture, tmp_path):
+async def test_create_interaction_content_optimizes_pdf_with_synthetic_id(
+    pipe_instance_fixture, tmp_path
+):
     """
     Tests that a compressed single-PDF output is uploaded under a synthetic ID,
     avoiding stale original-file ID hash mappings.
@@ -1270,7 +3694,7 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
         )
     )
     mock_files_api_manager = AsyncMock()
-    mock_files_api_manager.client.vertexai = False
+    mock_files_api_manager.endpoint_identity = _developer_identity()
     mock_gemini_file = MagicMock()
     mock_gemini_file.uri = "gs://fake-bucket/optimized.pdf"
     mock_gemini_file.mime_type = pdf_mime_type
@@ -1286,7 +3710,7 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
         pdf_mitigation_manager=mock_pdf_mitigation_manager,
     )
 
-    parts = await builder._create_genai_parts_from_file_data(
+    parts = await builder._create_interaction_contents_from_file_data(
         file_bytes=original_pdf_bytes,
         mime_type=pdf_mime_type,
         owui_file_id=pdf_file_id,
@@ -1295,7 +3719,11 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
     )
 
     assert len(parts) == 1
-    assert parts[0].file_data is not None
+    assert parts[0] == {
+        "type": "document",
+        "uri": mock_gemini_file.uri,
+        "mime_type": pdf_mime_type,
+    }
     mock_pdf_mitigation_manager.prepare.assert_awaited_once_with(
         file_bytes=original_pdf_bytes,
         file_path=None,
@@ -1314,7 +3742,7 @@ async def test_create_genai_parts_optimizes_pdf_with_synthetic_id(pipe_instance_
 
 
 @pytest.mark.asyncio
-async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp_path):
+async def test_create_interaction_content_splits_pdf_in_order(pipe_instance_fixture, tmp_path):
     """
     Tests that split PDFs produce an instruction text part followed by ordered
     file parts uploaded with distinct synthetic IDs.
@@ -1352,7 +3780,7 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
         )
     )
     mock_files_api_manager = AsyncMock()
-    mock_files_api_manager.client.vertexai = False
+    mock_files_api_manager.endpoint_identity = _developer_identity()
     mock_gemini_files = []
     for i in range(len(chunks)):
         mock_file = MagicMock()
@@ -1371,7 +3799,7 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
         pdf_mitigation_manager=mock_pdf_mitigation_manager,
     )
 
-    parts = await builder._create_genai_parts_from_file_data(
+    parts = await builder._create_interaction_contents_from_file_data(
         file_bytes=original_pdf_bytes,
         mime_type=pdf_mime_type,
         owui_file_id=pdf_file_id,
@@ -1384,13 +3812,15 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
         file_bytes=original_pdf_bytes,
         file_path=None,
     )
-    assert parts[0].text is not None
-    assert "very-large.pdf" in parts[0].text
-    assert "3 consecutive attachments" in parts[0].text
-    assert "PDF 'very-large.pdf', attachment 1: original document pages 1-46" in parts[0].text
-    assert "PDF 'very-large.pdf', attachment 2: original document pages 47-92" in parts[0].text
-    assert "do not restart page numbering at 1" in parts[0].text
-    assert [part.file_data.file_uri for part in parts[1:]] == [  # type: ignore[union-attr]
+    instruction = parts[0]
+    assert instruction["type"] == "text"
+    instruction_text = instruction["text"]
+    assert "very-large.pdf" in instruction_text
+    assert "3 consecutive attachments" in instruction_text
+    assert "PDF 'very-large.pdf', attachment 1: original document pages 1-46" in instruction_text
+    assert "PDF 'very-large.pdf', attachment 2: original document pages 47-92" in instruction_text
+    assert "do not restart page numbering at 1" in instruction_text
+    assert [dict(part).get("uri") for part in parts[1:]] == [
         "gs://fake-bucket/chunk-1.pdf",
         "gs://fake-bucket/chunk-2.pdf",
         "gs://fake-bucket/chunk-3.pdf",
@@ -1408,6 +3838,253 @@ async def test_create_genai_parts_splits_pdf_in_order(pipe_instance_fixture, tmp
         done=True,
         indent_level=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_builder_force_raw_media_is_explicit_base64(pipe_instance_fixture):
+    pipe_instance, _ = pipe_instance_fixture
+    files_manager = AsyncMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=[],
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+    payload = b"\x89PNG\r\nexplicit bytes"
+
+    content = await builder._create_interaction_content_from_file_data(
+        file_bytes=payload,
+        mime_type="image/png",
+        owui_file_id="image-id",
+        status_queue=asyncio.Queue(),
+        force_raw=True,
+    )
+
+    assert content == {
+        "type": "image",
+        "mime_type": "image/png",
+        "data": base64.b64encode(payload).decode("ascii"),
+    }
+    files_manager.get_or_upload_file.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "content_type"),
+    [
+        ("image/png", "image"),
+        ("audio/wav", "audio"),
+        ("video/mp4", "video"),
+        ("application/pdf", "document"),
+    ],
+)
+def test_interaction_media_factory_supports_data_and_uri(
+    mime_type: str,
+    content_type: str,
+) -> None:
+    encoded = base64.b64encode(b"media").decode("ascii")
+
+    assert GeminiContentBuilder._media_content(mime_type=mime_type, data=encoded) == {
+        "type": content_type,
+        "mime_type": mime_type,
+        "data": encoded,
+    }
+    assert GeminiContentBuilder._media_content(
+        mime_type=mime_type, uri="https://files.example/media"
+    ) == {
+        "type": content_type,
+        "mime_type": mime_type,
+        "uri": "https://files.example/media",
+    }
+
+
+@pytest.mark.asyncio
+async def test_builder_rehydrates_generated_local_image_for_exact_replay(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=[],
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+    image_bytes = b"generated image bytes"
+    with patch.object(
+        builder,
+        "_get_file_data",
+        new_callable=AsyncMock,
+        return_value=(image_bytes, "image/png"),
+    ) as get_file_data:
+        replay = await builder._rehydrate_assistant_steps(
+            [
+                {
+                    "type": "model_output",
+                    "content": [
+                        {
+                            "type": "image",
+                            "mime_type": "image/png",
+                            "uri": "/api/v1/files/generated-image/content",
+                        }
+                    ],
+                }
+            ],
+            files_manager.endpoint_identity.scope,
+        )
+
+    assert replay == [
+        {
+            "type": "model_output",
+            "content": [
+                {
+                    "type": "image",
+                    "mime_type": "image/png",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                }
+            ],
+        }
+    ]
+    get_file_data.assert_awaited_once_with("generated-image")
+
+
+def test_builder_rejects_request_over_100_mib_preflight(pipe_instance_fixture):
+    pipe_instance, _ = pipe_instance_fixture
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=[],
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+    oversized_text = "x" * (100 * 1024 * 1024)
+
+    with pytest.raises(ContentBuildError, match="exceeding the 100 MiB limit"):
+        builder._validate_request_size(
+            [
+                {
+                    "type": "user_input",
+                    "content": [{"type": "text", "text": oversized_text}],
+                }
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_builder_exact_replay_preserves_signature_and_edit_drops_ledger(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=[],
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+    signature = base64.b64encode(b"opaque signed thought").decode("ascii")
+    stored_steps: list[dict[str, object]] = [
+        {"type": "thought", "signature": signature},
+        {"type": "model_output", "content": [{"type": "text", "text": "answer"}]},
+    ]
+    message_db = {
+        "gemini_interaction": {
+            "version": 1,
+            "interaction_id": "stored",
+            "endpoint_scope": files_manager.endpoint_identity.scope,
+            "model_id": "gemini-test",
+            "store": True,
+            "status": "completed",
+            "steps": stored_steps,
+            "visible_content": "answer",
+            "usage": {},
+            "last_event_id": None,
+            "grounding": {
+                "protocol_version": 1,
+                "visible_content_sha256": "",
+                "grounded_text_sha256": "",
+            },
+        }
+    }
+
+    exact = await builder._process_assistant_message(
+        0,
+        {"role": "assistant", "content": "answer"},  # type: ignore
+        message_db,  # type: ignore
+        None,
+        asyncio.Queue(),
+    )
+    edited = await builder._process_assistant_message(
+        0,
+        {"role": "assistant", "content": "edited answer"},  # type: ignore
+        message_db,  # type: ignore
+        None,
+        asyncio.Queue(),
+    )
+
+    assert exact == stored_steps
+    assert edited == [
+        {
+            "type": "model_output",
+            "content": [{"type": "text", "text": "edited answer"}],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_builder_replay_rejects_unknown_and_foreign_endpoint_scope(
+    pipe_instance_fixture,
+):
+    pipe_instance, _ = pipe_instance_fixture
+    files_manager = MagicMock()
+    files_manager.endpoint_identity = _developer_identity()
+    builder = GeminiContentBuilder(
+        messages_body=[],
+        metadata_body={"chat_id": "chat"},  # type: ignore
+        user_data={"id": "user", "email": "user@example.com"},  # type: ignore
+        event_emitter=MagicMock(spec=EventEmitter),
+        valves=pipe_instance.valves,
+        files_api_manager=files_manager,
+        pdf_mitigation_manager=pipe_instance.pdf_mitigation_manager,
+    )
+
+    with pytest.raises(ValueError, match="unknown step or content"):
+        await builder._rehydrate_assistant_steps(
+            [{"type": "future_step", "payload": "unsafe"}],
+            files_manager.endpoint_identity.scope,
+        )
+
+    with pytest.raises(ValueError, match="different endpoint identity"):
+        await builder._rehydrate_assistant_steps(
+            [
+                {
+                    "type": "model_output",
+                    "content": [
+                        {
+                            "type": "document",
+                            "mime_type": "application/pdf",
+                            "uri": "https://files.example/foreign.pdf",
+                        }
+                    ],
+                }
+            ],
+            "developer:other-credential:v1:model",
+        )
 
 
 @pytest.mark.asyncio
@@ -1549,7 +4226,7 @@ async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
     pipe_instance, _ = pipe_instance_fixture
     mock_event_emitter = MagicMock(spec=EventEmitter)
     mock_files_api_manager = AsyncMock()
-    mock_files_api_manager.client.vertexai = False
+    mock_files_api_manager.endpoint_identity = _developer_identity()
 
     builder = GeminiContentBuilder(
         messages_body=[{"role": "user", "content": "hello"}],  # type: ignore
@@ -1574,6 +4251,676 @@ async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
 
 
 # endregion Test GeminiContentBuilder
+
+
+def _installed_model_catalog() -> dict[str, dict[str, object]]:
+    catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+    payload = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    return cast(dict[str, dict[str, object]], payload["models"])
+
+
+def _public_pipe_harness(
+    pipe: Pipe, scripted: FakeInteractions
+) -> tuple[Body, dict[str, object], MagicMock, GenAIClientBinding]:
+    model_id = "gemini-2.5-flash"
+    app = FastAPI()
+    app.state._state.update(
+        {
+            "gemini_model_config": _installed_model_catalog(),
+            "gemini_model_catalog_schema_version": 1,
+        }
+    )
+    request = MagicMock()
+    request.app = app
+    body = cast(
+        Body,
+        {
+            "model": f"gemini_manifold_google_genai.{model_id}",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+    metadata = {
+        "chat_id": "local-harness",
+        "message_id": "message-harness",
+        "features": {"gemini_manifold_companion_version": "3.0.0"},
+    }
+    fake_client = FakeGenAIClient(scripted)
+    binding = GenAIClientBinding(
+        client=cast(genai.Client, fake_client),
+        identity=_developer_identity(),
+    )
+    pipe.valves.GEMINI_FREE_API_KEY = "sanitized-test-key"
+    pipe.valves.GEMINI_PAID_API_KEY = None
+    return body, metadata, request, binding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
+async def test_public_pipe_reaches_strict_developer_interactions_only(
+    pipe_instance_fixture, stream: bool
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    fake_stream = FakeInteractionStream(completed_stream())
+    scripted = FakeInteractions([fake_stream if stream else completed_interaction()])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = stream
+
+    def split_system_message(messages):
+        if messages and messages[0].get("role") == "system":
+            return messages[0], messages[1:]
+        return None, messages
+
+    mock_misc_module.pop_system_message.side_effect = split_system_message
+    toggles_off = AsyncMock(return_value=(False, False))
+    with (
+        patch.object(pipe, "_get_toggleable_feature_status", toggles_off),
+        patch.object(pipe, "_get_user_client", return_value=binding) as get_client,
+    ):
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    if stream:
+        assert not isinstance(result, dict)
+        chunks = [chunk async for chunk in result]
+        assert "Hello from Gemini." in str(chunks)
+        assert chunks[-1] == "data: [DONE]"
+        assert fake_stream.enter_count == 1
+        assert fake_stream.close_count == 1
+    else:
+        assert isinstance(result, dict)
+        assert result["choices"][0]["message"]["content"] == "Hello from Gemini."
+
+    get_client.assert_called_once()
+    scripted.assert_exhausted()
+    assert len(scripted.requests) == 1
+    request_model = scripted.requests[0]
+    assert request_model.model == "gemini-2.5-flash"
+    assert request_model.stream is stream
+    assert request_model.store is False
+    assert request_model.previous_interaction_id is None
+    assert isinstance(request_model.input, list)
+    assert isinstance(request_model.input[0], interaction_types.UserInputStep)
+    assert request_model.input[0].type == "user_input"
+    assert not hasattr(binding.client, "models")
+
+
+@pytest.mark.asyncio
+async def test_public_pipe_persists_grounded_search_and_companion_renders_it(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    annotation = interaction_types.URLCitation(
+        type="url_citation",
+        url="https://example.test/source",
+        title="Example source",
+        start_index=0,
+        end_index=6,
+    )
+    interaction = interaction_types.Interaction(
+        id="grounded-interaction",
+        model="gemini-2.5-flash",
+        status="completed",
+        steps=[
+            interaction_types.GoogleSearchCallStep(
+                type="google_search_call",
+                id="search-call",
+                arguments=interaction_types.GoogleSearchCallArguments(
+                    queries=["sanitized public query"]
+                ),
+                search_type="web_search",
+                signature="c2ln",
+            ),
+            interaction_types.GoogleSearchResultStep(
+                type="google_search_result",
+                call_id="search-call",
+                result=[
+                    interaction_types.GoogleSearchResult(
+                        search_suggestions="sanitized refined query"
+                    )
+                ],
+                signature="c2ln",
+            ),
+            interaction_types.ModelOutputStep(
+                type="model_output",
+                content=[
+                    interaction_types.TextContent(
+                        type="text", text="Source", annotations=[annotation]
+                    )
+                ],
+            ),
+        ],
+        usage=interaction_types.Usage(total_input_tokens=3, total_output_tokens=2, total_tokens=5),
+    )
+    scripted = FakeInteractions([interaction])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = False
+    pipe.valves.GEMINI_PAID_API_KEY = "sanitized-paid-key"
+    metadata.update(
+        {
+            "chat_id": "chat-grounded",
+            "message_id": "assistant-grounded",
+            "features": {
+                "gemini_manifold_companion_version": "3.0.0",
+                "google_search_tool": True,
+            },
+        }
+    )
+    upsert = _install_public_chat_history(
+        [{"id": "user-grounded", "parentId": None, "role": "user", "content": "Hello"}],
+        current_message_id="assistant-grounded",
+    )
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "Source"
+    assert len(scripted.requests) == 1
+    assert [tool.type for tool in scripted.requests[0].tools or []] == ["google_search"]
+    upsert.assert_awaited_once()
+    awaited_upsert = upsert.await_args
+    assert awaited_upsert is not None
+    persisted = awaited_upsert.kwargs["message"]["gemini_interaction"]
+    envelope = InteractionEnvelopeV1.model_validate(persisted)
+    assert envelope.grounding.queries == ["sanitized public query"]
+    assert [source.uri for source in envelope.grounding.sources] == ["https://example.test/source"]
+    assert len(envelope.grounding.citations) == 1
+
+    companion_body = cast(
+        Body,
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "Source",
+                    "gemini_interaction": persisted,
+                }
+            ]
+        },
+    )
+    events: list[Event] = []
+
+    async def collect(event: Event) -> None:
+        events.append(event)
+
+    companion = CompanionFilter()
+    companion_result = await companion.outlet(
+        companion_body,
+        request,
+        {},
+        collect,
+    )
+
+    assert companion_result["messages"][-1]["content"] == "Source[1]"
+    assert any(event["type"] == "source" for event in events)
+    assert any(
+        event["type"] == "status" and event["data"].get("action") == "web_search_queries_generated"
+        for event in events
+    )
+    scripted.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_public_pipe_multimodal_storage_input_and_generated_image_output(
+    pipe_instance_fixture, tmp_path: Path
+) -> None:
+    mock_files_module.reset_mock()
+    mock_storage_module.reset_mock()
+    pipe, _constructor = pipe_instance_fixture
+    input_image = b"sanitized-input-image"
+    generated_image = b"sanitized-generated-image"
+    local_image = tmp_path / "input.png"
+    local_image.write_bytes(input_image)
+    interaction = interaction_types.Interaction(
+        id="media-interaction",
+        model="gemini-3.1-flash-image-preview",
+        status="completed",
+        steps=[
+            interaction_types.ModelOutputStep(
+                type="model_output",
+                content=[
+                    interaction_types.TextContent(type="text", text="Created "),
+                    interaction_types.ImageContent(
+                        type="image",
+                        mime_type="image/png",
+                        data=base64.b64encode(generated_image).decode("ascii"),
+                    ),
+                ],
+            )
+        ],
+    )
+    scripted = FakeInteractions([interaction])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["model"] = "gemini_manifold_google_genai.gemini-3.1-flash-image-preview"
+    body["stream"] = False
+    pipe.valves.GEMINI_PAID_API_KEY = "sanitized-paid-key"
+    pipe.valves.USE_FILES_API = False
+    metadata.update(
+        {
+            "chat_id": "chat-media",
+            "message_id": "assistant-media",
+            "features": {
+                "gemini_manifold_companion_version": "3.0.0",
+                "upload_documents": True,
+            },
+        }
+    )
+    _install_public_chat_history(
+        [
+            {
+                "id": "user-media",
+                "parentId": None,
+                "role": "user",
+                "content": "Describe and transform this image",
+                "files": [{"id": "input-file", "name": "input.png", "content_type": "image/png"}],
+            }
+        ],
+        current_message_id="assistant-media",
+    )
+    file_model = MagicMock(path="s3://sanitized/input.png", meta={"content_type": "image/png"})
+    mock_files_module.Files.get_file_by_id = AsyncMock(return_value=file_model)
+    mock_storage_module.Storage.get_file.reset_mock()
+    mock_storage_module.Storage.get_file.return_value = str(local_image)
+    mock_storage_module.Storage.upload_file.return_value = (
+        generated_image,
+        "s3://sanitized/generated.png",
+    )
+    mock_files_module.Files.insert_new_file = AsyncMock(return_value=MagicMock(id="generated-file"))
+    request.app.url_path_for = MagicMock(return_value="/api/v1/files/generated-file/content")
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == (
+        "Created ![Generated Image](/api/v1/files/generated-file/content)"
+    )
+    assert len(scripted.requests) == 1
+    request_input = scripted.requests[0].input
+    assert isinstance(request_input, list)
+    assert isinstance(request_input[0], interaction_types.UserInputStep)
+    image_parts = [
+        part
+        for part in request_input[0].content or []
+        if isinstance(part, interaction_types.ImageContent)
+    ]
+    assert len(image_parts) == 1
+    assert base64.b64decode(image_parts[0].data or "") == input_image
+    assert image_parts[0].uri is None
+    mock_files_module.Files.get_file_by_id.assert_awaited_once_with("input-file")
+    mock_storage_module.Storage.get_file.assert_called_once_with("s3://sanitized/input.png")
+    mock_storage_module.Storage.upload_file.assert_called_once()
+    mock_files_module.Files.insert_new_file.assert_awaited_once()
+    assert not hasattr(binding.client, "models")
+    scripted.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_public_pipe_rejects_foreign_endpoint_uri_before_create(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions([])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = False
+    body["messages"] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "parent answer"},
+        {"role": "user", "content": "next"},
+    ]
+    metadata.update({"chat_id": "chat-foreign", "message_id": "assistant-foreign"})
+    _install_public_chat_history(
+        [
+            {"id": "user-first", "parentId": None, "role": "user", "content": "first"},
+            {
+                "id": "assistant-parent",
+                "parentId": "user-first",
+                "role": "assistant",
+                "content": "parent answer",
+                "gemini_interaction": _interaction_envelope(
+                    endpoint_scope="foreign-endpoint-scope",
+                    model_id="gemini-2.5-flash",
+                    steps=[
+                        {
+                            "type": "model_output",
+                            "content": [
+                                {"type": "text", "text": "parent answer"},
+                                {
+                                    "type": "image",
+                                    "uri": "https://files.example.test/foreign-image",
+                                    "mime_type": "image/png",
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            },
+            {
+                "id": "user-next",
+                "parentId": "assistant-parent",
+                "role": "user",
+                "content": "next",
+            },
+        ],
+        current_message_id="assistant-foreign",
+    )
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert "URI from a different endpoint identity" in result["choices"][0]["message"]["content"]
+    assert scripted.requests == []
+
+
+def _install_public_chat_history(
+    messages: list[dict[str, object]], *, current_message_id: str
+) -> AsyncMock:
+    placeholder = {
+        "id": current_message_id,
+        "parentId": messages[-1]["id"],
+        "role": "assistant",
+        "content": "",
+    }
+    chat = MagicMock()
+    chat.chat = {
+        "history": {
+            "messages": {str(message["id"]): message for message in [*messages, placeholder]},
+            "currentId": current_message_id,
+        }
+    }
+    mock_chats_module.Chats.get_chat_by_id_and_user_id = AsyncMock(return_value=chat)
+    upsert = AsyncMock()
+    mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id = upsert
+    return upsert
+
+
+def _public_pipe_patches(pipe: Pipe, binding: GenAIClientBinding):
+    def split_system_message(messages):
+        if messages and messages[0].get("role") == "system":
+            return messages[0], messages[1:]
+        return None, messages
+
+    mock_misc_module.pop_system_message.side_effect = split_system_message
+    return (
+        patch.object(
+            pipe, "_get_toggleable_feature_status", AsyncMock(return_value=(False, False))
+        ),
+        patch.object(pipe, "_get_user_client", return_value=binding),
+    )
+
+
+@pytest.mark.asyncio
+async def test_public_pipe_same_scope_continuation_404_replays_and_persists_once(
+    pipe_instance_fixture,
+) -> None:
+    class MissingInteractionError(Exception):
+        status_code = 404
+
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions(
+        [MissingInteractionError("expired"), completed_interaction(interaction_id="replayed-id")]
+    )
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    model_id = "gemini-2.5-flash"
+    endpoint_scope = binding.identity.for_model(model_id).scope
+    body["stream"] = False
+    body["messages"] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "parent answer"},
+        {"role": "user", "content": "next"},
+    ]
+    metadata.update({"chat_id": "chat-continuation", "message_id": "assistant-current"})
+    upsert = _install_public_chat_history(
+        [
+            {"id": "user-first", "parentId": None, "role": "user", "content": "first"},
+            {
+                "id": "assistant-parent",
+                "parentId": "user-first",
+                "role": "assistant",
+                "content": "parent answer",
+                "usage": {"cumulative_token_count": 7, "cumulative_total_cost": 0.01},
+                "gemini_interaction": _interaction_envelope(
+                    interaction_id="parent-interaction",
+                    endpoint_scope=endpoint_scope,
+                    model_id=model_id,
+                ),
+            },
+            {
+                "id": "user-next",
+                "parentId": "assistant-parent",
+                "role": "user",
+                "content": "next",
+            },
+        ],
+        current_message_id="assistant-current",
+    )
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "Hello from Gemini."
+    assert result["usage"]["input_tokens"] == 3
+    assert result["usage"]["cumulative_token_count"] == 14
+    assert len(scripted.requests) == 2
+    continued, replayed = scripted.requests
+    assert continued.previous_interaction_id == "parent-interaction"
+    assert isinstance(continued.input, list) and len(continued.input) == 1
+    assert replayed.previous_interaction_id is None
+    assert isinstance(replayed.input, list) and len(replayed.input) == 3
+    upsert.assert_awaited_once()
+    awaited_upsert = upsert.await_args
+    assert awaited_upsert is not None
+    persisted = awaited_upsert.kwargs["message"]["gemini_interaction"]
+    envelope = InteractionEnvelopeV1.model_validate(persisted)
+    assert envelope.interaction_id == "replayed-id"
+    assert envelope.usage.total_tokens == 7
+    scripted.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_public_pipe_custom_function_round_trip_uses_result_continuation_order(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions(
+        [
+            _tool_interaction("tool-round-1", _function_call("call-1")),
+            completed_interaction("tool finished", interaction_id="tool-final"),
+        ]
+    )
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["model"] = "gemini_manifold_google_genai.gemini-3.5-flash"
+    body["stream"] = False
+    metadata.update({"chat_id": "chat-tool", "message_id": "assistant-tool"})
+    _install_public_chat_history(
+        [{"id": "user-tool", "parentId": None, "role": "user", "content": "Hello"}],
+        current_message_id="assistant-tool",
+    )
+    function = AsyncMock(return_value={"value": "sanitized"})
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+            __tools__={"lookup": _authorized_tool(function)},
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "tool finished"
+    function.assert_awaited_once_with(query="value")
+    assert len(scripted.requests) == 2
+    first, second = scripted.requests
+    assert first.previous_interaction_id is None
+    assert [tool.type for tool in first.tools or []] == ["function"]
+    assert second.previous_interaction_id == "tool-round-1"
+    assert isinstance(second.input, list)
+    assert len(second.input) == 1
+    assert isinstance(second.input[0], interaction_types.FunctionResultStep)
+    assert second.input[0].call_id == "call-1"
+    assert second.input[0].result == '{"value":"sanitized"}'
+    scripted.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_public_sse_persists_reasoning_signature_and_closes_stream(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    signature = base64.b64encode(b"opaque-reasoning-signature").decode("ascii")
+    fake_stream = FakeInteractionStream(completed_reasoning_stream(signature=signature))
+    scripted = FakeInteractions([fake_stream])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = True
+    metadata.update({"chat_id": "chat-reasoning", "message_id": "assistant-reasoning"})
+    upsert = _install_public_chat_history(
+        [
+            {
+                "id": "user-reasoning",
+                "parentId": None,
+                "role": "user",
+                "content": "Hello",
+            }
+        ],
+        current_message_id="assistant-reasoning",
+    )
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+    assert not isinstance(result, dict)
+    chunks = [chunk async for chunk in result]
+
+    assert "brief rationale" in str(chunks)
+    assert "reasoned answer" in str(chunks)
+    assert fake_stream.close_count == 1
+    upsert.assert_awaited_once()
+    awaited_upsert = upsert.await_args
+    assert awaited_upsert is not None
+    envelope = InteractionEnvelopeV1.model_validate(
+        awaited_upsert.kwargs["message"]["gemini_interaction"]
+    )
+    thought_steps = [step for step in envelope.steps if step.get("type") == "thought"]
+    assert thought_steps == [
+        {
+            "type": "thought",
+            "signature": signature,
+            "summary": [{"text": "brief rationale", "type": "text"}],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_public_sse_early_close_releases_strict_stream(pipe_instance_fixture) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    signature = base64.b64encode(b"opaque-early-close").decode("ascii")
+    fake_stream = FakeInteractionStream(completed_reasoning_stream(signature=signature))
+    scripted = FakeInteractions([fake_stream])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = True
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+    assert not isinstance(result, dict)
+    first_chunk = await anext(result)
+    assert "brief rationale" in str(first_chunk)
+    await result.aclose()
+
+    assert fake_stream.close_count == 1
+    assert fake_stream.closed
+    scripted.assert_exhausted()
+
+
+@pytest.mark.asyncio
+async def test_public_pipe_denies_unverified_enterprise_before_create(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions([])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    pipe.valves.GEMINI_FREE_API_KEY = None
+    pipe.valves.ENTERPRISE_PROJECT = "sanitized-project"
+    enterprise_identity = EndpointIdentity(
+        service="enterprise",
+        credential_fingerprint="sanitized-credential",
+        project="sanitized-project",
+        location="global",
+        api_version="v1beta1",
+    )
+    enterprise_binding = GenAIClientBinding(
+        client=binding.client,
+        identity=enterprise_identity,
+    )
+
+    async def toggle_status(filter_id: str, _metadata: Metadata) -> tuple[bool, bool]:
+        return (True, True) if filter_id == "gemini_enterprise_toggle" else (False, False)
+
+    with (
+        patch.object(pipe, "_get_toggleable_feature_status", side_effect=toggle_status),
+        patch.object(pipe, "_get_user_client", return_value=enterprise_binding) as get_client,
+        pytest.raises(ValueError, match="unverified.*enterprise"),
+    ):
+        await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    get_client.assert_not_called()
+    assert scripted.requests == []
 
 
 def teardown_module(module):

@@ -1,0 +1,47 @@
+name: Optional Gemini Interactions Live Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  developer:
+    name: Developer API live smoke
+    runs-on: ubuntu-latest
+    environment: gemini-live-developer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - name: Require configured Developer API credentials
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: test -n "$GEMINI_API_KEY"
+      - name: Run redacted Developer API tests
+        env:
+          RUN_GEMINI_LIVE_TESTS: "1"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_LIVE_MODEL: ${{ vars.GEMINI_LIVE_MODEL }}
+        run: uv run pytest -ra tests/live -m "live and developer_api"
+
+  enterprise-policy:
+    name: Enterprise policy contract (no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - name: Prove canonical transport and fail-closed catalog policy
+        run: >-
+          uv run pytest -ra
+          tests/test_gemini_model_catalog.py
+          tests/test_google_genai_interactions_contract.py::test_service_specific_interactions_paths
+          tests/test_gemini_manifold.py::test_public_pipe_denies_unverified_enterprise_before_create

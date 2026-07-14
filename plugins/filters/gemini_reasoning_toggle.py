@@ -6,7 +6,7 @@ author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 1.1.0
+version: 2.0.0
 """
 
 # Shoutout to jrkropp for making me aware of Filter.toggle!
@@ -43,5 +43,5 @@ class Filter:
             metadata_features = cast(Features, {})
             metadata["features"] = metadata_features
 
-        metadata_features["reason"] = True
+        metadata_features["reasoning"] = True
         return body

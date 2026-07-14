@@ -1,77 +1,174 @@
-# `gemini_manifold.py` - Detailed Documentation
+# Gemini Manifold 3.0.0
 
-This document provides a comprehensive overview of the `gemini_manifold.py` Open WebUI plugin.
+`gemini_manifold.py` exposes catalog-approved Gemini models in Open WebUI through the
+`google-genai==2.11.0` Interactions API. Version 3.0 is a strict cutover: no maintained
+GenerateContent request, response, storage, or compatibility path remains.
 
-## Description
+Authoritative references: [Interactions overview](https://ai.google.dev/gemini-api/docs/interactions-overview),
+[Google Gen AI SDK 2.11.0 release](https://github.com/googleapis/python-genai/releases/tag/v2.11.0),
+[function calling](https://ai.google.dev/gemini-api/docs/function-calling), and
+[model catalog source](../../../plugins/pipes/gemini_models.yaml).
 
-This is a manifold pipe function that adds support for Google's Gemini Studio API and Vertex AI into Open WebUI using `google-genai` SDK.
+## Required coordinated components
 
-## Features
+Install pipe 3.0.0 with companion 3.0.0 and catalog protocol 1 from the same
+`gemini-suite/v3.0.0` manifest. The pipe rejects a missing/wrong companion version and a missing or
+wrong catalog protocol. The Reason and Maps filters have breaking 2.0.0 feature keys; the old
+Vertex AI toggle is replaced by the Enterprise toggle.
 
-Here's a breakdown of implemented and planned features for the Gemini Manifold plugin:
+The companion's default catalog URL is pinned to:
 
-**Implemented Features:**
+```text
+https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.0.0/plugins/pipes/gemini_models.yaml
+```
 
--   [x] Display thinking summary
--   [x] Thinking budget
--   [x] Reasoning toggle (Reason filter function required, see [it's doc](../filters/gemini_reasoning_toggle.md))
--   [x] Native image generation and editing (image output)
--   [x] Document understanding (PDF and plaintext files). (Gemini Manifold Companion >= 1.4.0 filter required, see [it's doc](../filters/gemini_manifold_companion.md))
--   [x] Automatic PDF limit mitigation: oversized PDFs are optimized and split to fit Gemini's 50 MiB / 1000 page per-document limits.
--   [x] Image input
--   [x] YouTube video input (automatically detects youtube.com and youtu.be URLs in messages)
--   [x] Video input support (other than YouTube URLs)
--   [x] Audio input support
--   [x] Google Files API
--   [x] Grounding with Google Search (Gemini Manifold Companion >= 1.2.0 required)
--   [x] Grounding with Google Maps (Gemini Manifold Companion >= 1.7.0 required). If you want to toggle this just like reasoning then install [Google Maps Grounding](../../../plugins/filters/gemini_map_grounding_toggle.py) filter function.
--   [x] Display citations in the front-end. (Gemini Manifold Companion >= 1.5.0 required)
--   [x] Permissive safety settings (Gemini Manifold Companion >= 1.3.0 required)
--   [x] Each user can decide to use their own API key.
--   [x] Token usage data
--   [x] Code execution tool. (Gemini Manifold Companion >= 1.1.0 required)
--   [x] URL context tool (Gemini Manifold Companion >= 1.5.0 required if you want to see citations in the front-end). If you want to toggle this then install [URL Context](../../../plugins/filters/gemini_url_context_toggle.py) filter function.
--   [x] Streaming and non-streaming responses.
+That prospective URL works only after the tag exists. Do not enable the release before the tag
+and catalog are reachable. An override must be immutable, reviewable, schema 1, and compatible
+with both 3.0 components; mutable branch URLs are unsupported.
 
-**Planned Features:**
+## Service support
 
--   [ ] Native tool calling
--   [ ] Ability to easily switch between paid and free API
+- **Gemini Developer API:** deterministically validated `v1` Interactions route. Free and paid API
+  keys use the same protocol but separate credentials/routing policy.
+- **Gemini Enterprise:** the SDK's tested route is `v1beta1` with project/location identity.
+  However, every bundled catalog entry currently says `enterprise: unverified`; generation is
+  denied before network access. Configuration or a successful models-list call is not evidence of
+  Interactions model support.
+- **Custom base URL:** applies to Developer API and is included in endpoint identity. Interaction
+  IDs and signed replay ledgers never cross service, credential, base-URL, API-version, or model
+  scope.
 
-## Installation
+Unknown or unverified models and capabilities fail closed. `MODEL_WHITELIST` and
+`MODEL_BLACKLIST` can narrow the catalog but cannot grant unsupported capabilities.
 
-To install this plugin, navigate to the [Open WebUI Community page for Gemini Manifold](https://openwebui.com/f/suurt8ll/gemini_manifold_google_genai) and click the white "Get" button.
+## Inputs, outputs, and tools
 
-## Configuration
+The exact per-model catalog controls text, image, audio, video, document, external-URL, Files API,
+thinking, response-format, image-output, and tool availability. Supported request construction
+includes multimodal user content, Open WebUI files, YouTube URLs, PDFs, system instructions, JSON
+schema response format, reasoning summaries, and safety settings.
 
-After installation, click the gear icon next to the `gemini_manifold_google_genai` function within Open WebUI. At a minimum, you must enter your Google Gemini API key. Other configurable options are also available on that settings page.
+Server tools are Google Search, URL Context, Google Maps, code execution, and catalog-declared
+file search. The companion translates Open WebUI search/code controls; the optional toggles emit
+canonical `reasoning`, `google_maps`, and `url_context` feature flags. Unsupported combinations are
+rejected before an API call.
 
-### PDF limit mitigation
+Custom Open WebUI functions are deliberately narrower:
 
-Gemini accepts each PDF as a single document up to 50 MiB or 1000 pages. This limit applies to both inline file data and Google Files API uploads.
+- They require effective `store=true` and non-streaming Interaction rounds.
+- Only authorized request-local callables with object JSON schemas are exposed.
+- Direct frontend tools are rejected.
+- The loop allows at most 8 rounds, 16 calls per round, and 32 calls total.
+- Each call has a 30-second timeout and each serialized result is limited to 1 MiB.
+- Repeated call IDs must have identical names/arguments; results are reused rather than executed
+  twice.
 
-When `PDF_LIMIT_MITIGATION` is enabled, the pipe checks every attached PDF before it is sent to Gemini. This setting is enabled by default. PDFs already within the limits are sent unchanged. PDFs over either limit are saved with compressed streams/object streams and page thumbnail entries removed. If a PDF is already under 50 MiB but over 1000 pages, it is split directly without first rewriting the whole document. If the optimized PDF is still too large, or still above 1000 pages, it is split into ordered PDF attachments that each stay under the configured safety target and page limit.
+## Continuation, storage, and privacy
 
-If splitting is needed, the request includes a short text note telling Gemini to treat the ordered PDF parts as one original document. That note includes an absolute page map, such as `Attachment 2: original document pages 47-92`, so page references should stay aligned to the original PDF instead of restarting at page 1 for each split attachment. If one individual page remains larger than Gemini's 50 MiB document limit after optimization, the pipe reports an error because sending that page would require lossy page/image downsampling.
+`STORE_INTERACTIONS` controls provider-side storage. Effective storage is monotonic: either the
+administrator or user can opt out, while a user cannot override an administrator opt-out.
+Temporary/local chats and background task requests always send `store=false`.
 
-Processed oversized PDFs are cached for follow-up turns in the same Open WebUI process, so an active conversation does not repeatedly recompress and split the same source PDF. The cache metadata is kept in memory, but optimized/split PDF parts are stored under the system temp directory and reused by path. The cache is keyed by the original PDF content hash and expires after several hours.
+For a persisted, unedited branch with matching endpoint identity, model, and stored completed
+Interaction, the next request may use `previous_interaction_id`. Both the parent and continuation
+request use `store=true`, as required by the service. When effective storage is false, the pipe
+uses exact signed replay instead of a previous ID. If Google returns not-found on the first
+continuation request, the pipe retries once with the exact local replay input.
 
-PDF processing is serialized with a small internal semaphore to protect low-resource hosts from multiple concurrent compression jobs. When Open WebUI stores an attachment on local disk, the pipe hashes, processes, and uploads by path where possible instead of loading each mitigated PDF part into memory.
+Every assistant message also receives one local `gemini_interaction` envelope containing exact
+step payloads, status, usage, visible-content digest, grounding protocol, and endpoint-scope
+fingerprint. It contains no credentials, but it can contain signed thought/tool replay data and
+conversation content. Treat the Open WebUI database and backups as sensitive. Do not expose,
+hand-edit, merge, or transplant envelopes between chats or credentials.
 
-This feature requires the `pikepdf` package, which is included in this plugin's requirements.
+Stateless replay is selected for storage opt-out, temporary chats, edited history, branches,
+foreign endpoint scope, missing/expired state, and other unsafe continuation cases. Replay is
+exact only for supported 2.11 step/content variants. Unknown variants fail closed. Recovery is
+not transactional across Open WebUI workers: duplicate suppression is process-local, and a crash
+between provider completion and local persistence can require regeneration.
 
-## Usage
+Deleting an Open WebUI chat does not invoke provider deletion. Google retention/account controls
+remain authoritative for stored Interactions and Files API objects.
 
-If the whitelist and blacklist are configured to allow models, those models will appear in the Open WebUI model selection list. If valid credentials for both Gemini Developer API and Vertex AI are provided then the models get fetched from both sources and merged together. To use a Gemini model, simply select it from the list and begin your chat.
+## Reasoning, statuses, and failures
 
-## Troubleshooting
+Reasoning uses Interactions `thinking_level` (`minimal`, `low`, `medium`, `high`) and optional
+automatic summaries. Opaque signatures are retained only in the replay ledger and never emitted
+through grounding/source events.
 
-If you encounter issues, check the Open WebUI logs for error messages. The logs contain detailed information that should help pinpoint the problem. If you need further assistance, please open a new issue in this repository.
+The reducer handles `in_progress`, `requires_action`, `completed`, `failed`, `cancelled`,
+`incomplete`, and `budget_exceeded`. Function calls require `requires_action`; normal output must
+finish `completed`. Error events, conflicting timelines, unknown open-union variants, nonterminal
+stream endings, and failed terminal statuses surface as request failures rather than partial
+success.
 
-## Contributing
+## Files and PDF mitigation
 
-See `CONTRIBUTING.md`. For this plugin, I've also included several ideas in `TODO` comments within the code. These comments can serve as a starting point for contributions, but feel free to propose completely new features as well!
+`USE_FILES_API` enables content-addressed Developer Files API uploads; Enterprise and temporary
+chat paths use inline/local processing where supported. `PDF_LIMIT_MITIGATION` optimizes and
+splits PDFs above 50 MiB or 1000 pages into ordered pieces with an original-page map. A single
+page that still exceeds the limit fails rather than being silently rasterized. Temporary outputs
+are cached for several hours in the process/system temp directory.
+
+Uploaded files, provider interactions, and the local signed envelope have distinct lifecycles.
+Disabling Interaction storage does not by itself disable Files API upload; disable `USE_FILES_API`
+too when provider file persistence is unsuitable.
+
+## Main valves
+
+| Valve | Purpose |
+| --- | --- |
+| `GEMINI_FREE_API_KEY`, `GEMINI_PAID_API_KEY` | Separate Developer credentials; never put them in catalog overrides or logs. |
+| `USE_ENTERPRISE`, `ENTERPRISE_PROJECT`, `ENTERPRISE_LOCATION` | Enterprise routing request; catalog policy can still deny it. |
+| `GEMINI_API_BASE_URL` | Optional Developer endpoint override and part of continuation scope. |
+| `ENABLE_FREE_TIER_FALLBACK` | Retry eligible free 429/503 failures on the paid credential. |
+| `TASK_MODEL_ROUTING` | `only_free`, `free_fallback`, `only_paid`, or `match_main`. |
+| `STORE_INTERACTIONS` | Provider storage/continuation permission for persisted chats. |
+| `THINKING_LEVEL`, `THINKING_SUMMARIES` | Reasoning level and summary policy. |
+| `USE_FILES_API`, `PDF_LIMIT_MITIGATION`, `PARSE_YOUTUBE_URLS` | Media ingestion policy. |
+| `MAPS_GROUNDING_COORDINATES` | Optional `latitude,longitude` Maps bias. |
+| `MODEL_WHITELIST`, `MODEL_BLACKLIST`, `CACHE_MODELS` | Catalog visibility controls. |
+
+User valves can narrow storage and supply their own credentials. `USER_MUST_PROVIDE_AUTH_CONFIG`
+forces non-whitelisted users onto their own Developer credentials and disables shared Enterprise
+configuration.
+
+### Removed 2.x options
+
+The cutover removes GenerateContent-specific thinking budgets, dynamic search thresholds,
+temperature-for-grounding overrides, `ENABLE_URL_CONTEXT_TOOL`, and legacy retrieval toggles.
+`GEMINI_API_KEY` is replaced by explicit free/paid credential fields, reasoning uses levels and
+summaries, and feature availability comes only from the catalog plus canonical toggle flags. No
+old valve name is accepted as an alias.
+
+## Smoke validation and troubleshooting
+
+Run the offline gate first:
+
+```shell
+make check
+```
+
+Optional credential-gated, output-redacted smoke commands are in
+[tests/live/README.md](../../../tests/live/README.md). Developer unary/SSE and stored continuation
+are available. Enterprise has no generation smoke while every catalog entry is `unverified`; CI
+instead runs the non-network canonical-transport and pre-client-denial policy contract.
+
+### Process shutdown
+
+The pipe owns cached asynchronous SDK clients and in-memory file/model caches. Open WebUI does not
+currently expose a portable shutdown hook for installed functions. Hosts that embed the pipe must
+stop accepting requests, wait for active requests to finish, and then call `await pipe.shutdown()`.
+The call is idempotent, closes cached clients once, and clears pipe-owned caches. Calling it while a
+request is active fails explicitly instead of closing resources underneath that request.
+
+Common startup failures are intentional safety checks: wrong companion version, unreachable or
+invalid catalog, catalog protocol mismatch, uncatalogued model, unsupported capability, or an
+Enterprise-unverified model. Do not work around them by using a mutable catalog.
+
+See the [coordinated release guide](../../development/gemini-suite-release.md) for upgrade and
+rollback procedures.
 
 ## License
 
-MIT License. See the `LICENSE` file for details.
+[MIT](../../../LICENSE)

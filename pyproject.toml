@@ -13,7 +13,7 @@ dependencies = [
   "fastapi",
   "google-api-core",
   "google-cloud-storage",
-  "google-genai==2.8.0",
+  "google-genai==2.11.0",
   "loguru",
   "pikepdf",
   "pydantic",
@@ -83,6 +83,11 @@ addopts = [
   "-ra",
   "--strict-config",
   "--strict-markers",
+]
+markers = [
+  "live: opt-in tests that call external services with user-provided credentials",
+  "developer_api: Gemini Developer API contract or live coverage",
+  "enterprise_api: Gemini Enterprise contract or live coverage",
 ]
 norecursedirs = [
   ".git",

@@ -1,8 +1,11 @@
-# Archived Plugins
+# Archived plugins
 
-Functions here are discontinued, I'm not developing them anymore.
+Everything in this directory is unsupported, excluded from maintained static analysis and release
+bundles, and retained only as historical reference. Do not install archived code in a maintained
+deployment and do not interpret its APIs as compatibility promises.
 
-## Plugins and Scripts
-
--   `smallthinker_filter.py` | At first I wanted to code a simple filter that makes output of the `smallthinker:3b` nicer but now I'm thinking of turning it into more general reasoning model formatter.
--   `thinking_gemini.py` | [Open WebUI Community](https://openwebui.com/f/suurt8ll/thinking_gemini) | An outdated script, initially developed for `gemini-2.0-flash-thinking-exp` model interactions. Superseded by `gemini_manifold.py`.
+- `smallthinker_filter.py`: discontinued experimental reasoning formatter.
+- `thinking_gemini.py`: historical `google-generativeai`/GenerateContent implementation for an
+  obsolete experimental model. It is not migrated, tested, published, or included in Gemini
+  Interactions suite 3.0.0. Use `plugins/pipes/gemini_manifold.py` and the coordinated suite
+  instead.

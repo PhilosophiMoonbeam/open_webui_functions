@@ -1,29 +1,46 @@
 """
 title: Gemini Manifold google_genai
 id: gemini_manifold_google_genai
-description: Manifold function for Gemini Developer API and Vertex AI. Uses the newer google-genai SDK. Aims to support as many features from it as possible.
+description: Manifold function for Gemini Developer API and Gemini Enterprise. Uses the newer google-genai SDK. Aims to support as many features from it as possible.
 author: suurt8ll
 author_url: https://github.com/suurt8ll
 funding_url: https://github.com/suurt8ll/open_webui_functions
 license: MIT
-version: 2.1.0
-requirements: google-genai==2.8.0, pikepdf
+version: 3.0.0
+requirements: google-genai==2.11.0, pikepdf
 """
 
 # I change these only when I make a release to avoid PR merge conflicts.
 # If you are making a PR then please do not change these values.
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 # This is the recommended version for the companion filter.
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
-RECOMMENDED_COMPANION_VERSION = "2.1.0"
+RECOMMENDED_COMPANION_VERSION = "3.0.0"
+MODEL_CATALOG_SCHEMA_VERSION = 1
+GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
+CATALOG_MODEL_IDS = frozenset(
+    {
+        "gemini-3.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-3.1-flash-image-preview",
+        "gemini-3-flash-preview",
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro-image-preview",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-image",
+        "gemini-2.5-flash-lite",
+    }
+)
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
 # They don't have any effect on the plugin's functionality.
 
 
-# This is a helper function that provides a manifold for Google's Gemini Studio API and Vertex AI.
+# This helper provides a manifold for the Gemini Developer API and Gemini Enterprise.
 # Be sure to check out my GitHub repository for more information! Contributions, questions and suggestions are very welcome.
 
 import asyncio
@@ -31,6 +48,7 @@ import base64
 import copy
 import difflib
 import fnmatch
+import hashlib
 import io
 import json
 import mimetypes
@@ -41,21 +59,30 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from functools import cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
     Final,
+    Generic,
     Literal,
+    Protocol,
+    TypeVar,
+    Unpack,
     cast,
+    overload,
 )
 from urllib.parse import parse_qs, urlparse
 
 import aiofiles
+import httpx
 import pydantic_core
 import xxhash
 from aiocache import cached
@@ -66,6 +93,7 @@ from fastapi import FastAPI, Request
 from fastapi.datastructures import State
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import interactions as interaction_types
 from google.genai import types
 from loguru import logger
 from open_webui.models.chats import Chats
@@ -73,13 +101,12 @@ from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
 from open_webui.utils.misc import pop_system_message
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, field_validator
 
 # This block is skipped at runtime.
 if TYPE_CHECKING:
     from loguru import Record
     from loguru._handler import Handler  # type: ignore
-    from plugins.filters.gemini_manifold_companion import EventEmitter
 
     # Imports custom type definitions (TypedDicts) for static analysis purposes (mypy/pylance).
     from utils.manifold_types import *
@@ -88,32 +115,97 @@ if TYPE_CHECKING:
 log = logger.bind(auditable=False)
 
 
-# A mapping of finish reason names (str) to human-readable descriptions.
-# This allows handling of reasons that may not be defined in the current SDK version.
-FINISH_REASON_DESCRIPTIONS: Final = {
-    "FINISH_REASON_UNSPECIFIED": "The reason for finishing is not specified.",
-    "STOP": "Natural stopping point or stop sequence reached.",
-    "MAX_TOKENS": "The maximum number of tokens was reached.",
-    "SAFETY": "The response was blocked due to safety concerns.",
-    "RECITATION": "The response was blocked due to potential recitation of copyrighted material.",
-    "LANGUAGE": "The response was stopped because of an unsupported language.",
-    "OTHER": "The response was stopped for an unspecified reason.",
-    "BLOCKLIST": "The response was blocked due to a word on a blocklist.",
-    "PROHIBITED_CONTENT": "The response was blocked for containing prohibited content.",
-    "SPII": "The response was blocked for containing sensitive personally identifiable information.",
-    "MALFORMED_FUNCTION_CALL": "The model generated an invalid function call.",
-    "IMAGE_SAFETY": "Generated image was blocked due to safety concerns.",
-    "UNEXPECTED_TOOL_CALL": "The model generated an invalid tool call.",
-    "IMAGE_PROHIBITED_CONTENT": "Generated image was blocked for containing prohibited content.",
-    "NO_IMAGE": "The model was expected to generate an image, but it did not.",
-    "IMAGE_OTHER": (
-        "Image generation stopped for other reasons, possibly related to safety or quality. "
-        "Try a different image or prompt."
-    ),
-}
+class EventEmitter(Protocol):
+    start_time: float
 
-# Finish reasons that are considered normal and do not require user notification.
-NORMAL_REASONS: Final = {types.FinishReason.STOP, types.FinishReason.MAX_TOKENS}
+    def emit_toast(
+        self, msg: str, type: Literal["info", "success", "warning", "error"] = "info"
+    ) -> None: ...
+
+    def emit_status(
+        self,
+        description: str,
+        done: bool = False,
+        hidden: bool = False,
+        *,
+        is_successful_finish: bool = False,
+        is_thought: bool = False,
+        indent_level: int = 0,
+    ) -> None: ...
+
+
+class PipeEventEmitter:
+    """Request-local ordered emitter; never crosses process or request state."""
+
+    def __init__(self, emitter: Callable[["Event"], Awaitable[None]] | None) -> None:
+        self._emitter = emitter
+        self.start_time = time.monotonic()
+        self._queue: asyncio.Queue[dict[str, object] | None] = asyncio.Queue()
+        self._worker = asyncio.create_task(self._run()) if emitter is not None else None
+
+    async def _run(self) -> None:
+        while True:
+            event = await self._queue.get()
+            try:
+                if event is None:
+                    return
+                if self._emitter is not None:
+                    try:
+                        await self._emitter(cast("Event", event))
+                    except asyncio.CancelledError:
+                        log.warning("Open WebUI event callback was cancelled; dropping the event.")
+                    except Exception:
+                        log.exception("Open WebUI event callback failed; dropping the event.")
+            finally:
+                self._queue.task_done()
+
+    def _enqueue(self, event: dict[str, object]) -> None:
+        if self._worker is not None:
+            self._queue.put_nowait(event)
+
+    def emit_toast(
+        self, msg: str, type: Literal["info", "success", "warning", "error"] = "info"
+    ) -> None:
+        self._enqueue({"type": "notification", "data": {"type": type, "content": msg}})
+
+    def emit_status(
+        self,
+        description: str,
+        done: bool = False,
+        hidden: bool = False,
+        *,
+        is_successful_finish: bool = False,
+        is_thought: bool = False,
+        indent_level: int = 0,
+    ) -> None:
+        del is_successful_finish, is_thought
+        if indent_level:
+            description = f"{'- ' * indent_level}{description}"
+        self._enqueue(
+            {
+                "type": "status",
+                "data": {"description": description, "done": done, "hidden": hidden},
+            }
+        )
+
+    async def flush(self) -> None:
+        if self._worker is not None and self._worker.done():
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
+        await self._queue.join()
+
+    async def shutdown(self) -> None:
+        if self._worker is None:
+            return
+        if self._worker.done():
+            while not self._queue.empty():
+                self._queue.get_nowait()
+                self._queue.task_done()
+            return
+        self._queue.put_nowait(None)
+        await self._worker
+
 
 # These tags will be "disabled" in the response, meaning that they will not be parsed by the backend.
 SPECIAL_TAGS_TO_DISABLE = [
@@ -135,6 +227,16 @@ GEMINI_PDF_MAX_PAGES: Final = 1000
 GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS: Final = 6 * 60 * 60
 GEMINI_PDF_MITIGATION_CACHE_DIR_NAME: Final = "open_webui_gemini_pdf_mitigation"
 GEMINI_PDF_PROCESSING_CONCURRENCY: Final = 1
+GEMINI_INTERACTION_MAX_REQUEST_BYTES: Final = 100 * 1024 * 1024
+GEMINI_TOOL_MAX_ROUNDS: Final = 8
+GEMINI_TOOL_MAX_CALLS_PER_ROUND: Final = 16
+GEMINI_TOOL_MAX_TOTAL_CALLS: Final = 32
+GEMINI_TOOL_TIMEOUT_SECONDS: Final = 30.0
+GEMINI_TOOL_MAX_RESULT_BYTES: Final = 1024 * 1024
+GEMINI_TOOL_NAME_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+MESSAGE_COMPLETION_TTL_SECONDS: Final = 15 * 60.0
+MESSAGE_COMPLETION_MAX_ENTRIES: Final = 4096
+LOG_REDACTED: Final = "[REDACTED]"
 
 
 @dataclass(frozen=True)
@@ -166,6 +268,942 @@ class LocalFileSource:
     is_temp: bool = False
 
 
+@dataclass
+class MessageGate:
+    """Reference-counted lock that remains reachable while holders or waiters exist."""
+
+    lock: asyncio.Lock
+    users: int = 0
+
+
+InteractionEvent = interaction_types.InteractionSSEEvent
+InteractionStep = interaction_types.Step
+InteractionContent = interaction_types.Content
+
+InteractionEventT = TypeVar("InteractionEventT", covariant=True)
+
+
+class AsyncInteractionStream(Protocol, Generic[InteractionEventT]):
+    """Public structural view of the SDK stream, whose concrete class is private."""
+
+    def __aiter__(self) -> AsyncIterator[InteractionEventT]: ...
+
+    async def __anext__(self) -> InteractionEventT: ...
+
+    async def close(self) -> None: ...
+
+    async def __aenter__(self) -> "AsyncInteractionStream[InteractionEventT]": ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object | None,
+    ) -> None: ...
+
+
+class AsyncInteractionsBoundary(Protocol):
+    """Typed facade over the SDK's runtime-erased ``create`` signature."""
+
+    @overload
+    async def create(
+        self, **request: Unpack[interaction_types.CreateModelInteractionParamsNonStreaming]
+    ) -> interaction_types.Interaction: ...
+
+    @overload
+    async def create(
+        self, **request: Unpack[interaction_types.CreateModelInteractionParamsStreaming]
+    ) -> AsyncInteractionStream[InteractionEvent]: ...
+
+    async def get(
+        self,
+        id: str,
+        *,
+        stream: Literal[True],
+        last_event_id: str,
+    ) -> AsyncInteractionStream[InteractionEvent]: ...
+
+    async def cancel(self, id: str) -> interaction_types.Interaction: ...
+
+
+class AsyncOpenWebUIToolCallable(Protocol):
+    """Callable already authorized and context-bound by Open WebUI."""
+
+    def __call__(self, **kwargs: object) -> Awaitable[object]: ...
+
+
+@dataclass(frozen=True)
+class OpenWebUITool:
+    """Validated executable boundary paired with its Interactions declaration."""
+
+    name: str
+    parameters: dict[str, object]
+    function: AsyncOpenWebUIToolCallable
+    declaration: interaction_types.Function
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    """Per-request idempotency record for a completed custom function call."""
+
+    fingerprint: str
+    result: interaction_types.FunctionResultStep
+
+
+class NormalizedInteractionUsage(BaseModel):
+    """Stable project-owned usage shape consumed outside the SDK boundary."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    thought_tokens: int = 0
+    cached_tokens: int = 0
+    tool_use_tokens: int = 0
+    total_tokens: int = 0
+    input_by_modality: list[dict[str, JsonValue]] = Field(default_factory=list)
+    output_by_modality: list[dict[str, JsonValue]] = Field(default_factory=list)
+    cached_by_modality: list[dict[str, JsonValue]] = Field(default_factory=list)
+    tool_use_by_modality: list[dict[str, JsonValue]] = Field(default_factory=list)
+    grounding_tool_count: list[dict[str, JsonValue]] = Field(default_factory=list)
+
+
+class NormalizedInteractionEvent(BaseModel):
+    """Lossless event envelope; reducers must explicitly handle unknown variants."""
+
+    event_type: str
+    event_id: str | None = None
+    payload: dict[str, JsonValue]
+    is_unknown: bool = False
+
+
+class InteractionsSDKBoundary:
+    """The sole conversion point between SDK models and project-owned records."""
+
+    @staticmethod
+    def normalize_usage(
+        usage: interaction_types.Usage | None,
+    ) -> NormalizedInteractionUsage:
+        if usage is None:
+            return NormalizedInteractionUsage()
+        return NormalizedInteractionUsage(
+            input_tokens=usage.total_input_tokens or 0,
+            output_tokens=usage.total_output_tokens or 0,
+            thought_tokens=usage.total_thought_tokens or 0,
+            cached_tokens=usage.total_cached_tokens or 0,
+            tool_use_tokens=usage.total_tool_use_tokens or 0,
+            total_tokens=usage.total_tokens or 0,
+            input_by_modality=[
+                cast(dict[str, JsonValue], item.model_dump(mode="json", exclude_none=True))
+                for item in (usage.input_tokens_by_modality or [])
+            ],
+            output_by_modality=[
+                cast(dict[str, JsonValue], item.model_dump(mode="json", exclude_none=True))
+                for item in (usage.output_tokens_by_modality or [])
+            ],
+            cached_by_modality=[
+                cast(dict[str, JsonValue], item.model_dump(mode="json", exclude_none=True))
+                for item in (usage.cached_tokens_by_modality or [])
+            ],
+            tool_use_by_modality=[
+                cast(dict[str, JsonValue], item.model_dump(mode="json", exclude_none=True))
+                for item in (usage.tool_use_tokens_by_modality or [])
+            ],
+            grounding_tool_count=[
+                cast(dict[str, JsonValue], item.model_dump(mode="json", exclude_none=True))
+                for item in (usage.grounding_tool_count or [])
+            ],
+        )
+
+    @staticmethod
+    def normalize_event(event: InteractionEvent) -> NormalizedInteractionEvent:
+        payload = cast(
+            dict[str, JsonValue],
+            event.model_dump(mode="json", exclude_none=True),
+        )
+        event_type = str(payload.get("event_type", "UNKNOWN"))
+        return NormalizedInteractionEvent(
+            event_type=event_type,
+            event_id=cast(str | None, payload.get("event_id")),
+            payload=payload,
+            is_unknown=getattr(event, "is_unknown", False),
+        )
+
+
+class ReducerEmission(BaseModel):
+    """A transport-neutral semantic output consumed by the OWUI presenter."""
+
+    kind: Literal["content", "reasoning", "media", "source", "tool", "status"]
+    text: str | None = None
+    payload: dict[str, JsonValue] | None = None
+
+
+class GroundingTextBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step_index: int
+    content_index: int
+    text: str
+
+
+class GroundingReviewSnippet(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    review_id: str | None = None
+    title: str | None = None
+    uri: str | None = None
+
+
+class GroundingSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    kind: Literal["url", "file", "place"]
+    uri: str | None = None
+    title: str | None = None
+    file_name: str | None = None
+    media_id: str | None = None
+    page_number: int | None = None
+    source: str | None = None
+    place_id: str | None = None
+    custom_metadata: dict[str, JsonValue] | None = None
+    review_snippets: list[GroundingReviewSnippet] = Field(default_factory=list)
+
+
+class GroundingCitation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_id: str
+    block_index: int
+    start: int
+    end: int
+    index_unit: Literal["provider", "utf8_bytes", "unicode_codepoints"] = "provider"
+
+
+class GroundingToolRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tool: Literal["google_search", "url_context", "google_maps", "file_search", "retrieval"]
+    phase: Literal["call", "result"]
+    step_index: int
+    call_id: str | None = None
+    queries: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
+    search_type: str | None = None
+    retrieval_type: str | None = None
+    statuses: list[str] = Field(default_factory=list)
+    search_suggestions: list[str] = Field(default_factory=list)
+    places: list[GroundingSource] = Field(default_factory=list)
+    widget_context_tokens: list[str] = Field(default_factory=list)
+    is_error: bool | None = None
+
+
+class GroundingDiagnostic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str
+    detail: str
+    step_index: int | None = None
+
+
+class GroundingEnvelope(BaseModel):
+    """Versioned SDK-neutral grounding contract shared with the companion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol_version: Literal[1] = 1
+    visible_content_sha256: str = ""
+    grounded_text_sha256: str = ""
+    text_blocks: list[GroundingTextBlock] = Field(default_factory=list)
+    sources: list[GroundingSource] = Field(default_factory=list)
+    citations: list[GroundingCitation] = Field(default_factory=list)
+    tool_records: list[GroundingToolRecord] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)
+    tool_errors: list[str] = Field(default_factory=list)
+    diagnostics: list[GroundingDiagnostic] = Field(default_factory=list)
+
+
+class InteractionReduction(BaseModel):
+    """Project-owned, persistable result of reducing an Interaction timeline."""
+
+    interaction_id: str | None = None
+    status: str = "in_progress"
+    steps: list[dict[str, JsonValue]] = Field(default_factory=list)
+    usage: NormalizedInteractionUsage = Field(default_factory=NormalizedInteractionUsage)
+    last_event_id: str | None = None
+    terminal: bool = False
+    original_content: str = ""
+    reasoning_content: str = ""
+    grounding: GroundingEnvelope = Field(default_factory=GroundingEnvelope)
+
+
+class InteractionEnvelopeV1(BaseModel):
+    """The only durable Gemini message contract; unknown fields fail closed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal[1] = 1
+    interaction_id: str | None = None
+    endpoint_scope: str
+    model_id: str
+    store: bool
+    status: Literal[
+        "in_progress",
+        "requires_action",
+        "completed",
+        "failed",
+        "cancelled",
+        "incomplete",
+        "budget_exceeded",
+    ]
+    steps: list[dict[str, JsonValue]] = Field(default_factory=list)
+    visible_content: str
+    usage: NormalizedInteractionUsage = Field(default_factory=NormalizedInteractionUsage)
+    last_event_id: str | None = None
+    grounding: GroundingEnvelope = Field(default_factory=GroundingEnvelope)
+
+
+@dataclass(frozen=True)
+class ContinuationDecision:
+    """Request input selected from the active Open WebUI branch."""
+
+    input: list[interaction_types.StepParam]
+    previous_interaction_id: str | None
+    used_server_state: bool
+    reason: str
+
+
+class InteractionReducer:
+    """Finite-state reducer shared by streamed SSE and unary Interaction responses."""
+
+    _TERMINAL = {"completed", "failed", "cancelled", "incomplete", "budget_exceeded"}
+
+    def __init__(self) -> None:
+        self.state = InteractionReduction()
+        self._events_seen: set[str] = set()
+        self._step_payloads: dict[int, dict[str, JsonValue]] = {}
+        self._step_types: dict[int, str] = {}
+        self._stopped: set[int] = set()
+        self._emitted_text: dict[tuple[int, str], str] = {}
+        self._step_models: dict[int, InteractionStep] = {}
+        self._pending_annotations: dict[int, list[interaction_types.Annotation]] = {}
+        self._retrieval_records: list[GroundingToolRecord] = []
+
+    def consume_event(self, event: InteractionEvent) -> list[ReducerEmission]:
+        event_id = getattr(event, "event_id", None)
+        if event_id and event_id in self._events_seen:
+            return []
+        if event_id:
+            self._events_seen.add(event_id)
+            self.state.last_event_id = event_id
+
+        if isinstance(event, interaction_types.UnknownInteractionSSEEvent):
+            raise InteractionExecutionError(
+                GenerationFailureKind.INTERACTION_ERROR,
+                f"Unknown Interaction event: {event.raw}",
+            )
+        if isinstance(event, interaction_types.InteractionCreatedEvent):
+            return self._consume_interaction_header(event.interaction)
+        if isinstance(event, interaction_types.InteractionStatusUpdate):
+            return self._transition(str(event.status))
+        if isinstance(event, interaction_types.ErrorEvent):
+            detail = (
+                event.error.message if event.error and event.error.message else "Interaction error"
+            )
+            self.state.status = "failed"
+            self.state.terminal = True
+            raise InteractionExecutionError(GenerationFailureKind.INTERACTION_ERROR, detail)
+        if isinstance(event, interaction_types.StepStart):
+            if event.index in self._step_payloads:
+                existing = self._step_payloads[event.index]
+                incoming = self._dump(event.step)
+                if existing != incoming:
+                    raise self._protocol_error(f"Conflicting step.start for index {event.index}")
+                return []
+            payload = self._dump(event.step)
+            self._step_payloads[event.index] = payload
+            self._step_types[event.index] = str(payload.get("type", "UNKNOWN"))
+            self._step_models[event.index] = event.step
+            return self._emit_snapshot(event.index, event.step)
+        if isinstance(event, interaction_types.StepDelta):
+            if event.index not in self._step_payloads or event.index in self._stopped:
+                raise self._protocol_error(f"Delta for inactive step index {event.index}")
+            return self._consume_delta(event.index, event.delta)
+        if isinstance(event, interaction_types.StepStop):
+            if event.index not in self._step_payloads or event.index in self._stopped:
+                raise self._protocol_error(f"Invalid step.stop for index {event.index}")
+            self._stopped.add(event.index)
+            usage = event.step_usage or event.usage
+            if usage is not None:
+                self.state.usage = InteractionsSDKBoundary.normalize_usage(usage)
+            return []
+        if isinstance(event, interaction_types.InteractionCompletedEvent):
+            emissions = self._consume_interaction_header(event.interaction)
+            for index, step in enumerate(event.interaction.steps or []):
+                emissions.extend(self._reconcile_snapshot(index, step))
+            if event.interaction.usage is not None:
+                self.state.usage = InteractionsSDKBoundary.normalize_usage(event.interaction.usage)
+            emissions.extend(self._transition(str(event.interaction.status)))
+            return emissions
+        raise self._protocol_error(f"Unhandled Interaction event {type(event).__name__}")
+
+    def consume_interaction(
+        self, interaction: interaction_types.Interaction
+    ) -> list[ReducerEmission]:
+        self.state.interaction_id = interaction.id or None
+        emissions: list[ReducerEmission] = []
+        for index, step in enumerate(interaction.steps or []):
+            emissions.extend(self._reconcile_snapshot(index, step))
+        self.state.usage = InteractionsSDKBoundary.normalize_usage(interaction.usage)
+        emissions.extend(self._transition(str(interaction.status)))
+        return emissions
+
+    def finalize_steps(self) -> None:
+        self.state.steps = [self._step_payloads[index] for index in sorted(self._step_payloads)]
+        self.state.grounding = self._build_grounding_envelope()
+
+    def _consume_interaction_header(
+        self, interaction: interaction_types.InteractionSseEventInteraction
+    ) -> list[ReducerEmission]:
+        if self.state.interaction_id and self.state.interaction_id != interaction.id:
+            raise self._protocol_error("Interaction ID changed within one response")
+        self.state.interaction_id = interaction.id
+        if interaction.usage is not None:
+            self.state.usage = InteractionsSDKBoundary.normalize_usage(interaction.usage)
+        return self._transition(str(interaction.status))
+
+    def _transition(self, status: str) -> list[ReducerEmission]:
+        if self.state.terminal and status != self.state.status:
+            raise self._protocol_error(f"Terminal status {self.state.status} changed to {status}")
+        self.state.status = status
+        self.state.terminal = status in self._TERMINAL
+        if status in {"failed", "cancelled", "incomplete", "budget_exceeded"}:
+            raise InteractionExecutionError(
+                GenerationFailureKind.INTERACTION_STATUS,
+                f"Interaction ended with status {status}",
+            )
+        return [ReducerEmission(kind="status", text=status)]
+
+    def _reconcile_snapshot(self, index: int, step: InteractionStep) -> list[ReducerEmission]:
+        incoming = self._dump(step)
+        existing_type = self._step_types.get(index)
+        incoming_type = str(incoming.get("type", "UNKNOWN"))
+        if existing_type and existing_type != incoming_type:
+            raise self._protocol_error(f"Step type changed at index {index}")
+        self._step_payloads[index] = incoming
+        self._step_types[index] = incoming_type
+        self._step_models[index] = step
+        self._stopped.add(index)
+        return self._emit_snapshot(index, step)
+
+    def _emit_snapshot(self, index: int, step: InteractionStep) -> list[ReducerEmission]:
+        if isinstance(step, interaction_types.UnknownStep):
+            raise self._protocol_error(f"Unknown Interaction step: {step.raw}")
+        emissions: list[ReducerEmission] = []
+        if isinstance(step, interaction_types.ModelOutputStep):
+            if step.error and step.error.message:
+                raise InteractionExecutionError(
+                    GenerationFailureKind.MODEL_OUTPUT_STATUS, step.error.message
+                )
+            for content_index, content in enumerate(step.content or []):
+                emissions.extend(self._emit_content(index, content_index, content, "content"))
+        elif isinstance(step, interaction_types.ThoughtStep):
+            for content_index, content in enumerate(step.summary or []):
+                emissions.extend(self._emit_content(index, content_index, content, "reasoning"))
+        elif isinstance(
+            step,
+            (
+                interaction_types.FunctionCallStep,
+                interaction_types.FunctionResultStep,
+                interaction_types.MCPServerToolCallStep,
+            ),
+        ):
+            emissions.append(ReducerEmission(kind="tool", payload=self._dump(step)))
+        elif isinstance(
+            step,
+            (
+                interaction_types.URLContextCallStep,
+                interaction_types.GoogleSearchCallStep,
+                interaction_types.FileSearchCallStep,
+                interaction_types.GoogleMapsCallStep,
+            ),
+        ):
+            emissions.append(self._source_emission(step, "call"))
+        elif isinstance(step, interaction_types.CodeExecutionCallStep):
+            code = step.arguments.code if step.arguments else None
+            if code:
+                emissions.append(
+                    ReducerEmission(kind="content", text=f"```python\n{code.rstrip()}\n```\n\n")
+                )
+        elif isinstance(step, interaction_types.CodeExecutionResultStep):
+            if step.result:
+                emissions.append(
+                    ReducerEmission(
+                        kind="content", text=f"**Output:**\n\n```\n{step.result.rstrip()}\n```\n\n"
+                    )
+                )
+        elif isinstance(
+            step,
+            (
+                interaction_types.URLContextResultStep,
+                interaction_types.GoogleSearchResultStep,
+                interaction_types.FileSearchResultStep,
+                interaction_types.GoogleMapsResultStep,
+                interaction_types.MCPServerToolResultStep,
+            ),
+        ):
+            emissions.append(self._source_emission(step, "result"))
+        return emissions
+
+    def _emit_content(
+        self,
+        step_index: int,
+        content_index: int,
+        content: InteractionContent | interaction_types.ThoughtSummaryContent,
+        channel: Literal["content", "reasoning"],
+    ) -> list[ReducerEmission]:
+        if isinstance(content, interaction_types.UnknownContent):
+            raise self._protocol_error(f"Unknown Interaction content: {content.raw}")
+        if isinstance(content, interaction_types.TextContent):
+            key = (step_index, f"{channel}:{content_index}")
+            emitted = self._emitted_text.get(key, "")
+            text = content.text
+            suffix = text[len(emitted) :] if text.startswith(emitted) else text
+            self._emitted_text[key] = text
+            if not suffix:
+                return []
+            if channel == "content":
+                self.state.original_content += suffix
+            else:
+                self.state.reasoning_content += suffix
+            return [ReducerEmission(kind=channel, text=suffix)]
+        return [ReducerEmission(kind="media", payload=self._dump(content))]
+
+    def _consume_delta(
+        self, index: int, delta: interaction_types.StepDeltaData
+    ) -> list[ReducerEmission]:
+        if isinstance(delta, interaction_types.UnknownStepDeltaData):
+            raise self._protocol_error(f"Unknown Interaction delta: {delta.raw}")
+        if isinstance(delta, interaction_types.TextDelta):
+            channel: Literal["content", "reasoning"] = (
+                "reasoning" if self._step_types[index] == "thought" else "content"
+            )
+            if channel == "content":
+                self.state.original_content += delta.text
+            else:
+                self.state.reasoning_content += delta.text
+            key = (index, f"{channel}:0")
+            self._emitted_text[key] = self._emitted_text.get(key, "") + delta.text
+            return [ReducerEmission(kind=channel, text=delta.text)]
+        if isinstance(delta, interaction_types.ThoughtSummaryDelta) and delta.content:
+            return self._emit_content(index, 0, delta.content, "reasoning")
+        if isinstance(
+            delta,
+            (
+                interaction_types.ImageDelta,
+                interaction_types.AudioDelta,
+                interaction_types.DocumentDelta,
+                interaction_types.VideoDelta,
+            ),
+        ):
+            # Media deltas may contain partial base64. Preserve them in the ledger
+            # and wait for the final snapshot before presentation.
+            self._step_payloads[index].setdefault("deltas", [])
+            media_deltas = self._step_payloads[index]["deltas"]
+            if isinstance(media_deltas, list):
+                media_deltas.append(self._dump(delta))
+            return []
+        if isinstance(delta, interaction_types.TextAnnotationDelta):
+            self._pending_annotations.setdefault(index, []).extend(delta.annotations or [])
+            return []
+        if isinstance(delta, interaction_types.RetrievalCallDelta):
+            arguments = delta.arguments
+            queries = list(arguments.queries or []) if arguments else []
+            self._retrieval_records.append(
+                GroundingToolRecord(
+                    tool="retrieval",
+                    phase="call",
+                    step_index=index,
+                    queries=queries,
+                    retrieval_type=str(delta.retrieval_type) if delta.retrieval_type else None,
+                )
+            )
+            return []
+        if isinstance(delta, interaction_types.RetrievalResultDelta):
+            self._retrieval_records.append(
+                GroundingToolRecord(
+                    tool="retrieval",
+                    phase="result",
+                    step_index=index,
+                    is_error=delta.is_error,
+                )
+            )
+            return []
+        # Signatures, argument fragments, and server-tool call/result deltas are
+        # replay-critical ledger data but do not directly render user content.
+        self._step_payloads[index].setdefault("deltas", [])
+        deltas = self._step_payloads[index]["deltas"]
+        if isinstance(deltas, list):
+            deltas.append(self._dump(delta))
+        return []
+
+    @staticmethod
+    def _dump(model: BaseModel) -> dict[str, JsonValue]:
+        return cast(dict[str, JsonValue], model.model_dump(mode="json", exclude_none=True))
+
+    def _source_emission(
+        self, step: InteractionStep, phase: Literal["call", "result"]
+    ) -> ReducerEmission:
+        step_payload = self._dump(step)
+        step_type = str(step_payload.get("type", "unknown"))
+        kind = step_type.removesuffix("_call").removesuffix("_result")
+        call_id = step_payload.get("call_id", step_payload.get("id"))
+        payload: dict[str, JsonValue] = {
+            "kind": kind,
+            "phase": phase,
+        }
+        if isinstance(call_id, str):
+            payload["call_id"] = call_id
+        return ReducerEmission(kind="source", payload=payload)
+
+    def _build_grounding_envelope(self) -> GroundingEnvelope:
+        envelope = GroundingEnvelope()
+        source_indexes: dict[str, int] = {}
+        citation_keys: set[tuple[str, int, int, int]] = set()
+
+        for step_index in sorted(self._step_models):
+            step = self._step_models[step_index]
+            if isinstance(step, interaction_types.ModelOutputStep):
+                text_contents = [
+                    (content_index, content)
+                    for content_index, content in enumerate(step.content or [])
+                    if isinstance(content, interaction_types.TextContent)
+                ]
+                for content_index, content in text_contents:
+                    block_index = len(envelope.text_blocks)
+                    envelope.text_blocks.append(
+                        GroundingTextBlock(
+                            step_index=step_index,
+                            content_index=content_index,
+                            text=content.text,
+                        )
+                    )
+                    annotations = list(content.annotations or [])
+                    if not annotations and content_index == text_contents[0][0]:
+                        annotations = self._pending_annotations.get(step_index, [])
+                    for annotation in annotations:
+                        self._normalize_annotation(
+                            envelope,
+                            annotation,
+                            block_index,
+                            step_index,
+                            source_indexes,
+                            citation_keys,
+                        )
+            record = self._normalize_tool_step(step_index, step)
+            if record is not None:
+                envelope.tool_records.append(record)
+                for query in record.queries:
+                    if query not in envelope.queries:
+                        envelope.queries.append(query)
+                if record.is_error:
+                    envelope.tool_errors.append(
+                        f"{record.tool} result for {record.call_id or f'step {step_index}'} failed"
+                    )
+                if record.tool == "url_context":
+                    for status in record.statuses:
+                        if status not in {"success"}:
+                            envelope.tool_errors.append(f"URL context returned status {status}")
+                for place in record.places:
+                    if place.id not in source_indexes:
+                        source_indexes[place.id] = len(envelope.sources)
+                        envelope.sources.append(place)
+
+        envelope.tool_records.extend(self._retrieval_records)
+        visible_text = "".join(block.text for block in envelope.text_blocks)
+        envelope.grounded_text_sha256 = hashlib.sha256(visible_text.encode("utf-8")).hexdigest()
+        return envelope
+
+    def _normalize_annotation(
+        self,
+        envelope: GroundingEnvelope,
+        annotation: interaction_types.Annotation,
+        block_index: int,
+        step_index: int,
+        source_indexes: dict[str, int],
+        citation_keys: set[tuple[str, int, int, int]],
+    ) -> None:
+        if isinstance(annotation, interaction_types.UnknownAnnotation):
+            envelope.diagnostics.append(
+                GroundingDiagnostic(
+                    code="unknown_annotation",
+                    detail="The provider returned an unsupported annotation variant.",
+                    step_index=step_index,
+                )
+            )
+            return
+        if isinstance(annotation, interaction_types.URLCitation):
+            source = GroundingSource(id="", kind="url", uri=annotation.url, title=annotation.title)
+        elif isinstance(annotation, interaction_types.FileCitation):
+            source = GroundingSource(
+                id="",
+                kind="file",
+                uri=annotation.document_uri,
+                file_name=annotation.file_name,
+                media_id=annotation.media_id,
+                page_number=annotation.page_number,
+                source=annotation.source,
+                custom_metadata=cast(dict[str, JsonValue] | None, annotation.custom_metadata),
+            )
+        elif isinstance(annotation, interaction_types.PlaceCitation):
+            source = GroundingSource(
+                id="",
+                kind="place",
+                uri=annotation.url,
+                title=annotation.name,
+                place_id=annotation.place_id,
+                review_snippets=[
+                    GroundingReviewSnippet(
+                        review_id=snippet.review_id,
+                        title=snippet.title,
+                        uri=snippet.url,
+                    )
+                    for snippet in (annotation.review_snippets or [])
+                ],
+            )
+        else:
+            return
+        stable_payload = source.model_dump_json(exclude={"id"}, exclude_none=True)
+        source_id = f"{source.kind}:{hashlib.sha256(stable_payload.encode()).hexdigest()[:20]}"
+        source = source.model_copy(update={"id": source_id})
+        if source_id not in source_indexes:
+            source_indexes[source_id] = len(envelope.sources)
+            envelope.sources.append(source)
+        if annotation.start_index is None or annotation.end_index is None:
+            return
+        citation_key = (source_id, block_index, annotation.start_index, annotation.end_index)
+        if citation_key in citation_keys:
+            return
+        citation_keys.add(citation_key)
+        envelope.citations.append(
+            GroundingCitation(
+                source_id=source_id,
+                block_index=block_index,
+                start=annotation.start_index,
+                end=annotation.end_index,
+                index_unit="provider",
+            )
+        )
+
+    @staticmethod
+    def _normalize_tool_step(step_index: int, step: InteractionStep) -> GroundingToolRecord | None:
+        if isinstance(step, interaction_types.GoogleSearchCallStep):
+            arguments = getattr(step, "arguments", None)
+            return GroundingToolRecord(
+                tool="google_search",
+                phase="call",
+                step_index=step_index,
+                call_id=getattr(step, "id", None),
+                queries=list(getattr(arguments, "queries", None) or []),
+                search_type=(
+                    str(search_type)
+                    if (search_type := getattr(step, "search_type", None))
+                    else None
+                ),
+            )
+        if isinstance(step, interaction_types.GoogleSearchResultStep):
+            results = getattr(step, "result", None) or []
+            return GroundingToolRecord(
+                tool="google_search",
+                phase="result",
+                step_index=step_index,
+                call_id=getattr(step, "call_id", None),
+                search_suggestions=[
+                    suggestion
+                    for item in results
+                    if (suggestion := getattr(item, "search_suggestions", None)) is not None
+                ],
+                is_error=getattr(step, "is_error", None),
+            )
+        if isinstance(step, interaction_types.URLContextCallStep):
+            arguments = getattr(step, "arguments", None)
+            return GroundingToolRecord(
+                tool="url_context",
+                phase="call",
+                step_index=step_index,
+                call_id=getattr(step, "id", None),
+                urls=list(getattr(arguments, "urls", None) or []),
+            )
+        if isinstance(step, interaction_types.URLContextResultStep):
+            results = getattr(step, "result", None) or []
+            return GroundingToolRecord(
+                tool="url_context",
+                phase="result",
+                step_index=step_index,
+                call_id=getattr(step, "call_id", None),
+                urls=[url for item in results if (url := getattr(item, "url", None)) is not None],
+                statuses=[
+                    str(status)
+                    for item in results
+                    if (status := getattr(item, "status", None)) is not None
+                ],
+                is_error=getattr(step, "is_error", None),
+            )
+        if isinstance(step, interaction_types.GoogleMapsCallStep):
+            arguments = getattr(step, "arguments", None)
+            return GroundingToolRecord(
+                tool="google_maps",
+                phase="call",
+                step_index=step_index,
+                call_id=getattr(step, "id", None),
+                queries=list(getattr(arguments, "queries", None) or []),
+            )
+        if isinstance(step, interaction_types.GoogleMapsResultStep):
+            places: list[GroundingSource] = []
+            tokens: list[str] = []
+            for result in getattr(step, "result", None) or []:
+                if token := getattr(result, "widget_context_token", None):
+                    tokens.append(token)
+                for place in getattr(result, "places", None) or []:
+                    source = GroundingSource(
+                        id="",
+                        kind="place",
+                        uri=place.url,
+                        title=place.name,
+                        place_id=place.place_id,
+                        review_snippets=[
+                            GroundingReviewSnippet(
+                                review_id=snippet.review_id,
+                                title=snippet.title,
+                                uri=snippet.url,
+                            )
+                            for snippet in (getattr(place, "review_snippets", None) or [])
+                        ],
+                    )
+                    stable = source.model_dump_json(exclude={"id"}, exclude_none=True)
+                    places.append(
+                        source.model_copy(
+                            update={
+                                "id": f"place:{hashlib.sha256(stable.encode()).hexdigest()[:20]}"
+                            }
+                        )
+                    )
+            return GroundingToolRecord(
+                tool="google_maps",
+                phase="result",
+                step_index=step_index,
+                call_id=getattr(step, "call_id", None),
+                places=places,
+                widget_context_tokens=tokens,
+            )
+        if isinstance(step, interaction_types.FileSearchCallStep):
+            return GroundingToolRecord(
+                tool="file_search",
+                phase="call",
+                step_index=step_index,
+                call_id=getattr(step, "id", None),
+            )
+        if isinstance(step, interaction_types.FileSearchResultStep):
+            return GroundingToolRecord(
+                tool="file_search",
+                phase="result",
+                step_index=step_index,
+                call_id=getattr(step, "call_id", None),
+            )
+        return None
+
+    @staticmethod
+    def _protocol_error(detail: str) -> "InteractionExecutionError":
+        return InteractionExecutionError(GenerationFailureKind.INTERACTION_ERROR, detail)
+
+
+class EndpointIdentity(BaseModel):
+    """Credential and endpoint scope for Interaction IDs, files, and continuations."""
+
+    service: Literal["developer", "enterprise"]
+    credential_fingerprint: str
+    project: str | None = None
+    location: str | None = None
+    base_url: str | None = None
+    api_version: str
+    model: str | None = None
+
+    def for_model(self, model: str) -> "EndpointIdentity":
+        return self.model_copy(update={"model": model})
+
+    @property
+    def scope(self) -> str:
+        return xxhash.xxh64(self.model_dump_json(exclude_none=False).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class GenAIClientBinding:
+    """Project-owned client wrapper that carries its non-portable endpoint scope."""
+
+    client: genai.Client
+    identity: EndpointIdentity
+
+    def close(self) -> None:
+        self.client.close()
+
+    async def aclose(self) -> None:
+        await self.client.aio.aclose()
+
+
+class GenerationFailureKind(StrEnum):
+    RATE_LIMIT = "rate_limit"
+    UNAVAILABLE = "unavailable"
+    TRANSPORT = "transport"
+    PERMISSION = "permission"
+    INVALID_REQUEST = "invalid_request"
+    INTERACTION_ERROR = "interaction_error"
+    INTERACTION_STATUS = "interaction_status"
+    MODEL_OUTPUT_STATUS = "model_output_status"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class GenerationFailure:
+    kind: GenerationFailureKind
+    retryable_across_endpoint: bool
+    detail: str
+
+
+class InteractionExecutionError(Exception):
+    """Typed failure emitted by the Interaction event/status reducer."""
+
+    def __init__(self, kind: GenerationFailureKind, detail: str):
+        if kind not in {
+            GenerationFailureKind.INTERACTION_ERROR,
+            GenerationFailureKind.INTERACTION_STATUS,
+            GenerationFailureKind.MODEL_OUTPUT_STATUS,
+        }:
+            raise ValueError(f"Invalid Interaction failure kind: {kind}")
+        self.kind = kind
+        super().__init__(detail)
+
+
+class ResolvedGeminiFeatures(BaseModel):
+    """Single canonical feature contract consumed by routing and request assembly."""
+
+    reasoning: bool = False
+    google_search: bool = False
+    code_execution: bool = False
+    url_context: bool = False
+    google_maps: bool = False
+    paid_api: bool = False
+    enterprise: bool = False
+
+
+class InteractionRequestOptions(BaseModel):
+    """Validated top-level options for ``interactions.create``."""
+
+    generation_config: interaction_types.GenerationConfig
+    system_instruction: str | None = None
+    safety_settings: list[interaction_types.SafetySetting] = Field(default_factory=list)
+    response_format: interaction_types.CreateModelInteractionResponseFormat | None = None
+    tools: list[interaction_types.Tool] = Field(default_factory=list)
+    features: ResolvedGeminiFeatures
+
+
 class GenaiApiError(Exception):
     """Custom exception for errors during Genai API interactions."""
 
@@ -186,6 +1224,12 @@ class PDFProcessingError(Exception):
 
 class ContentBuildError(Exception):
     """Raised when request content cannot be prepared for Gemini."""
+
+    pass
+
+
+class ForeignEndpointReplayError(ValueError):
+    """Raised when persisted provider media belongs to another endpoint identity."""
 
     pass
 
@@ -617,6 +1661,7 @@ class FilesAPIManager:
     def __init__(
         self,
         client: genai.Client,
+        endpoint_identity: EndpointIdentity,
         file_cache: SimpleMemoryCache,
         id_hash_cache: SimpleMemoryCache,
         event_emitter: "EventEmitter",
@@ -633,27 +1678,14 @@ class FilesAPIManager:
             event_emitter: An abstract class for emitting events to the front-end.
         """
         self.client = client
+        self.endpoint_identity = endpoint_identity
         self.file_cache = file_cache
         self.id_hash_cache = id_hash_cache
         self.event_emitter = event_emitter
         # A dictionary to manage locks for concurrent uploads.
         # The key is a composite of api_key_hash and content_hash.
         self.upload_locks: dict[str, asyncio.Lock] = {}
-        self.api_key_hash = self._get_api_key_hash()
-
-    def _get_api_key_hash(self) -> str:
-        """
-        Returns a hash of the API key for use in cache keys.
-
-        Returns 'no_key' if the client is not using an API key (e.g., Vertex AI with ADC).
-        """
-        # The genai.Client object doesn't expose the API key directly.
-        # It's stored in the internal _api_client.
-        api_key = getattr(self.client._api_client, "api_key", None)
-        if not api_key:
-            # This could happen if using Vertex AI with Application Default Credentials
-            return "no_key"
-        return xxhash.xxh64(api_key.encode("utf-8")).hexdigest()
+        self.api_key_hash = endpoint_identity.scope
 
     def _get_file_cache_key(self, content_hash: str) -> str:
         """Gets the namespaced key for the file cache."""
@@ -1045,7 +2077,7 @@ class FilesAPIManager:
                 )
 
             log.debug(f"{uploaded_file.name} uploaded.")
-            log.trace("Uploaded file details:", payload=uploaded_file)
+            log.trace("Uploaded file details omitted from logs.")
 
             # Check if the file is already active. If so, we can skip polling.
             if uploaded_file.state == types.FileState.ACTIVE:
@@ -1114,7 +2146,7 @@ class FilesAPIManager:
                 )
 
             log.debug(f"{uploaded_file.name} uploaded.")
-            log.trace("Uploaded file details:", payload=uploaded_file)
+            log.trace("Uploaded file details omitted from logs.")
 
             if uploaded_file.state == types.FileState.ACTIVE:
                 log.debug(f"File {uploaded_file.name} is already ACTIVE. Skipping poll.")
@@ -1362,7 +2394,7 @@ class PDFMitigationManager:
 
 
 class GeminiContentBuilder:
-    """Builds a list of `google.genai.types.Content` objects from the OWUI's body payload."""
+    """Builds a canonical Interactions step ledger from an Open WebUI request."""
 
     def __init__(
         self,
@@ -1386,14 +2418,14 @@ class GeminiContentBuilder:
         self.pdf_mitigation_manager = pdf_mitigation_manager
         # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
-        self.vertexai = self.files_api_manager.client.vertexai
+        self.is_enterprise = self.files_api_manager.endpoint_identity.service == "enterprise"
 
         self.system_prompt, self.messages_body = self._extract_system_prompt(self.messages_body)
         self.metadata_body = metadata_body
         self.user_data = user_data
         self.messages_db = None
 
-    async def build_contents(self) -> list[types.Content]:
+    async def build_contents(self) -> list[interaction_types.StepParam]:
         """
         The main public method to generate the contents list by processing all
         message turns concurrently and using a self-configuring status manager.
@@ -1402,7 +2434,7 @@ class GeminiContentBuilder:
         self.messages_db = await self._fetch_and_validate_chat_history(
             self.metadata_body, self.user_data
         )
-        log.trace("Database messages: ", payload=self.messages_db)
+        log.trace("Database history loaded; signed message state omitted from logs.")
         # Retrieve cumulative usage from the DB history and inject it into metadata.
         # This will be picked up later when constructing the final usage payload.
         c_tokens, c_cost = self._retrieve_previous_usage_data()
@@ -1435,21 +2467,90 @@ class GeminiContentBuilder:
         # 4. Wait for the manager to finish processing all reported uploads.
         await manager_task
 
-        # 5. Filter and assemble the final contents list.
-        contents: list[types.Content] = []
+        # 5. Flatten message results without changing turn or attachment order.
+        steps: list[interaction_types.StepParam] = []
         content_errors: list[Exception] = []
         for i, res in enumerate(results):
-            if isinstance(res, types.Content):
-                contents.append(res)
+            if isinstance(res, list):
+                steps.extend(res)
             elif isinstance(res, Exception):
                 content_errors.append(res)
-                log.error(
-                    f"An error occurred while processing message {i} concurrently.",
-                    payload=res,
-                )
+                log.error(f"An error occurred while processing message {i} concurrently.")
         if content_errors:
             raise ContentBuildError(str(content_errors[0])) from content_errors[0]
-        return contents
+        self._validate_request_size(steps)
+        return steps
+
+    @staticmethod
+    def _parse_interaction_envelope(message: "ChatMessageTD") -> InteractionEnvelopeV1 | None:
+        payload = message.get("gemini_interaction")
+        if payload is None:
+            return None
+        try:
+            return InteractionEnvelopeV1.model_validate(payload)
+        except pydantic_core.ValidationError as exc:
+            raise ContentBuildError(
+                "Stored gemini_interaction envelope is malformed or uses an unsupported version."
+            ) from exc
+
+    def _canonical_visible_content(self, content: str, sources: list["Source"] | None) -> str:
+        content, _thoughts = self._pop_thoughts(content)
+        if sources:
+            content = self._remove_citation_markers(content, sources)
+        return content.strip()
+
+    def select_continuation(
+        self,
+        full_input: list[interaction_types.StepParam],
+        *,
+        store: bool,
+        endpoint_scope: str,
+        model_id: str,
+    ) -> ContinuationDecision:
+        """Select server continuation only from the immediate active branch parent."""
+        if not store:
+            return ContinuationDecision(full_input, None, False, "storage_disabled")
+        if not self.messages_db or len(self.messages_db) < 2 or len(self.messages_body) < 2:
+            return ContinuationDecision(full_input, None, False, "no_parent")
+        parent_db = self.messages_db[-2]
+        parent_body = self.messages_body[-2]
+        if parent_db.get("role") != "assistant" or parent_body.get("role") != "assistant":
+            return ContinuationDecision(full_input, None, False, "parent_not_assistant")
+        envelope = self._parse_interaction_envelope(parent_db)
+        if envelope is None:
+            return ContinuationDecision(full_input, None, False, "non_gemini_parent")
+        sources = parent_db.get("sources")
+        current_content = self._canonical_visible_content(
+            cast("AssistantMessage", parent_body).get("content", ""), sources
+        )
+        eligible = bool(
+            envelope.store
+            and envelope.status == "completed"
+            and envelope.interaction_id
+            and envelope.endpoint_scope == endpoint_scope
+            and envelope.model_id == model_id
+            and current_content == envelope.visible_content.strip()
+        )
+        if not eligible:
+            return ContinuationDecision(full_input, None, False, "parent_not_eligible")
+        if not full_input or full_input[-1].get("type") != "user_input":
+            raise ContentBuildError("Active branch does not end in the current user input.")
+        return ContinuationDecision(
+            [full_input[-1]], envelope.interaction_id, True, "same_scope_completed_parent"
+        )
+
+    def _validate_request_size(self, steps: list[interaction_types.StepParam]) -> None:
+        payload = {
+            "input": steps,
+            "system_instruction": self.system_prompt,
+        }
+        payload_size = len(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        )
+        if payload_size > GEMINI_INTERACTION_MAX_REQUEST_BYTES:
+            raise ContentBuildError(
+                f"Interaction request payload is {payload_size} bytes, exceeding the 100 MiB limit."
+            )
 
     def _retrieve_previous_usage_data(self) -> tuple[int | None, float | None]:
         """
@@ -1544,87 +2645,56 @@ class GeminiContentBuilder:
 
     async def _process_message_turn(
         self, i: int, message: "Message", status_queue: asyncio.Queue
-    ) -> types.Content | None:
-        """
-        Processes a single message turn, handling user and assistant roles,
-        and returns a complete `types.Content` object. Designed to be run concurrently.
-        """
+    ) -> list[interaction_types.StepParam] | None:
+        """Convert one OWUI message into one or more canonical Interaction steps."""
         role = message.get("role")
-        parts: list[types.Part] = []
 
         if role == "user":
             message = cast("UserMessage", message)
-            # Logic for retrieving files is now handled inside _process_user_message
-            # to allow for finer control over which file types are included based on task mode.
-            parts = await self._process_user_message(i, message, status_queue)
-            # Case 1: User content is completely empty (no text, no files).
-            if not parts:
+            contents = await self._process_user_message(i, message, status_queue)
+            if not contents:
                 log.info(
                     f"User message at index {i} is completely empty. "
                     "Injecting a prompt to ask for clarification."
                 )
-                # Inform the user via a toast notification.
                 toast_msg = (
                     f"Your message #{i + 1} was empty. The assistant will ask for clarification."
                 )
                 self.event_emitter.emit_toast(toast_msg, "info")
-
                 clarification_prompt = (
                     "The user sent an empty message. Please ask the user for "
                     "clarification on what they would like to ask or discuss."
                 )
-                # This will become the only part for this user message.
-                parts = await self._genai_parts_from_text(clarification_prompt, status_queue)
-            else:
-                # Case 2: User has sent content, check if it includes text.
-                has_text_component = any(p.text for p in parts if p.text)
-                if not has_text_component:
-                    # The user sent content (e.g., files) but no accompanying text.
-                    if self.vertexai:
-                        # Vertex AI requires a text part in multi-modal messages.
-                        log.info(
-                            f"User message at index {i} lacks a text component for Vertex AI. "
-                            "Adding default text prompt."
-                        )
-                        # Inform the user via a toast notification.
-                        toast_msg = (
-                            f"For your message #{i + 1}, a default prompt was added as text is required "
-                            "for requests with attachments when using Vertex AI."
-                        )
-                        self.event_emitter.emit_toast(toast_msg, "info")
-
-                        default_prompt_text = (
-                            "The user did not send any text message with the additional context. "
-                            "Answer by summarizing the newly added context."
-                        )
-                        default_text_parts = await self._genai_parts_from_text(
-                            default_prompt_text, status_queue
-                        )
-                        parts.extend(default_text_parts)
-                    else:
-                        # Google Developer API allows no-text user content.
-                        log.info(
-                            f"User message at index {i} lacks a text component for Google Developer API. "
-                            "Proceeding with non-text parts only."
-                        )
+                contents = await self._interaction_contents_from_text(
+                    clarification_prompt, status_queue
+                )
+            elif self.is_enterprise and not any(
+                content.get("type") == "text" for content in contents
+            ):
+                default_prompt_text = (
+                    "The user did not send any text message with the additional context. "
+                    "Answer by summarizing the newly added context."
+                )
+                contents.extend(
+                    await self._interaction_contents_from_text(default_prompt_text, status_queue)
+                )
+                self.event_emitter.emit_toast(
+                    f"For your message #{i + 1}, a default prompt was added as text is required "
+                    "for requests with attachments when using Gemini Enterprise.",
+                    "info",
+                )
+            return [interaction_types.UserInputStepParam(type="user_input", content=contents)]
         elif role == "assistant":
             message = cast("AssistantMessage", message)
-            # Google API's assistant role is "model"
-            role = "model"
             message_db = self.messages_db[i] if self.messages_db else None
             sources = message_db.get("sources") if message_db else None
-            parts = await self._process_assistant_message(
+            return await self._process_assistant_message(
                 i, message, message_db, sources, status_queue
             )
-        else:
-            warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
-            log.warning(warn_msg)
-            self.event_emitter.emit_toast(warn_msg, "warning")
-            return None
 
-        # Only create a Content object if there are parts to include.
-        if parts:
-            return types.Content(parts=parts, role=role)
+        warn_msg = f"Message {i} has an invalid role: {role}. Skipping to the next message."
+        log.warning(warn_msg)
+        self.event_emitter.emit_toast(warn_msg, "warning")
         return None
 
     async def _process_user_message(
@@ -1632,8 +2702,8 @@ class GeminiContentBuilder:
         i: int,
         message: "UserMessage",
         status_queue: asyncio.Queue,
-    ) -> list[types.Part]:
-        user_parts: list[types.Part] = []
+    ) -> list[interaction_types.ContentParam]:
+        user_contents: list[interaction_types.ContentParam] = []
         db_files_processed = False
 
         # PATH 1: Database is available (Normal Chat).
@@ -1667,20 +2737,20 @@ class GeminiContentBuilder:
                     if file_id := file.get("id"):
                         uri = f"/api/v1/files/{file_id}/content"
                         upload_tasks.append(
-                            self._genai_parts_from_uri(
+                            self._interaction_contents_from_uri(
                                 uri,
                                 status_queue,
                                 source_name=file.get("name"),
                             )
                         )
                     else:
-                        log.warning("Could not determine ID for file in DB.", payload=file)
+                        log.warning("Could not determine ID for a database file entry.")
 
                 if upload_tasks:
                     log.info(f"Processing {len(upload_tasks)} file(s) from database.")
                     results = await asyncio.gather(*upload_tasks)
                     for result in results:
-                        user_parts.extend(result)
+                        user_contents.extend(result)
 
         # Now, process the content from the message payload.
         user_content = message.get("content")
@@ -1692,14 +2762,16 @@ class GeminiContentBuilder:
             warn_msg = "User message content is not a string or list, skipping."
             log.warning(warn_msg)
             self.event_emitter.emit_toast(warn_msg, "warning")
-            return user_parts
+            return user_contents
 
         for c in user_content_list:
             c_type = c.get("type")
             if c_type == "text":
                 c = cast("TextContent", c)
                 if c_text := c.get("text"):
-                    user_parts.extend(await self._genai_parts_from_text(c_text, status_queue))
+                    user_contents.extend(
+                        await self._interaction_contents_from_text(c_text, status_queue)
+                    )
 
             # PATH 2: Temporary Chat Image Handling.
             # FIXME: this puts images to the end of the message, see if it matters where they are.
@@ -1707,50 +2779,84 @@ class GeminiContentBuilder:
                 log.info("Processing image from payload (temporary chat mode).")
                 c = cast("ImageContent", c)
                 if uri := c.get("image_url", {}).get("url"):
-                    user_parts.extend(await self._genai_parts_from_uri(uri, status_queue))
+                    user_contents.extend(
+                        await self._interaction_contents_from_uri(uri, status_queue)
+                    )
 
-        return user_parts
+        return user_contents
 
-    async def _rehydrate_assistant_parts(
+    async def _rehydrate_assistant_steps(
         self,
-        gemini_parts: list[dict[str, Any]],
-        status_queue: asyncio.Queue,
-    ) -> list[types.Part]:
-        """
-        Reconstructs `types.Part` objects from dictionaries, rehydrating file-based parts
-        by fetching their content from the OWUI backend.
-        """
-        rehydrated_parts: list[types.Part] = []
-        for part_dict in gemini_parts:
-            part = types.Part.model_validate(part_dict)
+        stored_steps: list[dict[str, object]],
+        stored_endpoint_scope: str | None,
+    ) -> list[interaction_types.StepParam]:
+        """Validate an exact persisted ledger and restore local generated media."""
+        validated = TypeAdapter(list[interaction_types.Step]).validate_python(stored_steps)
+        payloads: list[dict[str, object]] = [
+            cast(dict[str, object], step.model_dump(mode="json", exclude_none=True))
+            for step in validated
+        ]
+        if self._contains_unknown_variant(payloads):
+            raise ValueError("Stored Interaction history contains an unknown step or content type.")
 
-            if part.file_data and (file_uri := part.file_data.file_uri):
-                if not file_uri.startswith("/api/v1/files/"):
-                    raise ValueError(
-                        f"Unsupported file_uri in assistant history: {file_uri}. "
-                        "Only local Open WebUI files are supported for reconstruction."
-                    )
+        has_scoped_uri = self._contains_nonlocal_uri(payloads)
+        current_scope = self.files_api_manager.endpoint_identity.scope
+        if has_scoped_uri and stored_endpoint_scope != current_scope:
+            raise ForeignEndpointReplayError(
+                "Stored Interaction history contains a URI from a different endpoint identity."
+            )
 
-                file_id = file_uri.split("/")[4]
-                file_bytes, mime_type = await self._get_file_data(file_id)
+        rehydrated = await self._rehydrate_local_media(payloads)
+        return cast(list[interaction_types.StepParam], rehydrated)
 
-                if not (file_bytes and mime_type):
-                    raise ValueError(
-                        f"Could not retrieve content for file_id '{file_id}' from assistant history."
-                    )
+    @classmethod
+    def _contains_unknown_variant(cls, value: object) -> bool:
+        if isinstance(value, dict):
+            if value.get("type") == "UNKNOWN" or value.get("is_unknown") is True:
+                return True
+            return any(cls._contains_unknown_variant(item) for item in value.values())
+        if isinstance(value, list):
+            return any(cls._contains_unknown_variant(item) for item in value)
+        return False
 
-                # Force raw bytes (inline_data) to preserve exact history context for the model.
-                # This ensures we don't convert original inline images into Files API references.
-                rehydrated_part = await self._create_genai_part_from_file_data(
-                    file_bytes, mime_type, file_id, status_queue, force_raw=True
+    @classmethod
+    def _contains_nonlocal_uri(cls, value: object) -> bool:
+        if isinstance(value, dict):
+            uri = value.get("uri")
+            if isinstance(uri, str) and not uri.startswith("/api/v1/files/"):
+                return True
+            return any(cls._contains_nonlocal_uri(item) for item in value.values())
+        if isinstance(value, list):
+            return any(cls._contains_nonlocal_uri(item) for item in value)
+        return False
+
+    async def _rehydrate_local_media(self, value: object) -> object:
+        if isinstance(value, list):
+            return [await self._rehydrate_local_media(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        restored = dict(value)
+        uri = restored.get("uri")
+        media_type = restored.get("type")
+        if (
+            isinstance(uri, str)
+            and uri.startswith("/api/v1/files/")
+            and media_type in {"image", "audio", "video", "document"}
+        ):
+            file_id = uri.split("/")[4]
+            file_bytes, mime_type = await self._get_file_data(file_id)
+            if not file_bytes or not mime_type:
+                raise ValueError(
+                    f"Could not retrieve content for file_id '{file_id}' from assistant history."
                 )
-                part.inline_data = rehydrated_part.inline_data
-                part.file_data = rehydrated_part.file_data
-                rehydrated_parts.append(part)
-            else:
-                rehydrated_parts.append(part)
+            restored.pop("uri", None)
+            restored["data"] = self._encode_data(file_bytes)
+            restored["mime_type"] = mime_type
 
-        return rehydrated_parts
+        for key, item in list(restored.items()):
+            restored[key] = await self._rehydrate_local_media(item)
+        return restored
 
     def _pop_thoughts(self, content: str) -> tuple[str, list[str]]:
         """
@@ -1781,14 +2887,13 @@ class GeminiContentBuilder:
         message_db: "ChatMessageTD | None",
         sources: list["Source"] | None,
         status_queue: asyncio.Queue,
-    ) -> list[types.Part]:
+    ) -> list[interaction_types.StepParam]:
         """
-        Processes an assistant message, prioritizing reconstruction from stored 'gemini_parts'
-        if available and unmodified. Falls back to processing the text content if parts
+        Processes an assistant message, prioritizing the stored Interaction step ledger
+        when available and unmodified. Falls back to processing the rendered text if steps
         are missing or if the user has edited the message.
         """
-        gemini_parts = message_db.get("gemini_parts") if message_db else None
-        original_content = message_db.get("original_content") if message_db else None
+        envelope = self._parse_interaction_envelope(message_db) if message_db else None
         current_content = message_body.get("content", "")
 
         # 1. Pop thoughts out before any comparison or citation stripping.
@@ -1799,23 +2904,28 @@ class GeminiContentBuilder:
         if sources:
             current_content = self._remove_citation_markers(current_content, sources)
 
-        # --- PATH 1: Restore from stored parts (ideal case) ---
-        if gemini_parts and original_content is not None:
+        # --- PATH 1: Restore the exact canonical ledger when the rendered text is unchanged. ---
+        if envelope is not None:
             # Now current_content has no thoughts and no citations,
             # making it directly comparable to original_content.
-            if current_content.strip() == original_content.strip():
+            if current_content.strip() == envelope.visible_content.strip():
                 log.debug(f"Reconstructing assistant message at index {i} from stored parts.")
                 try:
-                    return await self._rehydrate_assistant_parts(gemini_parts, status_queue)
+                    return await self._rehydrate_assistant_steps(
+                        cast(list[dict[str, object]], envelope.steps),
+                        envelope.endpoint_scope,
+                    )
+                except ForeignEndpointReplayError as exc:
+                    raise ContentBuildError(str(exc)) from exc
                 except (pydantic_core.ValidationError, TypeError, ValueError):
                     log.exception(
-                        f"Failed to reconstruct types.Part for message {i} from stored gemini_parts. "
+                        f"Failed to reconstruct Interaction steps for message {i}. "
                         "Falling back to text processing."
                     )
             else:
                 # A meaningful edit was detected after accounting for whitespace.
                 diff = difflib.unified_diff(
-                    original_content.strip().splitlines(keepends=True),
+                    envelope.visible_content.strip().splitlines(keepends=True),
                     current_content.strip().splitlines(keepends=True),
                     fromfile="original_content_stripped",
                     tofile="current_content_stripped",
@@ -1834,9 +2944,8 @@ class GeminiContentBuilder:
                     "warning",
                 )
         elif message_db:
-            # Warn if the message was likely from another model (no-toast).
             log.warning(
-                f"Assistant message at index {i} lacks 'gemini_parts' or 'original_content'. "
+                f"Assistant message at index {i} lacks canonical Interaction history. "
                 "This message was likely not generated by this plugin. "
                 "Falling back to processing its plain text content."
             )
@@ -1844,16 +2953,17 @@ class GeminiContentBuilder:
         # --- PATH 2: Fallback to processing text content ---
         # This path is used for non-Gemini messages, edited messages, or on reconstruction failure.
         log.debug(f"Processing assistant message {i} content as plain text.")
-        return await self._genai_parts_from_text(current_content, status_queue)
+        contents = await self._interaction_contents_from_text(current_content, status_queue)
+        return [interaction_types.ModelOutputStepParam(type="model_output", content=contents)]
 
-    async def _genai_parts_from_text(
+    async def _interaction_contents_from_text(
         self, text: str, status_queue: asyncio.Queue
-    ) -> list[types.Part]:
+    ) -> list[interaction_types.ContentParam]:
         if not text:
             return []
 
         text = self._enable_special_tags(text)
-        parts: list[types.Part] = []
+        contents: list[interaction_types.ContentParam] = []
         last_pos = 0
 
         # Conditionally build a regex to find media links.
@@ -1872,42 +2982,42 @@ class GeminiContentBuilder:
         for match in pattern.finditer(text):
             # Add the text segment that precedes the media link
             if text_segment := text[last_pos : match.start()].strip():
-                parts.append(types.Part.from_text(text=text_segment))
+                contents.append(self._text_content(text_segment))
 
             # The URI is in group 1 for markdown, or group 2 for YouTube.
             uri = match.group(1) or match.group(2) if process_youtube else match.group(1)
 
             if not uri:
-                log.warning(f"Found unsupported URI format in text: {match.group(0)}. Skipping.")
+                log.warning("Found an unsupported URI format in text; skipping it.")
                 continue
 
             # Delegate all URI processing to the unified helper
-            media_parts = await self._genai_parts_from_uri(uri, status_queue)
-            parts.extend(media_parts)
+            media_contents = await self._interaction_contents_from_uri(uri, status_queue)
+            contents.extend(media_contents)
 
             last_pos = match.end()
 
         # Add any remaining text after the last media link
         if remaining_text := text[last_pos:].strip():
-            parts.append(types.Part.from_text(text=remaining_text))
+            contents.append(self._text_content(remaining_text))
 
         # If no media links were found, the whole text is a single part
-        if not parts and text.strip():
-            parts.append(types.Part.from_text(text=text.strip()))
+        if not contents and text.strip():
+            contents.append(self._text_content(text.strip()))
 
-        return parts
+        return contents
 
-    async def _genai_parts_from_uri(
+    @staticmethod
+    def _text_content(text: str) -> interaction_types.TextContentParam:
+        return interaction_types.TextContentParam(type="text", text=text)
+
+    async def _interaction_contents_from_uri(
         self,
         uri: str,
         status_queue: asyncio.Queue,
         source_name: str | None = None,
-    ) -> list[types.Part]:
-        """
-        Processes any resource URI and returns zero or more genai.types.Part objects.
-        This is the central dispatcher for all media processing, handling data URIs,
-        local API file paths, and YouTube URLs.
-        """
+    ) -> list[interaction_types.ContentParam]:
+        """Resolve an OWUI/data/YouTube URI into ordered Interaction content."""
         if not uri:
             log.warning("Received an empty URI, skipping.")
             return []
@@ -1920,14 +3030,14 @@ class GeminiContentBuilder:
             owui_file_id: str | None = None
 
             # Step 1: Extract bytes and mime_type from the URI if applicable
-            if uri.startswith("data:image"):
-                match = re.match(r"data:(image/\w+);base64,(.+)", uri)
+            if uri.startswith("data:"):
+                match = re.match(r"data:([^;,]+);base64,(.+)", uri, re.DOTALL)
                 if not match:
-                    raise ValueError("Invalid data URI for image.")
+                    raise ValueError("Invalid base64 data URI.")
                 mime_type, base64_data = match.group(1), match.group(2)
-                file_bytes = base64.b64decode(base64_data)
+                file_bytes = base64.b64decode(base64_data, validate=True)
             elif uri.startswith("/api/v1/files/"):
-                log.info(f"Processing local API file URI: {uri}")
+                log.info("Processing a local API file URI.")
                 file_id = uri.split("/")[4]
                 owui_file_id = file_id
                 source = await self._get_file_source(file_id)
@@ -1937,11 +3047,9 @@ class GeminiContentBuilder:
                     mime_type = source.mime_type
                     is_temp_source = source.is_temp
             elif "youtube.com/" in uri or "youtu.be/" in uri:
-                log.info(f"Found YouTube URL: {uri}")
-                part = self._genai_part_from_youtube_uri(uri)
-                return [part] if part else []
-            # TODO: Google Cloud Storage bucket support.
-            # elif uri.startswith("gs://"): ...
+                log.info("Found a YouTube URL.")
+                content = self._interaction_content_from_youtube_uri(uri)
+                return [content] if content else []
             else:
                 warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
                 log.warning(warn_msg)
@@ -1951,7 +3059,7 @@ class GeminiContentBuilder:
             # Step 2: If we have bytes, create the Part using the modularized helper
             if mime_type and (file_bytes or file_path):
                 try:
-                    return await self._create_genai_parts_from_file_source(
+                    return await self._create_interaction_contents_from_file_source(
                         file_bytes=file_bytes,
                         file_path=file_path,
                         mime_type=mime_type,
@@ -1981,17 +3089,10 @@ class GeminiContentBuilder:
             self.event_emitter.emit_toast(error_msg, "error")
             raise ContentBuildError(error_msg) from e
         except Exception:
-            log.exception(f"Error processing URI: {uri[:64]}[...]")
+            log.exception("Error processing a URI; value omitted from logs.")
             return []
 
-    async def _genai_part_from_uri(
-        self, uri: str, status_queue: asyncio.Queue
-    ) -> types.Part | None:
-        """Compatibility wrapper for callers that only expect the first part."""
-        parts = await self._genai_parts_from_uri(uri, status_queue)
-        return parts[0] if parts else None
-
-    async def _create_genai_parts_from_file_data(
+    async def _create_interaction_contents_from_file_data(
         self,
         file_bytes: bytes,
         mime_type: str,
@@ -1999,8 +3100,8 @@ class GeminiContentBuilder:
         status_queue: asyncio.Queue,
         force_raw: bool = False,
         source_name: str | None = None,
-    ) -> list[types.Part]:
-        return await self._create_genai_parts_from_file_source(
+    ) -> list[interaction_types.ContentParam]:
+        return await self._create_interaction_contents_from_file_source(
             file_bytes=file_bytes,
             file_path=None,
             mime_type=mime_type,
@@ -2010,7 +3111,7 @@ class GeminiContentBuilder:
             source_name=source_name,
         )
 
-    async def _create_genai_parts_from_file_source(
+    async def _create_interaction_contents_from_file_source(
         self,
         *,
         file_bytes: bytes | None,
@@ -2020,7 +3121,7 @@ class GeminiContentBuilder:
         status_queue: asyncio.Queue,
         force_raw: bool = False,
         source_name: str | None = None,
-    ) -> list[types.Part]:
+    ) -> list[interaction_types.ContentParam]:
         if mime_type == "application/pdf" and self.valves.PDF_LIMIT_MITIGATION and not force_raw:
             outcome = await self.pdf_mitigation_manager.prepare(
                 file_bytes=file_bytes,
@@ -2034,16 +3135,12 @@ class GeminiContentBuilder:
             page_count = result.page_count
             if result.was_mitigated:
                 pdf_label = source_name or owui_file_id or "attached PDF"
-                parts: list[types.Part] = []
+                contents: list[interaction_types.ContentParam] = []
 
                 if len(result.parts) > 1:
-                    parts.append(
-                        types.Part.from_text(
-                            text=self._pdf_split_instruction_text(
-                                pdf_label,
-                                result.parts,
-                                page_count,
-                            )
+                    contents.append(
+                        self._text_content(
+                            self._pdf_split_instruction_text(pdf_label, result.parts, page_count)
                         )
                     )
                     self.event_emitter.emit_status(
@@ -2062,8 +3159,8 @@ class GeminiContentBuilder:
                     synthetic_id = self._synthetic_pdf_part_id(
                         owui_file_id, original_hash, i, len(result.parts)
                     )
-                    parts.append(
-                        await self._create_genai_part_from_file_path(
+                    contents.append(
+                        await self._create_interaction_content_from_file_path(
                             file_path=pdf_part.path,
                             mime_type=mime_type,
                             owui_file_id=synthetic_id,
@@ -2071,11 +3168,11 @@ class GeminiContentBuilder:
                             force_raw=force_raw,
                         )
                     )
-                return parts
+                return contents
 
         if file_path:
             return [
-                await self._create_genai_part_from_file_path(
+                await self._create_interaction_content_from_file_path(
                     file_path=file_path,
                     mime_type=mime_type,
                     owui_file_id=owui_file_id,
@@ -2088,7 +3185,7 @@ class GeminiContentBuilder:
             return []
 
         return [
-            await self._create_genai_part_from_file_data(
+            await self._create_interaction_content_from_file_data(
                 file_bytes=file_bytes,
                 mime_type=mime_type,
                 owui_file_id=owui_file_id,
@@ -2128,18 +3225,15 @@ class GeminiContentBuilder:
         suffix = "optimized" if total == 1 else f"part-{index + 1:04d}-of-{total:04d}"
         return f"{base_id}:pdf:{original_hash}:{suffix}"
 
-    async def _create_genai_part_from_file_data(
+    async def _create_interaction_content_from_file_data(
         self,
         file_bytes: bytes,
         mime_type: str,
         owui_file_id: str | None,
         status_queue: asyncio.Queue,
         force_raw: bool = False,
-    ) -> types.Part:
-        """
-        Creates a `types.Part` from file bytes, deciding whether to use the
-        Google Files API or send raw bytes based on configuration and context.
-        """
+    ) -> interaction_types.ContentParam:
+        """Create URI-backed or explicitly base64-encoded Interaction content."""
         # TODO: The Files API is strict about MIME types (e.g., text/plain,
         # application/pdf). In the future, inspect the content of files
         # with unsupported text-like MIME types (e.g., 'application/json',
@@ -2156,8 +3250,8 @@ class GeminiContentBuilder:
         elif not self.valves.USE_FILES_API:
             reason = "disabled by user setting (USE_FILES_API=False)"
             use_files_api = False
-        elif self.vertexai:
-            reason = "the active client is configured for Vertex AI, which does not support the Files API"
+        elif self.is_enterprise:
+            reason = "the active client is configured for Gemini Enterprise, which does not support the Files API"
             use_files_api = False
         elif self.is_temp_chat:
             reason = "temporary chat mode is active"
@@ -2171,28 +3265,28 @@ class GeminiContentBuilder:
                 owui_file_id=owui_file_id,
                 status_queue=status_queue,
             )
-            return types.Part(
-                file_data=types.FileData(
-                    file_uri=gemini_file.uri,
-                    mime_type=gemini_file.mime_type,
-                )
+            if not gemini_file.uri:
+                raise FilesAPIError("Uploaded file did not provide a URI.")
+            return self._media_content(
+                mime_type=gemini_file.mime_type or mime_type,
+                uri=gemini_file.uri,
             )
         else:
             log.info(f"Sending raw bytes because {reason}.")
-            return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+            return self._media_content(
+                mime_type=mime_type,
+                data=self._encode_data(file_bytes),
+            )
 
-    async def _create_genai_part_from_file_path(
+    async def _create_interaction_content_from_file_path(
         self,
         file_path: str,
         mime_type: str,
         owui_file_id: str | None,
         status_queue: asyncio.Queue,
         force_raw: bool = False,
-    ) -> types.Part:
-        """
-        Creates a `types.Part` from a local path. Prefer this for large files so
-        hashing and Files API upload do not require a full in-memory byte copy.
-        """
+    ) -> interaction_types.ContentParam:
+        """Create Interaction content from a local path without foreign URI reuse."""
         use_files_api = True
         reason = ""
 
@@ -2202,8 +3296,8 @@ class GeminiContentBuilder:
         elif not self.valves.USE_FILES_API:
             reason = "disabled by user setting (USE_FILES_API=False)"
             use_files_api = False
-        elif self.vertexai:
-            reason = "the active client is configured for Vertex AI, which does not support the Files API"
+        elif self.is_enterprise:
+            reason = "the active client is configured for Gemini Enterprise, which does not support the Files API"
             use_files_api = False
         elif self.is_temp_chat:
             reason = "temporary chat mode is active"
@@ -2217,45 +3311,78 @@ class GeminiContentBuilder:
                 owui_file_id=owui_file_id,
                 status_queue=status_queue,
             )
-            return types.Part(
-                file_data=types.FileData(
-                    file_uri=gemini_file.uri,
-                    mime_type=gemini_file.mime_type,
-                )
+            if not gemini_file.uri:
+                raise FilesAPIError("Uploaded file did not provide a URI.")
+            return self._media_content(
+                mime_type=gemini_file.mime_type or mime_type,
+                uri=gemini_file.uri,
             )
 
         log.info(f"Sending raw bytes because {reason}.")
         async with aiofiles.open(file_path, "rb") as file:
             file_bytes = await file.read()
-        return types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+        return self._media_content(
+            mime_type=mime_type,
+            data=self._encode_data(file_bytes),
+        )
 
-    def _genai_part_from_youtube_uri(self, uri: str) -> types.Part | None:
-        """Creates a Gemini Part from a YouTube URL, with optional video metadata.
+    @staticmethod
+    def _encode_data(file_bytes: bytes) -> str:
+        return base64.b64encode(file_bytes).decode("ascii")
 
-        Handles standard (`watch?v=`), short (`youtu.be/`), mobile (`shorts/`),
-        and live (`live/`) URLs. Metadata is parsed for the Gemini Developer API
-        but ignored for Vertex AI, which receives a simple URI Part.
+    @staticmethod
+    def _media_content(
+        *,
+        mime_type: str,
+        data: str | None = None,
+        uri: str | None = None,
+    ) -> interaction_types.ContentParam:
+        if (data is None) == (uri is None):
+            raise ValueError("Interaction media content requires exactly one of data or uri.")
+        if mime_type.startswith("image/"):
+            image_mime = cast(interaction_types.ImageContentMimeType, mime_type)
+            if data is not None:
+                return interaction_types.ImageContentParam(
+                    type="image", mime_type=image_mime, data=data
+                )
+            return interaction_types.ImageContentParam(
+                type="image", mime_type=image_mime, uri=cast(str, uri)
+            )
+        if mime_type.startswith("audio/"):
+            audio_mime = cast(interaction_types.AudioContentMimeType, mime_type)
+            if data is not None:
+                return interaction_types.AudioContentParam(
+                    type="audio", mime_type=audio_mime, data=data
+                )
+            return interaction_types.AudioContentParam(
+                type="audio", mime_type=audio_mime, uri=cast(str, uri)
+            )
+        if mime_type.startswith("video/"):
+            video_mime = cast(interaction_types.VideoContentMimeType, mime_type)
+            if data is not None:
+                return interaction_types.VideoContentParam(
+                    type="video", mime_type=video_mime, data=data
+                )
+            return interaction_types.VideoContentParam(
+                type="video", mime_type=video_mime, uri=cast(str, uri)
+            )
+        document_mime = cast(interaction_types.DocumentContentMimeType, mime_type)
+        if data is not None:
+            return interaction_types.DocumentContentParam(
+                type="document", mime_type=document_mime, data=data
+            )
+        return interaction_types.DocumentContentParam(
+            type="document", mime_type=document_mime, uri=cast(str, uri)
+        )
 
-        - **Start/End Time**: `?t=<value>` and `#end=<value>`. The value can be a
-          flexible duration (e.g., "1m30s", "90") and will be converted to seconds.
-        - **Frame Rate**: Can be specified in two ways (if both are present,
-          `interval` takes precedence):
-          - **Interval**: `#interval=<value>` (e.g., `#interval=10s`, `#interval=0.5s`).
-            The value is a flexible duration converted to seconds, then to FPS (1/interval).
-          - **FPS**: `#fps=<value>` (e.g., `#fps=2.5`).
-          The final FPS value must be in the range (0, 24].
-
-        Args:
-            uri: The raw YouTube URL from the user.
-            is_vertex_client: If True, creates a simple Part for Vertex AI.
-
-        Returns:
-            A `types.Part` object, or `None` if the URI is not a valid YouTube link.
-        """
+    def _interaction_content_from_youtube_uri(
+        self, uri: str
+    ) -> interaction_types.VideoContentParam | None:
+        """Canonicalize a YouTube URL into the fields supported by Interactions."""
         # Convert YouTube Music URLs to standard YouTube URLs for consistent parsing.
         if "music.youtube.com" in uri:
             uri = uri.replace("music.youtube.com", "www.youtube.com")
-            log.info(f"Converted YouTube Music URL to standard URL: {uri}")
+            log.info("Converted a YouTube Music URL to its standard form.")
 
         # Regex to capture the 11-character video ID from various YouTube URL formats.
         video_id_pattern = re.compile(
@@ -2264,111 +3391,25 @@ class GeminiContentBuilder:
 
         match = video_id_pattern.search(uri)
         if not match:
-            log.warning(f"Could not extract a valid YouTube video ID from URI: {uri}")
+            log.warning("Could not extract a valid YouTube video ID from the supplied URI.")
             return None
 
         video_id = match.group(1)
         canonical_uri = f"https://www.youtube.com/watch?v={video_id}"
-
-        # --- Branching logic for Vertex AI vs. Gemini Developer API ---
-        if self.vertexai:
-            return types.Part.from_uri(file_uri=canonical_uri, mime_type="video/mp4")
-        else:
-            parsed_uri = urlparse(uri)
-            query_params = parse_qs(parsed_uri.query)
-            fragment_params = parse_qs(parsed_uri.fragment)
-
-            start_offset: str | None = None
-            end_offset: str | None = None
-            fps: float | None = None
-
-            # Start time from query `t`. Convert flexible format to "Ns".
-            if "t" in query_params:
-                raw_start = query_params["t"][0]
-                if (total_seconds := self._parse_duration_to_seconds(raw_start)) is not None:
-                    start_offset = f"{total_seconds}s"
-
-            # End time from fragment `end`. Convert flexible format to "Ns".
-            if "end" in fragment_params:
-                raw_end = fragment_params["end"][0]
-                if (total_seconds := self._parse_duration_to_seconds(raw_end)) is not None:
-                    end_offset = f"{total_seconds}s"
-
-            # Frame rate from fragment `interval` or `fps`. `interval` takes precedence.
-            if "interval" in fragment_params:
-                raw_interval = fragment_params["interval"][0]
-                if (
-                    interval_seconds := self._parse_duration_to_seconds(raw_interval)
-                ) is not None and interval_seconds > 0:
-                    calculated_fps = 1.0 / interval_seconds
-                    if 0.0 < calculated_fps <= 24.0:
-                        fps = calculated_fps
-                    else:
-                        log.warning(
-                            f"Interval '{raw_interval}' results in FPS '{calculated_fps}' which is outside the valid range (0.0, 24.0]. Ignoring."
-                        )
-
-            # Fall back to `fps` param if not set by `interval`.
-            if fps is None and "fps" in fragment_params:
-                try:
-                    fps_val = float(fragment_params["fps"][0])
-                    if 0.0 < fps_val <= 24.0:
-                        fps = fps_val
-                    else:
-                        log.warning(
-                            f"FPS value '{fps_val}' is outside the valid range (0.0, 24.0]. Ignoring."
-                        )
-                except (ValueError, IndexError):
-                    log.warning(
-                        f"Invalid FPS value in fragment: {fragment_params.get('fps')}. Ignoring."
-                    )
-
-            video_metadata: types.VideoMetadata | None = None
-            if start_offset or end_offset or fps is not None:
-                video_metadata = types.VideoMetadata(
-                    start_offset=start_offset,
-                    end_offset=end_offset,
-                    fps=fps,
+        parsed = urlparse(uri)
+        if parsed.query or parsed.fragment:
+            unsupported = {"t", "end", "interval", "fps"}
+            query_names = set(parse_qs(parsed.query))
+            fragment_names = set(parse_qs(parsed.fragment))
+            if unsupported & (query_names | fragment_names):
+                self.event_emitter.emit_toast(
+                    "YouTube start/end/FPS controls are not supported by the Interactions API; "
+                    "the full canonical video URL will be used.",
+                    "warning",
                 )
-
-            return types.Part(
-                file_data=types.FileData(file_uri=canonical_uri),
-                video_metadata=video_metadata,
-            )
-
-    def _parse_duration_to_seconds(self, duration_str: str) -> float | None:
-        """Converts a human-readable duration string to total seconds.
-
-        Supports formats like "1h30m15s", "90m", "3600s", or just "90".
-        Also supports float values like "0.5s" or "90.5".
-        Returns total seconds as a float, or None if the string is invalid.
-        """
-        # First, try to convert the whole string as a plain number (e.g., "90", "90.5").
-        try:
-            return float(duration_str)
-        except ValueError:
-            # If it fails, it might be a composite duration like "1m30s", so we parse it below.
-            pass
-
-        total_seconds = 0.0
-        # Regex to find number-unit pairs (e.g., 1h, 30.5m, 15s). Supports floats.
-        parts = re.findall(r"(\d+(?:\.\d+)?)\s*(h|m|s)?", duration_str, re.IGNORECASE)
-
-        if not parts:
-            # log.warning(f"Could not parse duration string: {duration_str}")
-            return None
-
-        for value, unit in parts:
-            val = float(value)
-            unit = (unit or "s").lower()  # Default to seconds if no unit
-            if unit == "h":
-                total_seconds += val * 3600
-            elif unit == "m":
-                total_seconds += val * 60
-            elif unit == "s":
-                total_seconds += val
-
-        return total_seconds
+        return interaction_types.VideoContentParam(
+            type="video", uri=canonical_uri, mime_type="video/mp4"
+        )
 
     @staticmethod
     def _enable_special_tags(text: str) -> str:
@@ -2536,13 +3577,14 @@ class GeminiContentBuilder:
             ]
             supports = [item for sublist in supports for item in sublist]
             for support in supports:
-                support = types.GroundingSupport(**support)
-                indices = support.grounding_chunk_indices
-                segment = support.segment
-                if not (indices and segment):
+                if not isinstance(support, dict):
                     continue
-                segment_text = segment.text
-                if not segment_text:
+                indices = support.get("grounding_chunk_indices")
+                segment = support.get("segment")
+                if not isinstance(indices, list) or not isinstance(segment, dict):
+                    continue
+                segment_text = segment.get("text")
+                if not isinstance(segment_text, str) or not segment_text:
                     continue
                 # Using a shortened version because user could edit the assistant message in the front-end.
                 # If citation segment get's edited, then the markers would not be removed. Shortening reduces the
@@ -2551,7 +3593,9 @@ class GeminiContentBuilder:
                 if segment_end in processed:
                     continue
                 processed.add(segment_end)
-                citation_markers = "".join(f"[{index + 1}]" for index in indices)
+                citation_markers = "".join(
+                    f"[{index + 1}]" for index in indices if isinstance(index, int)
+                )
                 # Find the position of the citation markers in the text
                 pos = text.find(segment_text + citation_markers)
                 if pos != -1:
@@ -2568,6 +3612,8 @@ class GeminiContentBuilder:
 
 
 class Pipe:
+    _cached_client_bindings: list[GenAIClientBinding] = []
+
     @staticmethod
     def _validate_coordinates_format(v: str | None) -> str | None:
         """Reusable validator for 'latitude,longitude' format."""
@@ -2603,7 +3649,7 @@ class Pipe:
         USER_MUST_PROVIDE_AUTH_CONFIG: bool = Field(
             default=False,
             description="""Whether to require users (including admins) to provide their own authentication configuration.
-            User can provide these through UserValves. Setting this to True will disallow users from using Vertex AI.
+            User can provide these through UserValves. Setting this to True will disallow users from using Gemini Enterprise.
             Default value is False.""",
         )
         AUTH_WHITELIST: str | None = Field(
@@ -2616,22 +3662,22 @@ class Pipe:
             description="""The base URL for calling the Gemini API.
             Default value is None.""",
         )
-        # FIXME: assume the user wants Vertex if they set VERTEX_PROJECT, removing the need for this valve.
-        USE_VERTEX_AI: bool = Field(
+        # FIXME: assume the user wants Enterprise if they set ENTERPRISE_PROJECT, removing the need for this valve.
+        USE_ENTERPRISE: bool = Field(
             default=False,
-            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
-            If VERTEX_PROJECT is not set then the plugin will use the Gemini Developer API.
+            description="""Whether to use Google Cloud Gemini Enterprise instead of the standard Gemini API.
+            If ENTERPRISE_PROJECT is not set then the plugin will use the Gemini Developer API.
             Default value is False.
-            Users can opt out of this by setting USE_VERTEX_AI to False in their UserValves.""",
+            Users can opt out of this by setting USE_ENTERPRISE to False in their UserValves.""",
         )
-        VERTEX_PROJECT: str | None = Field(
+        ENTERPRISE_PROJECT: str | None = Field(
             default=None,
-            description="""The Google Cloud project ID to use with Vertex AI.
+            description="""The Google Cloud project ID to use with Gemini Enterprise.
             Default value is None.""",
         )
-        VERTEX_LOCATION: str = Field(
+        ENTERPRISE_LOCATION: str = Field(
             default="global",
-            description="""The Google Cloud region to use with Vertex AI.
+            description="""The Google Cloud region to use with Gemini Enterprise.
             Default value is 'global'.""",
         )
         ENABLE_FREE_TIER_FALLBACK: bool = Field(
@@ -2650,7 +3696,7 @@ class Pipe:
             description="""Determines how task models (like title generation) are routed between Free and Paid APIs.
             • only_free: Use only the Free API.
             • free_fallback: Use Free API first, fallback to Paid on failure.
-            • only_paid: Bypass Free API and use Paid API directly (or Vertex if enabled).
+            • only_paid: Bypass Free API and use Paid API directly (or Enterprise if enabled).
             • match_main: Follow the same logic as the main chat generation.
             Default is match_main.""",
         )
@@ -2671,35 +3717,17 @@ class Pipe:
             description="""Whether to request models only on first load and when white- or blacklist changes.
             Default value is True.""",
         )
-        THINKING_BUDGET: int = Field(
-            default=8192,
-            ge=-1,
-            # The widest possible range is 0 (for Lite/Flash) to 32768 (for Pro).
-            # -1 is used for dynamic thinking budget.
-            # Model-specific constraints are detailed in the description.
-            le=32768,
-            description="""Specifies the token budget for the model's internal thinking process,
-            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is 8192. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
-
-            The valid token range depends on the specific model tier:
-            - **Pro models**: Must be a value between 128 and 32,768.
-            - **Flash and Lite models**: A value between 0 and 24,576. For these
-              models, a value of 0 disables the thinking feature.
-
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
+        THINKING_LEVEL: Literal["minimal", "low", "medium", "high"] = Field(
+            default="high",
+            description="Interactions thinking level used when reasoning is enabled.",
         )
-        SHOW_THINKING_SUMMARY: bool = Field(
+        THINKING_SUMMARIES: Literal["auto", "none"] = Field(
+            default="auto",
+            description="Whether Interactions should return automatic thinking summaries.",
+        )
+        STORE_INTERACTIONS: bool = Field(
             default=True,
-            description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 models.
-            Default value is True.""",
-        )
-        # FIXME: remove, toggle filter handles this now
-        ENABLE_URL_CONTEXT_TOOL: bool = Field(
-            default=False,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is False.""",
+            description="Allow persisted chats to store requests and responses with Google for server-side continuation. Temporary chats and tasks always disable storage. Users may opt out, but cannot override an administrator opt-out.",
         )
         USE_FILES_API: bool = Field(
             default=True,
@@ -2721,10 +3749,6 @@ class Pipe:
             If disabled, YouTube links are treated as plain text.
             This is only applicable for models that support video.
             Default value is True.""",
-        )
-        USE_ENTERPRISE_SEARCH: bool = Field(
-            default=False,
-            description="""Enable the Enterprise Search tool to allow the model to fetch and use content from provided URLs. """,
         )
         MAPS_GROUNDING_COORDINATES: str | None = Field(
             default=None,
@@ -2791,8 +3815,8 @@ class Pipe:
             not on the `AUTH_WHITELIST`:
             - The user's `GEMINI_API_KEY` is taken directly from their `UserValves`,
               bypassing the admin's key entirely.
-            - The ability to use the admin-configured Vertex AI is disabled
-              (`USE_VERTEX_AI` is forced to `False`).
+            - The ability to use the admin-configured Gemini Enterprise is disabled
+              (`USE_ENTERPRISE` is forced to `False`).
             This ensures that when required, users must use their own credentials
             and cannot fall back on the shared, system-level authentication.
 
@@ -2815,19 +3839,19 @@ class Pipe:
             description="""The base URL for calling the Gemini API
             Default value is None.""",
         )
-        USE_VERTEX_AI: bool | None | Literal[""] = Field(
+        USE_ENTERPRISE: bool | None | Literal[""] = Field(
             default=None,
-            description="""Whether to use Google Cloud Vertex AI instead of the standard Gemini API.
+            description="""Whether to use Google Cloud Gemini Enterprise instead of the standard Gemini API.
             Default value is None.""",
         )
-        VERTEX_PROJECT: str | None = Field(
+        ENTERPRISE_PROJECT: str | None = Field(
             default=None,
-            description="""The Google Cloud project ID to use with Vertex AI.
+            description="""The Google Cloud project ID to use with Gemini Enterprise.
             Default value is None.""",
         )
-        VERTEX_LOCATION: str | None = Field(
+        ENTERPRISE_LOCATION: str | None = Field(
             default=None,
-            description="""The Google Cloud region to use with Vertex AI.
+            description="""The Google Cloud region to use with Gemini Enterprise.
             Default value is None.""",
         )
         ENABLE_FREE_TIER_FALLBACK: bool | None | Literal[""] = Field(
@@ -2843,29 +3867,17 @@ class Pipe:
             description="""Override the default routing strategy for task models. 
             Possible values: only_free | free_fallback | only_paid | match_main.""",
         )
-        THINKING_BUDGET: int | None | Literal[""] = Field(
+        THINKING_LEVEL: Literal["minimal", "low", "medium", "high", ""] | None = Field(
             default=None,
-            description="""Specifies the token budget for the model's internal thinking process,
-            used for complex tasks like tool use. Applicable to Gemini 2.5 models.
-            Default value is None. If you want the model to control the thinking budget when using the API, set the thinking budget to -1.
-
-            The valid token range depends on the specific model tier:
-            - **Pro models**: Must be a value between 128 and 32,768.
-            - **Flash and Lite models**: A value between 0 and 24,576. For these
-              models, a value of 0 disables the thinking feature.
-
-            See <https://cloud.google.com/vertex-ai/generative-ai/docs/thinking> for more details.""",
+            description="Override the Interactions thinking level.",
         )
-        SHOW_THINKING_SUMMARY: bool | None | Literal[""] = Field(
+        THINKING_SUMMARIES: Literal["auto", "none", ""] | None = Field(
             default=None,
-            description="""Whether to show the thinking summary in the response.
-            This is only applicable for Gemini 2.5 models.
-            Default value is None.""",
+            description="Override automatic thinking summaries.",
         )
-        ENABLE_URL_CONTEXT_TOOL: bool | None | Literal[""] = Field(
+        STORE_INTERACTIONS: bool | None | Literal[""] = Field(
             default=None,
-            description="""Enable the URL context tool to allow the model to fetch and use content from provided URLs.
-            This tool is only compatible with specific models. Default value is None.""",
+            description="Opt out of Google server-side Interaction storage. False forces local full-ledger replay; True is effective only when the administrator also permits storage.",
         )
         USE_FILES_API: bool | None | Literal[""] = Field(
             default=None,
@@ -2916,13 +3928,6 @@ class Pipe:
             Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
         )
 
-        @field_validator("THINKING_BUDGET", mode="after")
-        @classmethod
-        def validate_thinking_budget_range(cls, v):
-            if v is not None and v != "" and not (-1 <= v <= 32768):
-                raise ValueError("THINKING_BUDGET must be between -1 and 32768, inclusive.")
-            return v
-
         @field_validator("MAPS_GROUNDING_COORDINATES", mode="after")
         @classmethod
         def validate_coordinates_format(cls, v: str | None):
@@ -2933,6 +3938,11 @@ class Pipe:
         self.file_content_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.file_id_to_hash_cache = SimpleMemoryCache(serializer=NullSerializer())
         self.pdf_mitigation_manager = PDFMitigationManager()
+        self._message_locks: dict[tuple[str, str], MessageGate] = {}
+        self._persisted_messages: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._generation_inflight: set[tuple[str, str]] = set()
+        self._shutdown_lock = asyncio.Lock()
+        self._shutdown_complete = False
         log.success("Function has been initialized.")
 
     async def pipes(self) -> list["ModelData"]:
@@ -2958,7 +3968,7 @@ class Pipe:
             return [self._return_error_model(error_msg, exception=True)]
 
         log.info(f"Returning {len(filtered_models)} models to Open WebUI.")
-        log.debug("Model list:", payload=filtered_models, _log_truncation_enabled=False)
+        log.debug("Model list details omitted from logs.")
         log.debug("pipes method has finished.")
 
         return filtered_models
@@ -2970,12 +3980,13 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Callable[["Event"], Awaitable[None]] | None,
         __metadata__: "Metadata",
+        __tools__: dict[str, dict[str, object]] | None = None,
     ) -> AsyncGenerator[dict | str, None] | dict:
 
         self._add_log_handler(self.valves.LOG_LEVEL)
 
         log.debug(f"pipe method has been called. Gemini Manifold google_genai version is {VERSION}")
-        log.trace("__metadata__:", payload=__metadata__)
+        log.trace("Request metadata received; values omitted from logs.")
         features = __metadata__.get("features", {}) or cast("Features", {})
 
         # Check the version of the companion filter
@@ -2984,13 +3995,19 @@ class Pipe:
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
         model_config: dict[str, Any] | None = app_state._state.get("gemini_model_config")
-        # FIXME: be even more strict by requring the model id to be present in the config to proceed?
         if model_config is None:
             error_msg = (
                 "FATAL: Gemini model configuration not found in app state. "
                 "Please ensure the Gemini Manifold Companion filter is installed and enabled."
             )
             raise ValueError(error_msg)
+        catalog_version = app_state._state.get("gemini_model_catalog_schema_version")
+        if catalog_version != MODEL_CATALOG_SCHEMA_VERSION:
+            raise ValueError(
+                "FATAL: incompatible Gemini model catalog protocol: "
+                f"expected {MODEL_CATALOG_SCHEMA_VERSION}, received {catalog_version!r}. "
+                "Update and enable the matching Gemini Manifold Companion filter."
+            )
 
         merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
@@ -2998,9 +4015,28 @@ class Pipe:
         model_id = self._get_model_name(body)
         __metadata__["canonical_model_id"] = model_id
 
+        catalog_model = model_config.get(model_id)
+        if catalog_model is None:
+            raise ValueError(
+                f"Model '{model_id}' is not present in the audited Gemini Interactions "
+                "catalog; use is denied until the catalog is updated."
+            )
+
         # 1. Capture the raw state of keys before any overrides
         valves: Pipe.Valves = self._get_merged_valves(
             self.valves, __user__.get("valves"), __user__.get("email")
+        )
+        raw_user_valves = __user__.get("valves")
+        user_store_preference = (
+            raw_user_valves.get("STORE_INTERACTIONS")
+            if isinstance(raw_user_valves, dict)
+            else getattr(raw_user_valves, "STORE_INTERACTIONS", None)
+        )
+        __metadata__["gemini_store_interactions"] = self._resolve_store_policy(
+            admin_allows=self.valves.STORE_INTERACTIONS,
+            user_preference=user_store_preference,
+            is_temp=False,
+            is_task=bool(__metadata__.get("task")),
         )
 
         if task_type := __metadata__.get("task"):
@@ -3025,22 +4061,7 @@ class Pipe:
             f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}"
         )
 
-        event_emitter: EventEmitter | None = self._get_and_clear_data_from_state(
-            app_state=app_state,
-            chat_id=__metadata__.get("chat_id"),
-            message_id=__metadata__.get("message_id"),
-            key_suffix="gemini_event_emitter",
-            clear_after_read=False,
-        )
-        if not event_emitter:
-            log.debug(
-                "No event emitter found in state for this request. Companion filter's inlet did not run? Event emissions will be disabled for this request."
-            )
-            event_emitter = app_state._state.get("gemini_dummy_event_emitter")
-        if not event_emitter:
-            raise RuntimeError(
-                "No event emitter is available; the companion filter did not initialize one."
-            )
+        event_emitter = PipeEventEmitter(__event_emitter__)
 
         # --- Execution Loop ---
         for attempt_idx, tier in enumerate(execution_order):
@@ -3052,51 +4073,70 @@ class Pipe:
 
             if tier == "free":
                 current_valves.GEMINI_PAID_API_KEY = None
-                current_valves.USE_VERTEX_AI = False
+                current_valves.USE_ENTERPRISE = False
                 __metadata__["is_paid_api"] = False
             elif tier == "paid":
                 current_valves.GEMINI_FREE_API_KEY = None
-                current_valves.USE_VERTEX_AI = False
+                current_valves.USE_ENTERPRISE = False
                 __metadata__["is_paid_api"] = True
-            elif tier == "vertex":
-                current_valves.USE_VERTEX_AI = True
+            elif tier == "enterprise":
+                current_valves.USE_ENTERPRISE = True
                 __metadata__["is_paid_api"] = True
+
+            service = "enterprise" if current_valves.USE_ENTERPRISE else "developer"
+            availability = catalog_model.get("services", {}).get(service, "unsupported")
+            if availability != "supported":
+                message = (
+                    f"Model '{model_id}' is {availability!r} for the Gemini {service} "
+                    "Interactions service; this attempt is denied by catalog policy."
+                )
+                if is_last_attempt:
+                    await event_emitter.shutdown()
+                    raise ValueError(message)
+                log.warning(message)
+                continue
 
             try:
                 log.info(f"Starting generation attempt on tier: {tier}")
 
                 # Execute the attempt. This encapsulates client creation,
                 # file uploads (scoped to key), and the API call.
-                return await self._execute_generation_attempt(
-                    tier=tier,
-                    valves=current_valves,
-                    body=body,
-                    __user__=__user__,
-                    __metadata__=__metadata__,
-                    __request__=__request__,
-                    event_emitter=event_emitter,
-                    model_config=model_config,
+                message_key = (
+                    str(__metadata__.get("chat_id", "")),
+                    str(__metadata__.get("message_id", "")),
                 )
+
+                async def execute_attempt(
+                    attempt_tier: str = tier,
+                    attempt_valves: Pipe.Valves = current_valves,
+                ):
+                    return await self._execute_generation_attempt(
+                        tier=attempt_tier,
+                        valves=attempt_valves,
+                        body=body,
+                        __user__=__user__,
+                        __metadata__=__metadata__,
+                        __request__=__request__,
+                        event_emitter=event_emitter,
+                        model_config=model_config,
+                        __tools__=__tools__,
+                    )
+
+                result = await self._execute_message_once(
+                    message_key,
+                    execute_attempt,
+                )
+                return await self._attach_emitter_lifecycle(result, event_emitter)
 
             except Exception as e:
-                # Error Handling & Routing
-                error_str = str(e).upper()
+                failure = self._classify_generation_failure(e)
 
-                # We catch Quota (429), Permission (403), and Overload/Unavailable (503) errors.
-                # 503 is crucial for Free Tier which has strict load balancing.
-                is_fallback_eligible = (
-                    "429" in error_str
-                    or "403" in error_str
-                    or "503" in error_str
-                    or "UNAVAILABLE" in error_str
-                    or (isinstance(e, genai_errors.ClientError) and e.code in [429, 403])
-                    or (isinstance(e, genai_errors.ServerError) and e.code in [503])
+                should_retry = (
+                    not is_last_attempt and tier == "free" and failure.retryable_across_endpoint
                 )
 
-                should_retry = not is_last_attempt and tier == "free" and is_fallback_eligible
-
                 if should_retry:
-                    reason = "quota exceeded" if "429" in error_str else "model overloaded"
+                    reason = failure.kind.value.replace("_", " ")
                     log.warning(f"Free Tier {reason} (Error: {e}). Switching to Paid API...")
                     event_emitter.emit_status(
                         f"Free Tier {reason}, switching to Paid API...", done=False
@@ -3109,15 +4149,80 @@ class Pipe:
                 event_emitter.emit_status("Request failed", done=True)
                 event_emitter.emit_toast(error_msg, "error")
                 if body.get("stream", False):
-                    return self._error_completion_stream(error_msg)
-                return self._error_completion_response(error_msg)
+                    return await self._attach_emitter_lifecycle(
+                        self._error_completion_stream(error_msg), event_emitter
+                    )
+                return await self._attach_emitter_lifecycle(
+                    self._error_completion_response(error_msg), event_emitter
+                )
 
         error_msg = "Exhausted execution options without result."
         if body.get("stream", False):
-            return self._error_completion_stream(error_msg)
-        return self._error_completion_response(error_msg)
+            return await self._attach_emitter_lifecycle(
+                self._error_completion_stream(error_msg), event_emitter
+            )
+        return await self._attach_emitter_lifecycle(
+            self._error_completion_response(error_msg), event_emitter
+        )
 
     # region 2. Helper methods inside the Pipe class
+
+    @asynccontextmanager
+    async def _message_guard(self, key: tuple[str, str]) -> AsyncIterator[None]:
+        """Serialize one message key and reclaim its gate after all waiters leave."""
+        gate = self._message_locks.setdefault(key, MessageGate(lock=asyncio.Lock()))
+        gate.users += 1
+        try:
+            async with gate.lock:
+                yield
+        finally:
+            gate.users -= 1
+            if gate.users == 0 and self._message_locks.get(key) is gate:
+                self._message_locks.pop(key, None)
+
+    def _prune_completed_messages(self, now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        while self._persisted_messages:
+            _key, expiry = next(iter(self._persisted_messages.items()))
+            if expiry > current:
+                break
+            self._persisted_messages.popitem(last=False)
+        while len(self._persisted_messages) > MESSAGE_COMPLETION_MAX_ENTRIES:
+            self._persisted_messages.popitem(last=False)
+
+    def _is_message_completed(self, key: tuple[str, str]) -> bool:
+        self._prune_completed_messages()
+        expiry = self._persisted_messages.get(key)
+        if expiry is None:
+            return False
+        self._persisted_messages.move_to_end(key)
+        return True
+
+    def _remember_completed_message(self, key: tuple[str, str]) -> None:
+        self._persisted_messages[key] = time.monotonic() + MESSAGE_COMPLETION_TTL_SECONDS
+        self._persisted_messages.move_to_end(key)
+        self._prune_completed_messages()
+
+    @staticmethod
+    async def _attach_emitter_lifecycle(
+        result: AsyncGenerator[dict | str, None] | dict,
+        emitter: PipeEventEmitter,
+    ) -> AsyncGenerator[dict | str, None] | dict:
+        if isinstance(result, dict):
+            await emitter.flush()
+            await emitter.shutdown()
+            return result
+
+        async def guarded() -> AsyncGenerator[dict | str, None]:
+            try:
+                async for item in result:
+                    yield item
+            finally:
+                await result.aclose()
+                await emitter.flush()
+                await emitter.shutdown()
+
+        return guarded()
 
     # region 2.1 Client initialization
     @staticmethod
@@ -3126,10 +4231,10 @@ class Pipe:
         free_api_key: str | None = None,
         paid_api_key: str | None = None,
         base_url: str | None = None,
-        use_vertex_ai: bool | None = None,
-        vertex_project: str | None = None,
-        vertex_location: str | None = None,
-    ) -> genai.Client:
+        use_enterprise: bool | None = None,
+        enterprise_project: str | None = None,
+        enterprise_location: str | None = None,
+    ) -> GenAIClientBinding:
         """
         Creates a genai.Client instance or retrieves it from cache.
         Raises GenaiApiError on failure.
@@ -3138,39 +4243,64 @@ class Pipe:
         # Prioritize the free key, then fall back to the paid key.
         api_key = free_api_key or paid_api_key
 
-        if not vertex_project and not api_key:
+        if not enterprise_project and not api_key:
             # FIXME: More detailed reason in the exception (tell user to set the API key).
-            msg = "Neither VERTEX_PROJECT nor a Gemini API key (free or paid) is set."
+            msg = "Neither ENTERPRISE_PROJECT nor a Gemini API key (free or paid) is set."
             raise GenaiApiError(msg)
 
-        if use_vertex_ai and vertex_project:
+        normalized_base_url = base_url.rstrip("/") if base_url else None
+        if use_enterprise and enterprise_project:
+            location = enterprise_location or "global"
             kwargs = {
-                "vertexai": True,
-                "project": vertex_project,
-                "location": vertex_location,
+                "enterprise": True,
+                "project": enterprise_project,
+                "location": location,
+                # 2.11's proven Enterprise route remains v1beta1.
+                "http_options": types.HttpOptions(
+                    api_version="v1beta1", base_url=normalized_base_url
+                ),
             }
-            api = "Vertex AI"
-        else:  # Covers (use_vertex_ai and not vertex_project) OR (not use_vertex_ai)
-            if use_vertex_ai and not vertex_project:
+            api = "Gemini Enterprise"
+            identity = EndpointIdentity(
+                service="enterprise",
+                credential_fingerprint=xxhash.xxh64(
+                    f"{enterprise_project}:{location}".encode()
+                ).hexdigest(),
+                project=enterprise_project,
+                location=location,
+                base_url=normalized_base_url,
+                api_version="v1beta1",
+            )
+        else:  # Covers (use_enterprise and not enterprise_project) OR (not use_enterprise)
+            if use_enterprise and not enterprise_project:
                 log.warning(
-                    "Vertex AI is enabled but no project is set. Using Gemini Developer API."
+                    "Gemini Enterprise is enabled but no project is set. Using Gemini Developer API."
                 )
             # This also implicitly covers the case where api_key might be None,
             # which is handled by the initial check or the SDK.
             kwargs = {
                 "api_key": api_key,
-                "http_options": types.HttpOptions(base_url=base_url),
+                "http_options": types.HttpOptions(api_version="v1", base_url=normalized_base_url),
             }
             api = "Gemini Developer API"
+            assert api_key is not None
+            identity = EndpointIdentity(
+                service="developer",
+                credential_fingerprint=xxhash.xxh64(api_key.encode()).hexdigest(),
+                base_url=normalized_base_url,
+                api_version="v1",
+            )
 
         try:
             client = genai.Client(**kwargs)
             log.success(f"{api} Genai client successfully initialized.")
-            return client
+            binding = GenAIClientBinding(client=client, identity=identity)
+            Pipe._cached_client_bindings.append(binding)
+            return binding
         except Exception as e:
             raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
 
-    def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> genai.Client:
+    def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> GenAIClientBinding:
         user_whitelist = valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
         log.debug(
             f"User whitelist: {user_whitelist}, user email: {user_email}, "
@@ -3185,12 +4315,12 @@ class Pipe:
                 raise ValueError(error_msg)
         try:
             client_args = self._prepare_client_args(valves)
-            client = self._get_or_create_genai_client(*client_args)
+            binding = self._get_or_create_genai_client(*client_args)
         except GenaiApiError as e:
             error_msg = f"Failed to initialize genai client for user {user_email}: {e}"
             # FIXME: include correct traceback.
             raise ValueError(error_msg) from e
-        return client
+        return binding
 
     @staticmethod
     def _prepare_client_args(
@@ -3201,11 +4331,52 @@ class Pipe:
             "GEMINI_FREE_API_KEY",
             "GEMINI_PAID_API_KEY",
             "GEMINI_API_BASE_URL",
-            "USE_VERTEX_AI",
-            "VERTEX_PROJECT",
-            "VERTEX_LOCATION",
+            "USE_ENTERPRISE",
+            "ENTERPRISE_PROJECT",
+            "ENTERPRISE_LOCATION",
         ]
         return [getattr(source_valves, attr, None) for attr in ATTRS]
+
+    @classmethod
+    async def aclose_cached_clients(cls) -> None:
+        """Close every owned cached SDK client once and clear the constructor cache."""
+        bindings, cls._cached_client_bindings = cls._cached_client_bindings, []
+        failures: list[Exception] = []
+        for binding in bindings:
+            try:
+                await binding.aclose()
+            except Exception as exc:
+                failures.append(exc)
+        cls._get_or_create_genai_client.cache_clear()
+        if failures:
+            raise ExceptionGroup("Failed to close one or more Gemini SDK clients", failures)
+
+    async def shutdown(self) -> None:
+        """Release Pipe-owned resources after Open WebUI has quiesced requests.
+
+        Open WebUI does not currently provide a portable function shutdown hook.
+        Deployments embedding this Pipe must call ``await pipe.shutdown()`` only
+        after request handling has stopped. Repeated calls are safe.
+        """
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            if self._generation_inflight:
+                raise RuntimeError("Cannot shut down Gemini Pipe while requests are active.")
+            try:
+                await type(self).aclose_cached_clients()
+            finally:
+                await self.file_content_cache.clear()
+                await self.file_id_to_hash_cache.clear()
+                await self.pdf_mitigation_manager.cache.clear()
+                self.pdf_mitigation_manager.locks.clear()
+                model_cache = getattr(self._get_genai_models, "cache", None)
+                if isinstance(model_cache, BaseCache):
+                    await model_cache.clear()
+                self._message_locks.clear()
+                self._generation_inflight.clear()
+                self._persisted_messages.clear()
+                self._shutdown_complete = True
 
     # endregion 2.1 Client initialization
 
@@ -3216,40 +4387,42 @@ class Pipe:
         free_api_key: str | None = None,
         paid_api_key: str | None = None,
         base_url: str | None = None,
-        use_vertex_ai: bool | None = None,
-        vertex_project: str | None = None,
-        vertex_location: str | None = None,
+        use_enterprise: bool | None = None,
+        enterprise_project: str | None = None,
+        enterprise_location: str | None = None,
         whitelist_str: str = "*",
         blacklist_str: str | None = None,
     ) -> list["ModelData"]:
         """
         Gets valid Google models from API(s) and filters them.
-        If use_vertex_ai, vertex_project, and api_key are all provided,
-        models are fetched from both Vertex AI and Gemini Developer API and merged.
+        If use_enterprise, enterprise_project, and api_key are all provided,
+        models are fetched from both Gemini Enterprise and Gemini Developer API and merged.
         """
         all_raw_models: list[types.Model] = []
 
         # Condition for fetching from both sources
-        fetch_both = bool(use_vertex_ai and vertex_project and (free_api_key or paid_api_key))
+        fetch_both = bool(use_enterprise and enterprise_project and (free_api_key or paid_api_key))
 
         if fetch_both:
-            log.info("Attempting to fetch models from both Gemini Developer API and Vertex AI.")
+            log.info(
+                "Attempting to fetch models from both Gemini Developer API and Gemini Enterprise."
+            )
             gemini_models_list: list[types.Model] = []
-            vertex_models_list: list[types.Model] = []
+            enterprise_models_list: list[types.Model] = []
 
             # TODO: perf, consider parallelizing these two fetches
             # 1. Fetch from Gemini Developer API
             try:
-                gemini_client = self._get_or_create_genai_client(
+                gemini_binding = self._get_or_create_genai_client(
                     free_api_key=free_api_key,
                     paid_api_key=paid_api_key,
                     base_url=base_url,
-                    use_vertex_ai=False,  # Explicitly target Gemini API
-                    vertex_project=None,
-                    vertex_location=None,
+                    use_enterprise=False,  # Explicitly target Gemini API
+                    enterprise_project=None,
+                    enterprise_location=None,
                 )
                 gemini_models_list = await self._fetch_models_from_client_internal(
-                    gemini_client, "Gemini Developer API"
+                    gemini_binding.client, "Gemini Developer API"
                 )
             except GenaiApiError as e:
                 log.warning(
@@ -3261,24 +4434,22 @@ class Pipe:
                     exc_info=True,
                 )
 
-            # 2. Fetch from Vertex AI
+            # 2. Fetch from Gemini Enterprise
             try:
-                vertex_client = self._get_or_create_genai_client(
-                    use_vertex_ai=True,  # Explicitly target Vertex AI
-                    vertex_project=vertex_project,
-                    vertex_location=vertex_location,
-                    base_url=base_url,  # Pass base_url for potential Vertex custom endpoints
+                enterprise_binding = self._get_or_create_genai_client(
+                    use_enterprise=True,  # Explicitly target Gemini Enterprise
+                    enterprise_project=enterprise_project,
+                    enterprise_location=enterprise_location,
+                    base_url=base_url,  # Pass base_url for potential Enterprise custom endpoints
                 )
-                vertex_models_list = await self._fetch_models_from_client_internal(
-                    vertex_client, "Vertex AI"
+                enterprise_models_list = await self._fetch_models_from_client_internal(
+                    enterprise_binding.client, "Gemini Enterprise"
                 )
             except GenaiApiError as e:
-                log.warning(
-                    f"Failemodel_configd to initialize or retrieve models from Vertex AI: {e}"
-                )
+                log.warning(f"Failed to initialize or retrieve models from Gemini Enterprise: {e}")
             except Exception as e:
                 log.warning(
-                    f"An unexpected error occurred with Vertex AI models: {e}",
+                    f"An unexpected error occurred with Gemini Enterprise models: {e}",
                     exc_info=True,
                 )
 
@@ -3296,7 +4467,7 @@ class Pipe:
                         f"Gemini model without a name encountered: {model.display_name or 'N/A'}"
                     )
 
-            for model in vertex_models_list:
+            for model in enterprise_models_list:
                 if model.name:
                     model_id = self._strip_api_prefix(model.name)
                     if model_id:
@@ -3304,49 +4475,53 @@ class Pipe:
                             combined_models_dict[model_id] = model
                         else:
                             log.info(
-                                f"Duplicate model ID '{model_id}' from Vertex AI already sourced from Gemini API. Keeping Gemini API version."
+                                f"Duplicate model ID '{model_id}' from Gemini Enterprise already sourced from Gemini API. Keeping Gemini API version."
                             )
                 else:
                     log.trace(
-                        f"Vertex AI model without a name encountered: {model.display_name or 'N/A'}"
+                        f"Gemini Enterprise model without a name encountered: {model.display_name or 'N/A'}"
                     )
 
             all_raw_models = list(combined_models_dict.values())
 
             log.info(
                 f"Fetched {len(gemini_models_list)} models from Gemini API, "
-                f"{len(vertex_models_list)} from Vertex AI. "
+                f"{len(enterprise_models_list)} from Gemini Enterprise. "
                 f"Combined to {len(all_raw_models)} unique models."
             )
 
-            if not all_raw_models and (gemini_models_list or vertex_models_list):
+            if not all_raw_models and (gemini_models_list or enterprise_models_list):
                 log.warning(
                     "Models were fetched but resulted in an empty list after de-duplication, possibly due to missing names or empty/duplicate IDs."
                 )
 
-            if not all_raw_models and not gemini_models_list and not vertex_models_list:
+            if not all_raw_models and not gemini_models_list and not enterprise_models_list:
                 raise GenaiApiError(
-                    "Failed to retrieve models: Both Gemini Developer API and Vertex AI attempts yielded no models."
+                    "Failed to retrieve models: Both Gemini Developer API and Gemini Enterprise attempts yielded no models."
                 )
 
         else:  # Single source logic
-            # Determine if we are effectively using Vertex AI or Gemini API
-            # This depends on user's config (use_vertex_ai) and availability of project/key
-            client_target_is_vertex = bool(use_vertex_ai and vertex_project)
-            client_source_name = "Vertex AI" if client_target_is_vertex else "Gemini Developer API"
+            # Determine if we are effectively using Gemini Enterprise or Gemini API
+            # This depends on user's config (use_enterprise) and availability of project/key
+            client_target_is_enterprise = bool(use_enterprise and enterprise_project)
+            client_source_name = (
+                "Gemini Enterprise" if client_target_is_enterprise else "Gemini Developer API"
+            )
             log.info(f"Attempting to fetch models from a single source: {client_source_name}.")
 
             try:
-                client = self._get_or_create_genai_client(
+                binding = self._get_or_create_genai_client(
                     free_api_key=free_api_key,
                     paid_api_key=paid_api_key,
                     base_url=base_url,
-                    use_vertex_ai=client_target_is_vertex,  # Pass the determined target
-                    vertex_project=vertex_project if client_target_is_vertex else None,
-                    vertex_location=(vertex_location if client_target_is_vertex else None),
+                    use_enterprise=client_target_is_enterprise,  # Pass the determined target
+                    enterprise_project=enterprise_project if client_target_is_enterprise else None,
+                    enterprise_location=(
+                        enterprise_location if client_target_is_enterprise else None
+                    ),
                 )
                 all_raw_models = await self._fetch_models_from_client_internal(
-                    client, client_source_name
+                    binding.client, client_source_name
                 )
 
                 if not all_raw_models:
@@ -3380,15 +4555,9 @@ class Pipe:
                     f"Skipping model with no name during generative filter: {model.display_name or 'N/A'}"
                 )
                 continue
-            actions = model.supported_actions
-            if (
-                actions is None or "generateContent" in actions
-            ):  # Includes models if actions is None (e.g., Vertex)
-                generative_models.append(model)
-            else:
-                log.trace(
-                    f"Model '{model.name}' (ID: {self._strip_api_prefix(model.name)}) skipped, not generative (actions: {actions})."
-                )
+            # Model.supported_actions describes legacy RPCs and does not establish
+            # Interactions support. The validated catalog is the capability authority.
+            generative_models.append(model)
 
         if not generative_models:
             log.warning("No generative models found after filtering all retrieved models.")
@@ -3411,6 +4580,13 @@ class Pipe:
             if not stripped_name:
                 log.warning(
                     f"Model '{model.name}' (display: {model.display_name}) resulted in an empty ID after stripping. Skipping."
+                )
+                continue
+
+            if stripped_name not in CATALOG_MODEL_IDS:
+                log.info(
+                    f"Hiding uncatalogued model '{stripped_name}'; Interactions capabilities "
+                    "are denied until the versioned catalog is audited and updated."
                 )
                 continue
 
@@ -3446,7 +4622,7 @@ class Pipe:
             )
             models = [model async for model in google_models_pager]
             log.info(f"Retrieved {len(models)} models from {source_name}.")
-            log.trace(f"All models returned by {source_name}:", payload=models)  # Can be verbose
+            log.trace(f"Model details returned by {source_name} are omitted from logs.")
             return models
         except Exception as e:
             log.error(f"Retrieving models from {source_name} failed: {e}")
@@ -3542,226 +4718,497 @@ class Pipe:
 
     @staticmethod
     def _is_image_model(model_id: str, config: dict) -> bool:
-        """Check if the model is an image generation model using provided config."""
-        if model_id in config:
-            return config[model_id].get("capabilities", {}).get("image_generation", False)
-
-        return False
+        """Return whether a catalogued model may emit images; unknown models deny."""
+        outputs = config.get(model_id, {}).get("content", {}).get("outputs", [])
+        return "image" in outputs
 
     # endregion 2.2 Model retrival from Google API
 
-    # region 2.3 GenerateContentConfig assembly
+    # region 2.3 Interactions request option assembly
 
-    async def _build_gen_content_config(
+    async def _build_interaction_request_options(
         self,
         body: "Body",
         __metadata__: "Metadata",
         valves: "Valves",
         config: dict,
-    ) -> types.GenerateContentConfig:
-        """Assembles the GenerateContentConfig for a Gemini API request."""
-        features = __metadata__.get("features", {}) or {}
-        is_vertex_ai = __metadata__.get("is_vertex_ai", False)
+        custom_functions: list[interaction_types.Function] | None = None,
+    ) -> InteractionRequestOptions:
+        """Build canonical, capability-checked Interactions create options."""
+        model_id = str(__metadata__.get("canonical_model_id", ""))
+        model_policy = config.get(model_id)
+        if not isinstance(model_policy, dict):
+            raise ValueError(f"Model '{model_id}' is absent from the validated catalog.")
+        interaction_policy = model_policy.get("interactions", {})
+        features = self._resolve_gemini_features(__metadata__)
 
-        log.debug("Features extracted from metadata (UI toggles and config):", payload=features)
-
-        safety_settings: list[types.SafetySetting] | None = __metadata__.get("safety_settings")
-
-        thinking_conf = None
-        # We are ensured to have a valid model ID at this point.
-        model_id: str = __metadata__.get("canonical_model_id", "")
-        is_thinking_model = False
-        if model_id in config:
-            is_thinking_model = config[model_id].get("capabilities", {}).get("thinking", False)
-
-        log.debug(
-            f"Model '{model_id}' is classified as a reasoning model: {bool(is_thinking_model)}. "
+        if body.get("top_k") is not None:
+            raise ValueError("'top_k' is not supported by the Gemini Interactions API.")
+        reasoning_effort = (__metadata__.get("merged_custom_params", {}) or {}).get(
+            "reasoning_effort"
         )
-
-        if is_thinking_model:
-            # Start with the default thinking configuration from valves.
-            log.info(
-                f"Setting thinking config defaults: budget={valves.THINKING_BUDGET}, "
-                f"include_thoughts={valves.SHOW_THINKING_SUMMARY}."
-            )
-            thinking_conf = types.ThinkingConfig(
-                thinking_budget=valves.THINKING_BUDGET,
-                include_thoughts=valves.SHOW_THINKING_SUMMARY,
-            )
-
-            # Override defaults with custom 'reasoning_effort' parameter if present.
-            merged_params = __metadata__.get("merged_custom_params", {})
-            if reasoning_effort := merged_params.get("reasoning_effort"):
-                log.info(
-                    f"Found `reasoning_effort` custom parameter: '{reasoning_effort}'. Overriding valve settings."
+        if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+            raise ValueError("'reasoning_effort' must be minimal, low, medium, or high.")
+        thinking_level = reasoning_effort or valves.THINKING_LEVEL
+        thinking_policy = interaction_policy.get("thinking", {})
+        if features.reasoning:
+            if not thinking_policy.get("supported", False):
+                raise ValueError(f"Model '{model_id}' does not support thinking.")
+            allowed_levels = thinking_policy.get("levels", [])
+            if thinking_level not in allowed_levels:
+                raise ValueError(
+                    f"Thinking level '{thinking_level}' is not supported by model '{model_id}'."
                 )
 
-                try:
-                    # Attempt to parse as a number (for thinking_budget).
-                    budget = round(float(reasoning_effort))
-                    log.info(f"Interpreting `reasoning_effort` as a thinking budget: {budget}")
-                    thinking_conf.thinking_budget = budget
-                    thinking_conf.thinking_level = None  # Budget and level are mutually exclusive.
-                except (ValueError, TypeError):
-                    # If it's not a number, treat it as a thinking_level string.
-                    if isinstance(reasoning_effort, str):
-                        effort_level_str = reasoning_effort.upper()
-                        if effort_level_str in types.ThinkingLevel.__members__:
-                            log.info(
-                                f"Interpreting `reasoning_effort` as a thinking level: {effort_level_str}"
-                            )
-                            thinking_conf.thinking_level = types.ThinkingLevel[effort_level_str]
-                            thinking_conf.thinking_budget = (
-                                None  # Budget and level are mutually exclusive.
-                            )
-                        else:
-                            log.warning(
-                                f"Invalid `reasoning_effort` string value: '{reasoning_effort}'. "
-                                f"Valid values are {list(types.ThinkingLevel.__members__.keys())}. "
-                                "Falling back to valve defaults."
-                            )
-                    else:
-                        log.warning(
-                            f"Unsupported type for `reasoning_effort`: {type(reasoning_effort)}. "
-                            "Expected a number or string. Falling back to valve defaults."
-                        )
-
-            # Check if reasoning can be disabled via toggle, which overrides other settings.
-            is_avail, is_on = await self._get_toggleable_feature_status(
-                "gemini_reasoning_toggle", __metadata__
-            )
-            if is_avail and not is_on:
-                # This toggle is only applicable to flash/lite models, which support a budget of 0.
-                is_reasoning_toggleable = "flash" in model_id or "lite" in model_id
-                if is_reasoning_toggleable:
-                    log.info(
-                        f"Model '{model_id}' supports disabling reasoning, and it is toggled OFF in the UI. "
-                        "Overwriting `thinking_budget` to 0 to disable reasoning."
-                    )
-                    thinking_conf.thinking_budget = 0
-                    thinking_conf.thinking_level = (
-                        None  # Ensure level is cleared when budget is forced to 0.
-                    )
-
-        # TODO: Take defaults from the general front-end config.
-        # system_instruction is intentionally left unset here. It will be set by the caller.
-        gen_content_conf = types.GenerateContentConfig(
-            temperature=body.get("temperature"),
-            top_p=body.get("top_p"),
-            top_k=body.get("top_k"),
-            max_output_tokens=body.get("max_tokens"),
-            stop_sequences=body.get("stop"),
-            safety_settings=safety_settings,
-            thinking_config=thinking_conf,
+        stop = body.get("stop")
+        if isinstance(stop, str):
+            stop = [stop]
+        generation_config = interaction_types.GenerationConfig.model_validate(
+            {
+                "temperature": body.get("temperature"),
+                "top_p": body.get("top_p"),
+                "max_output_tokens": body.get("max_tokens"),
+                "stop_sequences": stop,
+                "seed": body.get("seed"),
+                "thinking_level": thinking_level if features.reasoning else None,
+                "thinking_summaries": (valves.THINKING_SUMMARIES if features.reasoning else "none"),
+            }
         )
-        gen_content_conf.response_modalities = ["TEXT"]
 
-        # Optimization: Task models (titles, tags, search queries) do not require tools.
-        # Disabling them here prevents unnecessary tool-use overhead and reduces latency.
-        if __metadata__.get("task"):
-            log.debug("Task model detected. Skipping tool configuration.")
-            return gen_content_conf
+        safety_settings = __metadata__.get("safety_settings", []) or []
+        safety_types = {
+            "hate_speech",
+            "dangerous_content",
+            "harassment",
+            "sexually_explicit",
+            "civic_integrity",
+            "image_hate",
+            "image_dangerous_content",
+            "image_harassment",
+            "image_sexually_explicit",
+            "jailbreak",
+        }
+        safety_thresholds = {
+            "block_low_and_above",
+            "block_medium_and_above",
+            "block_only_high",
+            "block_none",
+            "off",
+        }
+        safety_payloads = [
+            setting.model_dump(mode="python", exclude_none=True)
+            if isinstance(setting, interaction_types.SafetySetting)
+            else setting
+            for setting in safety_settings
+        ]
+        for setting in safety_payloads:
+            if not isinstance(setting, dict) or setting.get("type") not in safety_types:
+                raise ValueError("Safety setting type must use a canonical lowercase literal.")
+            if setting.get("threshold") not in safety_thresholds:
+                raise ValueError("Safety threshold must use a canonical lowercase literal.")
+        canonical_safety = [
+            interaction_types.SafetySetting.model_validate(setting) for setting in safety_payloads
+        ]
 
-        if self._is_image_model(model_id, config):
-            gen_content_conf.response_modalities.append("IMAGE")
-            if "gemini-3-pro-image" in model_id and valves.IMAGE_RESOLUTION:
-                log.debug(f"Setting image resolution to {valves.IMAGE_RESOLUTION}")
-                if not gen_content_conf.image_config:
-                    gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.image_size = valves.IMAGE_RESOLUTION
-
+        response_format: interaction_types.CreateModelInteractionResponseFormat | None
+        response_format = interaction_types.TextResponseFormat(mime_type="text/plain")
+        requested_format = body.get("response_format")
+        if requested_format:
+            if not interaction_policy.get("response_format", False):
+                raise ValueError(f"Model '{model_id}' does not support structured output.")
             if (
-                "gemini-3-pro-image" in model_id or "gemini-2.5-flash-image" in model_id
-            ) and valves.IMAGE_ASPECT_RATIO:
-                log.debug(f"Setting image aspect ratio to {valves.IMAGE_ASPECT_RATIO}")
-                if not gen_content_conf.image_config:
-                    gen_content_conf.image_config = types.ImageConfig()
-                gen_content_conf.image_config.aspect_ratio = valves.IMAGE_ASPECT_RATIO
+                not isinstance(requested_format, dict)
+                or requested_format.get("type") != "json_schema"
+            ):
+                raise ValueError("response_format must use type='json_schema'.")
+            json_schema = requested_format.get("json_schema")
+            if not isinstance(json_schema, dict) or not isinstance(json_schema.get("schema"), dict):
+                raise ValueError("response_format.json_schema.schema must be an object.")
+            response_format = interaction_types.TextResponseFormat(
+                mime_type="application/json", schema_=json_schema["schema"]
+            )
+        elif self._is_image_model(model_id, config):
+            response_format = interaction_types.ImageResponseFormat(
+                image_size=valves.IMAGE_RESOLUTION,
+                aspect_ratio=valves.IMAGE_ASPECT_RATIO,
+                delivery="inline",
+                mime_type="image/jpeg",
+            )
 
-        gen_content_conf.tools = []
-
-        if features.get("google_search_tool"):
-            if valves.USE_ENTERPRISE_SEARCH and is_vertex_ai:
-                log.info("Using grounding with Enterprise Web Search as a Tool.")
-                gen_content_conf.tools.append(
-                    types.Tool(enterprise_web_search=types.EnterpriseWebSearch())
+        tools: list[interaction_types.Tool] = []
+        if not __metadata__.get("task"):
+            tool_policy = interaction_policy.get("tools", {})
+            requested_tools: list[tuple[str, bool]] = [
+                ("google_search", features.google_search),
+                ("code_execution", features.code_execution),
+                ("url_context", features.url_context),
+                ("google_maps", features.google_maps),
+            ]
+            unsupported = [
+                name for name, enabled in requested_tools if enabled and not tool_policy.get(name)
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"Model '{model_id}' does not support requested tools: {', '.join(unsupported)}."
                 )
-            else:
-                log.info("Using grounding with Google Search as a Tool.")
-                gen_content_conf.tools.append(types.Tool(google_search=types.GoogleSearch()))
-
-        # NB: It is not possible to use both Search and Code execution at the same time,
-        # however, it can be changed later, so let's just handle it as a common error
-        if features.get("google_code_execution"):
-            log.info("Using code execution on Google side.")
-            gen_content_conf.tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
-
-        # Determine if URL context tool should be enabled.
-        is_avail, is_on = await self._get_toggleable_feature_status(
-            "gemini_url_context_toggle", __metadata__
-        )
-        enable_url_context = valves.ENABLE_URL_CONTEXT_TOOL  # Start with valve default.
-        if is_avail:
-            # If the toggle filter is configured, it overrides the valve setting.
-            enable_url_context = is_on
-
-        if enable_url_context:
-            # Check capability from config
-            is_compatible = False
-            if model_id in config:
-                is_compatible = config[model_id].get("capabilities", {}).get("url_context", False)
-
-            if is_compatible:
-                if is_vertex_ai and (len(gen_content_conf.tools) > 0):
-                    log.warning(
-                        "URL context tool is enabled, but Vertex AI is used with other tools. Skipping."
+            if features.google_search:
+                tools.append(interaction_types.GoogleSearch())
+            if features.code_execution:
+                tools.append(interaction_types.CodeExecution())
+            if features.url_context:
+                tools.append(interaction_types.URLContext())
+            if features.google_maps:
+                coordinates: dict[str, float] = {}
+                if valves.MAPS_GROUNDING_COORDINATES:
+                    latitude, longitude = valves.MAPS_GROUNDING_COORDINATES.split(",")
+                    coordinates = {
+                        "latitude": float(latitude.strip()),
+                        "longitude": float(longitude.strip()),
+                    }
+                tools.append(
+                    interaction_types.GoogleMaps(
+                        latitude=coordinates.get("latitude"),
+                        longitude=coordinates.get("longitude"),
                     )
-                else:
-                    log.info(f"Model {model_id} is compatible with URL context tool. Enabling.")
-                    gen_content_conf.tools.append(types.Tool(url_context=types.UrlContext()))
-            else:
-                log.warning(
-                    f"URL context tool is enabled, but model {model_id} does not support it (see capabilities.url_context in gemini_models.yaml). Skipping."
                 )
 
-        # Determine if Google Maps grounding should be enabled.
-        is_avail, is_on = await self._get_toggleable_feature_status(
-            "gemini_maps_grounding_toggle", __metadata__
+        if custom_functions:
+            tools.extend(custom_functions)
+            generation_config.tool_choice = interaction_types.ToolChoiceConfig(
+                allowed_tools=interaction_types.AllowedTools(
+                    mode="auto", tools=[tool.name for tool in custom_functions if tool.name]
+                )
+            )
+
+        return InteractionRequestOptions(
+            generation_config=generation_config,
+            safety_settings=canonical_safety,
+            response_format=response_format,
+            tools=tools,
+            features=features,
         )
-        if is_avail and is_on:
-            log.info("Enabling Google Maps grounding tool.")
-            gen_content_conf.tools.append(types.Tool(google_maps=types.GoogleMaps()))
 
-            if valves.MAPS_GROUNDING_COORDINATES:
-                try:
-                    lat_str, lon_str = valves.MAPS_GROUNDING_COORDINATES.split(",")
-                    latitude = float(lat_str.strip())
-                    longitude = float(lon_str.strip())
+    @staticmethod
+    def _resolve_open_webui_tools(
+        raw_tools: dict[str, dict[str, object]] | None,
+        *,
+        model_id: str,
+        model_policy: dict[str, object],
+        is_task: bool,
+    ) -> dict[str, OpenWebUITool]:
+        """Validate only executable tools already authorized by Open WebUI."""
+        if not raw_tools or is_task:
+            return {}
+        interactions_policy = model_policy.get("interactions")
+        if not isinstance(interactions_policy, dict) or not interactions_policy.get(
+            "custom_function_calling", False
+        ):
+            raise ValueError(f"Model '{model_id}' is not approved for custom function calling.")
 
-                    log.info(
-                        f"Using coordinates for Maps grounding: lat={latitude}, lon={longitude}"
+        registry: dict[str, OpenWebUITool] = {}
+        for exposed_name, raw_tool in raw_tools.items():
+            if not isinstance(exposed_name, str) or not GEMINI_TOOL_NAME_PATTERN.fullmatch(
+                exposed_name
+            ):
+                raise ValueError(f"Invalid Open WebUI tool name: {exposed_name!r}.")
+            if not isinstance(raw_tool, dict):
+                raise ValueError(f"Open WebUI tool '{exposed_name}' has an invalid descriptor.")
+            if raw_tool.get("direct") is True:
+                raise ValueError(
+                    f"Open WebUI direct frontend tool '{exposed_name}' cannot be executed by this pipe."
+                )
+            function = raw_tool.get("callable")
+            if not callable(function):
+                raise ValueError(f"Open WebUI tool '{exposed_name}' has no authorized callable.")
+            spec = raw_tool.get("spec")
+            if not isinstance(spec, dict):
+                raise ValueError(f"Open WebUI tool '{exposed_name}' has no valid specification.")
+            parameters = spec.get("parameters", {"type": "object", "properties": {}})
+            if not isinstance(parameters, dict) or parameters.get("type") != "object":
+                raise ValueError(
+                    f"Open WebUI tool '{exposed_name}' parameters must be an object schema."
+                )
+            properties = parameters.get("properties", {})
+            required = parameters.get("required", [])
+            if not isinstance(properties, dict) or not all(
+                isinstance(name, str) and isinstance(schema, dict)
+                for name, schema in properties.items()
+            ):
+                raise ValueError(
+                    f"Open WebUI tool '{exposed_name}' has invalid parameter properties."
+                )
+            if not isinstance(required, list) or not all(
+                isinstance(name, str) and name in properties for name in required
+            ):
+                raise ValueError(
+                    f"Open WebUI tool '{exposed_name}' has invalid required parameters."
+                )
+            if any(name.startswith("__") for name in properties):
+                raise ValueError(f"Open WebUI tool '{exposed_name}' exposes a reserved parameter.")
+            description = spec.get("description")
+            declaration = interaction_types.Function(
+                name=exposed_name,
+                description=description if isinstance(description, str) else exposed_name,
+                parameters=copy.deepcopy(parameters),
+            )
+            registry[exposed_name] = OpenWebUITool(
+                name=exposed_name,
+                parameters=copy.deepcopy(parameters),
+                function=cast(AsyncOpenWebUIToolCallable, function),
+                declaration=declaration,
+            )
+        return registry
+
+    @staticmethod
+    def _validate_tool_arguments(tool: OpenWebUITool, arguments: dict[str, object]) -> str | None:
+        properties = cast(dict[str, dict[str, object]], tool.parameters.get("properties", {}))
+        required = cast(list[str], tool.parameters.get("required", []))
+        unexpected = sorted(set(arguments) - set(properties))
+        if unexpected:
+            return f"Unexpected arguments: {', '.join(unexpected)}."
+        missing = sorted(set(required) - set(arguments))
+        if missing:
+            return f"Missing required arguments: {', '.join(missing)}."
+        for name, value in arguments.items():
+            schema = properties[name]
+            expected = schema.get("type")
+            if expected is None:
+                valid = True
+            elif expected == "string":
+                valid = isinstance(value, str)
+            elif expected == "boolean":
+                valid = isinstance(value, bool)
+            elif expected == "integer":
+                valid = isinstance(value, int) and not isinstance(value, bool)
+            elif expected == "number":
+                valid = isinstance(value, (int, float)) and not isinstance(value, bool)
+            elif expected == "array":
+                valid = isinstance(value, list)
+            elif expected == "object":
+                valid = isinstance(value, dict)
+            elif expected == "null":
+                valid = value is None
+            else:
+                valid = False
+            if not valid:
+                return f"Argument '{name}' does not match its declared type '{expected}'."
+            enum_values = schema.get("enum")
+            if isinstance(enum_values, list) and value not in enum_values:
+                return f"Argument '{name}' is not one of its allowed values."
+        return None
+
+    @staticmethod
+    def _tool_result_text(value: object) -> tuple[str, bool]:
+        try:
+            text = (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            )
+        except (TypeError, ValueError):
+            return "Tool returned a value that is not JSON serializable.", True
+        if len(text.encode("utf-8")) > GEMINI_TOOL_MAX_RESULT_BYTES:
+            return "Tool result exceeded the 1 MiB response limit.", True
+        return text, False
+
+    async def _execute_custom_function_call(
+        self,
+        call: interaction_types.FunctionCallStep,
+        registry: dict[str, OpenWebUITool],
+        records: dict[str, ToolCallRecord],
+    ) -> interaction_types.FunctionResultStep:
+        fingerprint = json.dumps(
+            {"name": call.name, "arguments": call.arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        prior = records.get(call.id)
+        if prior:
+            if prior.fingerprint != fingerprint:
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    f"Function call ID '{call.id}' was reused with different arguments.",
+                )
+            return prior.result
+
+        tool = registry.get(call.name)
+        is_error = False
+        if tool is None:
+            text = f"Function '{call.name}' is not authorized for this request."
+            is_error = True
+        elif validation_error := self._validate_tool_arguments(
+            tool, cast(dict[str, object], call.arguments)
+        ):
+            text = validation_error
+            is_error = True
+        else:
+            try:
+                value = await asyncio.wait_for(
+                    tool.function(**cast(dict[str, object], call.arguments)),
+                    timeout=GEMINI_TOOL_TIMEOUT_SECONDS,
+                )
+                text, is_error = self._tool_result_text(value)
+            except TimeoutError:
+                text = "Tool execution timed out."
+                is_error = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                text = f"Tool execution failed ({type(exc).__name__})."
+                is_error = True
+
+        result = interaction_types.FunctionResultStep(
+            call_id=call.id,
+            name=call.name,
+            result=text,
+            is_error=is_error,
+        )
+        records[call.id] = ToolCallRecord(fingerprint=fingerprint, result=result)
+        return result
+
+    async def _run_custom_function_loop(
+        self,
+        *,
+        interactions: AsyncInteractionsBoundary,
+        common_request: dict[str, object],
+        registry: dict[str, OpenWebUITool],
+        root_replay_input: list[interaction_types.StepParam] | None = None,
+    ) -> tuple[list[ReducerEmission], InteractionReduction]:
+        """Run sequential custom functions without emitting OpenAI tool-call deltas."""
+        if common_request.get("store") is not True:
+            raise ValueError("Custom function calling requires store=true continuation.")
+        records: dict[str, ToolCallRecord] = {}
+        total_calls = 0
+        ledger: list[dict[str, JsonValue]] = []
+        total_usage = NormalizedInteractionUsage()
+        request_payload = dict(common_request)
+
+        for _round_index in range(GEMINI_TOOL_MAX_ROUNDS):
+            request = cast(
+                interaction_types.CreateModelInteractionParamsNonStreaming,
+                {**request_payload, "stream": False},
+            )
+            try:
+                response = await interactions.create(**request)
+            except Exception as exc:
+                can_replay_root = bool(
+                    _round_index == 0
+                    and request_payload.get("previous_interaction_id")
+                    and root_replay_input
+                    and self._is_interaction_not_found(exc)
+                )
+                if not can_replay_root:
+                    raise
+                request_payload = {**common_request, "input": root_replay_input}
+                request_payload.pop("previous_interaction_id", None)
+                request = cast(
+                    interaction_types.CreateModelInteractionParamsNonStreaming,
+                    {**request_payload, "stream": False},
+                )
+                response = await interactions.create(**request)
+            reducer = InteractionReducer()
+            emissions = reducer.consume_interaction(response)
+            reducer.finalize_steps()
+            ledger.extend(reducer.state.steps)
+            for field_name in (
+                "input_tokens",
+                "output_tokens",
+                "thought_tokens",
+                "cached_tokens",
+                "tool_use_tokens",
+                "total_tokens",
+            ):
+                setattr(
+                    total_usage,
+                    field_name,
+                    getattr(total_usage, field_name) + getattr(reducer.state.usage, field_name),
+                )
+
+            calls = [
+                step
+                for step in (response.steps or [])
+                if isinstance(step, interaction_types.FunctionCallStep)
+            ]
+            if not calls:
+                if reducer.state.status != "completed":
+                    raise InteractionExecutionError(
+                        GenerationFailureKind.INTERACTION_STATUS,
+                        f"Interaction ended with status {reducer.state.status} without function calls.",
                     )
+                reducer.state.steps = ledger
+                reducer.state.usage = total_usage
+                return emissions, reducer.state
+            if reducer.state.status != "requires_action":
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_STATUS,
+                    f"Interaction returned function calls with status {reducer.state.status}.",
+                )
+            if not response.id:
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    "Function-calling interaction did not return an interaction ID.",
+                )
+            if any(not call.id or not call.name for call in calls):
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    "Interaction returned a function call without a non-empty ID and name.",
+                )
+            if len(calls) > GEMINI_TOOL_MAX_CALLS_PER_ROUND:
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    "Interaction exceeded the per-round function call limit.",
+                )
+            total_calls += len(calls)
+            if total_calls > GEMINI_TOOL_MAX_TOTAL_CALLS:
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    "Interaction exceeded the total function call limit.",
+                )
+            results = [
+                await self._execute_custom_function_call(call, registry, records) for call in calls
+            ]
+            result_payloads = [
+                cast(
+                    interaction_types.StepParam,
+                    result.model_dump(mode="json", exclude_none=True),
+                )
+                for result in results
+            ]
+            ledger.extend(cast(list[dict[str, JsonValue]], copy.deepcopy(result_payloads)))
+            request_payload = {
+                **common_request,
+                "input": result_payloads,
+                "previous_interaction_id": response.id,
+            }
 
-                    lat_lng = types.LatLng(latitude=latitude, longitude=longitude)
+        raise InteractionExecutionError(
+            GenerationFailureKind.INTERACTION_ERROR,
+            f"Interaction exceeded the {GEMINI_TOOL_MAX_ROUNDS}-round function loop limit.",
+        )
 
-                    # Ensure tool_config and retrieval_config exist before assigning lat_lng.
-                    if not gen_content_conf.tool_config:
-                        gen_content_conf.tool_config = types.ToolConfig()
-                    if not gen_content_conf.tool_config.retrieval_config:
-                        gen_content_conf.tool_config.retrieval_config = types.RetrievalConfig()
+    @staticmethod
+    def _is_interaction_not_found(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 404:
+            return True
+        code = getattr(exc, "code", None)
+        return code == 404 or str(code).upper() == "NOT_FOUND"
 
-                    gen_content_conf.tool_config.retrieval_config.lat_lng = lat_lng
+    @staticmethod
+    def _resolve_gemini_features(__metadata__: "Metadata") -> ResolvedGeminiFeatures:
+        raw_features = __metadata__.get("features", {}) or {}
+        return ResolvedGeminiFeatures(
+            reasoning=bool(raw_features.get("reasoning")),
+            google_search=bool(raw_features.get("google_search_tool")),
+            code_execution=bool(raw_features.get("google_code_execution")),
+            url_context=bool(raw_features.get("url_context")),
+            google_maps=bool(raw_features.get("google_maps")),
+            paid_api=bool(__metadata__.get("is_paid_api")),
+            enterprise=bool(__metadata__.get("is_enterprise")),
+        )
 
-                except (ValueError, TypeError) as e:
-                    # This should not happen due to the Pydantic validator, but it's good practice to be safe.
-                    log.error(
-                        "Failed to parse MAPS_GROUNDING_COORDINATES: "
-                        f"'{valves.MAPS_GROUNDING_COORDINATES}'. Error: {e}"
-                    )
-
-        return gen_content_conf
-
-    # endregion 2.3 GenerateContentConfig assembly
+    # endregion 2.3 Interactions request option assembly
 
     # region 2.4 Model response processing
 
@@ -3810,6 +5257,41 @@ class Pipe:
             "usage": usage or {},
         }
 
+    async def _execute_message_once(
+        self,
+        key: tuple[str, str],
+        execute: Callable[[], Awaitable[AsyncGenerator[dict | str, None] | dict]],
+    ) -> AsyncGenerator[dict | str, None] | dict:
+        """Prevent duplicate in-process generation for one OWUI assistant message."""
+        if not key[0] or not key[1] or "local" in key[0]:
+            return await execute()
+        async with self._message_guard(key):
+            if key in self._generation_inflight or self._is_message_completed(key):
+                raise RuntimeError(
+                    "A generation for this chat message is already in progress or completed."
+                )
+            self._generation_inflight.add(key)
+        try:
+            result = await execute()
+        except BaseException:
+            async with self._message_guard(key):
+                self._generation_inflight.discard(key)
+            raise
+        if isinstance(result, dict):
+            async with self._message_guard(key):
+                self._generation_inflight.discard(key)
+            return result
+
+        async def guarded() -> AsyncGenerator[dict | str, None]:
+            try:
+                async for item in result:
+                    yield item
+            finally:
+                async with self._message_guard(key):
+                    self._generation_inflight.discard(key)
+
+        return guarded()
+
     async def _execute_generation_attempt(
         self,
         tier: str,
@@ -3820,6 +5302,7 @@ class Pipe:
         __request__: Request,
         event_emitter: "EventEmitter",
         model_config: dict,
+        __tools__: dict[str, dict[str, object]] | None = None,
     ) -> AsyncGenerator[dict | str, None] | dict:
         """
         Executes a single generation attempt with a specific tier configuration.
@@ -3828,13 +5311,23 @@ class Pipe:
         """
 
         # 1. Client Creation
-        client = self._get_user_client(valves, __user__["email"])
-        __metadata__["is_vertex_ai"] = client.vertexai
-        api_name = "Vertex AI Gemini API" if client.vertexai else "Gemini Developer API"
+        binding = self._get_user_client(valves, __user__["email"])
+        client = binding.client
+        model_id = str(__metadata__.get("canonical_model_id", ""))
+        endpoint_identity = binding.identity.for_model(model_id)
+        metadata_state = cast(dict[str, object], __metadata__)
+        metadata_state["is_enterprise"] = endpoint_identity.service == "enterprise"
+        metadata_state["gemini_endpoint_scope"] = endpoint_identity.scope
+        api_name = (
+            "Gemini Enterprise API"
+            if endpoint_identity.service == "enterprise"
+            else "Gemini Developer API"
+        )
 
         # 2. Files API Manager (Scoped to the current client)
         files_api_manager = FilesAPIManager(
             client=client,
+            endpoint_identity=endpoint_identity,
             file_cache=self.file_content_cache,
             id_hash_cache=self.file_id_to_hash_cache,
             event_emitter=event_emitter,
@@ -3852,103 +5345,163 @@ class Pipe:
         )
 
         event_emitter.emit_status("Preparing request...")
-        contents = await builder.build_contents()
+        full_contents = await builder.build_contents()
 
         # 4. Configuration Building
-        gen_content_conf = await self._build_gen_content_config(
-            body, __metadata__, valves, model_config
+        model_policy = cast(dict[str, object], model_config.get(model_id, {}))
+        tool_registry = self._resolve_open_webui_tools(
+            __tools__,
+            model_id=model_id,
+            model_policy=model_policy,
+            is_task=bool(__metadata__.get("task")),
         )
-        gen_content_conf.system_instruction = builder.system_prompt
+        request_options = await self._build_interaction_request_options(
+            body,
+            __metadata__,
+            valves,
+            model_config,
+            [tool.declaration for tool in tool_registry.values()],
+        )
+        request_options.system_instruction = builder.system_prompt
 
         model_id = __metadata__.get("canonical_model_id", "")
+        store_interaction = self._resolve_store_policy(
+            admin_allows=bool(__metadata__.get("gemini_store_interactions", True)),
+            user_preference=None,
+            is_temp=builder.is_temp_chat,
+            is_task=bool(__metadata__.get("task")),
+        )
+        metadata_state["gemini_effective_store"] = store_interaction
+        continuation = builder.select_continuation(
+            full_contents,
+            store=store_interaction,
+            endpoint_scope=endpoint_identity.scope,
+            model_id=str(model_id),
+        )
 
         # Check for image/system prompt compatibility
         is_image_model = self._is_image_model(model_id, model_config)
-        if (is_image_model or "gemma" in model_id) and gen_content_conf.system_instruction:
-            gen_content_conf.system_instruction = None
+        if (is_image_model or "gemma" in model_id) and request_options.system_instruction:
+            request_options.system_instruction = None
             log.warning(f"Model '{model_id}' does not support system prompts. Removing.")
 
-        gen_content_args = {
-            "model": model_id,
-            "contents": contents,
-            "config": gen_content_conf,
+        model = cast(interaction_types.Model, model_id)
+        common_request = {
+            "model": model,
+            "input": continuation.input,
+            "store": store_interaction,
+            "previous_interaction_id": continuation.previous_interaction_id,
+            "system_instruction": request_options.system_instruction,
+            "generation_config": request_options.generation_config.model_dump(
+                mode="json", exclude_none=True
+            ),
+            "safety_settings": [
+                setting.model_dump(mode="json", exclude_none=True)
+                for setting in request_options.safety_settings
+            ],
+            "tools": [
+                tool.model_dump(mode="json", exclude_none=True) for tool in request_options.tools
+            ],
+            "response_format": (
+                request_options.response_format.model_dump(mode="json", exclude_none=True)
+                if isinstance(request_options.response_format, BaseModel)
+                else request_options.response_format
+            ),
         }
-        log.debug(f"Passing args to {api_name} (Tier: {tier}):", payload=gen_content_args)
+        common_request = {key: value for key, value in common_request.items() if value is not None}
+        log.debug(f"Passing Interaction request to {api_name} (Tier: {tier}).")
+        interactions = cast(AsyncInteractionsBoundary, client.aio.interactions)
+        is_streaming_request = bool(body.get("stream", True))
 
-        # 5. Stream Setup
-        # 'is_streaming_request' tracks what Open WebUI expects to receive.
-        # 'use_streaming_api' tracks how we actually call the Google SDK.
-        is_streaming_request = body.get("stream", True)
-        use_streaming_api = is_streaming_request
-
-        # If a high-resolution image is requested with the gemini-3-pro-image model,
-        # the Google GenAI SDK's streaming method often raises a "chunk too big" error
-        # during the transfer of the generated image bytes. We avoid this by forcing
-        # a non-streaming SDK call, while still yielding the result as a stream to OWUI.
-        if (
-            use_streaming_api
-            and valves.IMAGE_RESOLUTION in ["2K", "4K"]
-            # FIXME: Nano Banana 2 supports resolutions too now.
-            and "gemini-3-pro-image" in model_id
-        ):
-            log.info(
-                f"Forcing non-streaming SDK call due to {valves.IMAGE_RESOLUTION} resolution "
-                "to avoid GenAI SDK 'chunk too big' errors."
+        if tool_registry:
+            emissions, reduction = await self._run_custom_function_loop(
+                interactions=interactions,
+                common_request=cast(dict[str, object], common_request),
+                registry=tool_registry,
+                root_replay_input=full_contents,
             )
-            use_streaming_api = False
-
-        request_type_str = "streaming" if use_streaming_api else "non-streaming"
-        request_type_msg = f"Sending {request_type_str} request to {api_name}..."
-        log.info(request_type_msg)
-        event_emitter.emit_status(request_type_msg)
-
-        # 6. Execution & Peek Logic
-        if use_streaming_api:
-            stream = await client.aio.models.generate_content_stream(**gen_content_args)  # type: ignore
-        else:
-            # When we use the non-streaming SDK call, we wrap the single response
-            # in an iterator so that our unified processor can still treat it like a stream.
-            response = await client.aio.models.generate_content(**gen_content_args)
-
-            async def one_shot_iter():
-                yield response
-
-            stream = one_shot_iter()
-
-        iterator = stream.__aiter__()
-
-        try:
-            first_chunk = await iterator.__anext__()
-        except StopAsyncIteration:
-            raise ValueError("API returned an empty response stream.") from None
-
-        # Success: Reconstruct the stream including the peeked chunk
-        async def reconstructed_stream():
-            yield first_chunk
-            async for chunk in iterator:
-                yield chunk
-
-        log.info(f"Request successful ({tier}). Passing stream to unified processor.")
-
-        processor = self._unified_response_processor(
-            reconstructed_stream(),
-            __request__.app,
-            event_emitter,
-            __metadata__,
-        )
-
-        # If OWUI requested a stream, we return the AsyncGenerator.
-        # If OWUI requested a single object, we aggregate the chunks back into a dict.
-        if is_streaming_request:
-            return processor
-        else:
+            processor = self._present_reduction(
+                emissions=emissions,
+                reduction=reduction,
+                app=__request__.app,
+                event_emitter=event_emitter,
+                metadata=__metadata__,
+            )
+            if is_streaming_request:
+                return processor
             return await self._aggregate_to_dict(processor)
+
+        if is_streaming_request:
+            request = cast(
+                interaction_types.CreateModelInteractionParamsStreaming,
+                {**common_request, "stream": True},
+            )
+            try:
+                stream = await interactions.create(**request)
+            except Exception as exc:
+                if not continuation.used_server_state or not self._is_interaction_not_found(exc):
+                    raise
+                request = cast(
+                    interaction_types.CreateModelInteractionParamsStreaming,
+                    {
+                        **common_request,
+                        "input": full_contents,
+                        "stream": True,
+                    },
+                )
+                request.pop("previous_interaction_id", None)
+                stream = await interactions.create(**request)
+            return self._present_interaction_stream(
+                stream=stream,
+                interactions=interactions,
+                app=__request__.app,
+                event_emitter=event_emitter,
+                metadata=__metadata__,
+            )
+
+        request = cast(
+            interaction_types.CreateModelInteractionParamsNonStreaming,
+            {**common_request, "stream": False},
+        )
+        try:
+            response = await interactions.create(**request)
+        except Exception as exc:
+            if not continuation.used_server_state or not self._is_interaction_not_found(exc):
+                raise
+            request = cast(
+                interaction_types.CreateModelInteractionParamsNonStreaming,
+                {**common_request, "input": full_contents, "stream": False},
+            )
+            request.pop("previous_interaction_id", None)
+            response = await interactions.create(**request)
+        reducer = InteractionReducer()
+        emissions = reducer.consume_interaction(response)
+        reducer.finalize_steps()
+        processor = self._present_reduction(
+            emissions=emissions,
+            reduction=reducer.state,
+            app=__request__.app,
+            event_emitter=event_emitter,
+            metadata=__metadata__,
+        )
+        return await self._aggregate_to_dict(processor)
+
+    @staticmethod
+    def _resolve_store_policy(
+        *,
+        admin_allows: bool,
+        user_preference: object,
+        is_temp: bool,
+        is_task: bool,
+    ) -> bool:
+        """Privacy is monotonic: either administrator or user may disable storage."""
+        return bool(admin_allows and user_preference is not False and not is_temp and not is_task)
 
     def _check_free_tier_eligibility(
         self,
         model_id: str,
         model_config: dict,
-        features: "Features",
+        features: ResolvedGeminiFeatures,
     ) -> bool:
         """
         Determines if the request is eligible for the Free Tier based on model config
@@ -3966,556 +5519,357 @@ class Pipe:
         excluded_features = pricing.get("excluded_features", [])
 
         # Check Search
-        is_search_requested = features.get("google_search_tool")
-        if is_search_requested and "search_grounding" in excluded_features:
+        is_search_requested = features.google_search
+        if is_search_requested and "google_search" in excluded_features:
             log.info(f"Free Tier ineligible: Search requested but excluded for {model_id}.")
             return False
 
         # Check Maps
-        # Note: We check the raw feature toggle presence here, assuming the toggle logic put it in features
-        if (
-            features.get("gemini_maps_grounding_toggle")
-            and "grounding_google_maps" in excluded_features
-        ):
+        if features.google_maps and "google_maps" in excluded_features:
             log.info(f"Free Tier ineligible: Maps requested but excluded for {model_id}.")
             return False
 
         return True
 
-    async def _unified_response_processor(
+    async def _present_interaction_stream(
         self,
-        response_stream: AsyncIterator[types.GenerateContentResponse],
+        *,
+        stream: AsyncInteractionStream[InteractionEvent],
+        interactions: AsyncInteractionsBoundary,
         app: FastAPI,
         event_emitter: "EventEmitter",
-        __metadata__: "Metadata",
+        metadata: "Metadata",
     ) -> AsyncGenerator[dict | str, None]:
-        """
-        Processes an async iterator of GenerateContentResponse objects, yielding
-        structured dictionary chunks for the Open WebUI frontend.
-
-        This single method handles both streaming and non-streaming (via an adapter)
-        responses, eliminating code duplication. It processes all parts within each
-        response chunk, counts tag substitutions for a final toast notification,
-        and handles post-processing in a finally block.
-        """
-        final_response_chunk: types.GenerateContentResponse | None = None
-        error_occurred = False
-        total_substitutions = 0
-        first_chunk_received = False
-        chunk_counter = 0
-        in_think = False
-        last_title: str | None = None
-        response_parts: list[types.Part] = []
-        content_parts_text: list[str] = []
-
-        try:
-            async for chunk in response_stream:
-                candidate = self._get_first_candidate(chunk.candidates)
-                content = candidate.content if candidate else None
-                log.trace(
-                    f"Processing response chunk #{chunk_counter}, first candidate's content:",
-                    payload=content,
-                )
-                chunk_counter += 1
-                final_response_chunk = chunk  # Keep the latest chunk for metadata
-
-                if not first_chunk_received:
-                    # This is the first (and possibly only) chunk.
-                    event_emitter.emit_status("Response received", done=True)
-                    first_chunk_received = True
-
-                if not (parts := chunk.parts):
-                    log.warning("Chunk has no parts, skipping.")
-                    continue
-
-                response_parts.extend(parts)
-
-                # This inner loop makes the method robust. It handles a single chunk
-                # with many parts (non-streaming) or many chunks with one part (streaming).
-                for part in parts:
-                    # Handle thought titles and transitions between reasoning and normal content.
-                    if part.thought:
-                        if not in_think:
-                            # TODO: emit an status indicating that reasoning has started. include budget or level if set.
-                            in_think = True
-
-                        # Attempt to extract a title from any text within a thought part.
-                        # TODO: refactor it to a helper method?
-                        if isinstance(part.text, str):
-                            try:
-                                title: str | None = None
-                                # Prefer markdown-style "### Heading" titles.
-                                for m in re.finditer(r"(^|\n)###\s+(.+?)(?=\n|$)", part.text or ""):
-                                    title = m.group(2).strip()
-                                # Fall back to bold "**Title**" lines if no heading was found.
-                                if not title:
-                                    for m in re.finditer(
-                                        r"(^|\n)\s*\*\*(.+?)\*\*\s*(?=\n|$)",
-                                        part.text or "",
-                                    ):
-                                        title = (m.group(2) or "").strip()
-                                if title:
-                                    # Trim common surrounding quotes.
-                                    title = title.strip('"“”‘’').strip()
-                                if title and title != last_title:
-                                    last_title = title
-                                    event_emitter.emit_status(
-                                        title,
-                                        done=False,
-                                        hidden=False,
-                                        is_thought=True,
-                                        indent_level=1,
-                                    )
-                            except Exception:
-                                # Thought titles are a best-effort feature; failures should not break the stream.
-                                pass
-                    elif in_think:
-                        # Terminate the 'in_think' state only when a non-thought part with actual content arrives.
-                        # This prevents empty text parts from prematurely ending the thought block in the UI.
-                        has_content = (
-                            (isinstance(part.text, str) and part.text)
-                            or part.inline_data
-                            or part.executable_code
-                            or part.code_execution_result
-                        )
-                        if has_content:
-                            in_think = False
-                            # Clear the last thought title when normal content begins.
-                            event_emitter.emit_status(
-                                "Thinking finished",
-                                done=True,
-                                is_thought=False,
-                            )
-
-                    payload, count = await self._process_part(
-                        part,
-                        app,
-                        __metadata__,
-                    )
-
-                    if payload:
-                        # Collect the original content text before it's sent to the frontend.
-                        # We only care about the "content" key for the final message.
-                        if "content" in payload and payload["content"]:
-                            content_parts_text.append(payload["content"])
-
-                        if count > 0:
-                            total_substitutions += count
-                            log.debug(f"Disabled {count} special tag(s) in a part.")
-
-                        structured_chunk = {"choices": [{"delta": payload}]}
-                        yield structured_chunk
-
-        except Exception as e:
-            error_occurred = True
-            error_msg = f"Response processing ended with error: {e}"
-            log.exception(error_msg)
-            event_emitter.emit_error(error_msg)
-
-        finally:
-            # The async for loop has completed, meaning we have received all data
-            # from the API. Now, we perform final internal processing.
-
-            if total_substitutions > 0 and not error_occurred:
-                plural_s = "s" if total_substitutions > 1 else ""
-                toast_msg = (
-                    f"For clarity, {total_substitutions} special tag{plural_s} "
-                    "were disabled in the response by injecting a zero-width space (ZWS)."
-                )
-                event_emitter.emit_toast(toast_msg, "info")
-
-            # Calculate usage data using the last received chunk.
-            # If the chunk contains usage metadata, we yield it so the backend persists it to DB.
-            if final_response_chunk and (
-                usage_data := self._get_usage_data(
-                    final_response_chunk,
-                    app.state,
-                    __metadata__,
-                    event_emitter.start_time,
-                )
-            ):
-                # Yielding this dictionary allows the OWUI proxy to catch and save usage.
-                yield {"usage": usage_data}
-
-            if not error_occurred:
-                # 'data: [DONE]' should be the last thing yielded in a successful stream
-                # to signify the protocol-level end of the OpenAI-compatible stream.
-                yield "data: [DONE]"
-                log.info("Response processing finished successfully!")
-
-                # We manually upsert custom metadata to the database because Open WebUI
-                # does not have a native way to persist non-standard message keys
-                # through the standard pipe return/yield stream.
-                chat_id = __metadata__.get("chat_id")
-                message_id = __metadata__.get("message_id")
-                is_task = __metadata__.get("task")
-
-                if chat_id and message_id and not is_task:
-                    db_payload = {}
-
-                    if response_parts:
-                        db_payload["gemini_parts"] = [
-                            part.model_dump(mode="json", exclude_none=True)
-                            for part in response_parts
-                        ]
-
-                    if content_parts_text:
-                        db_payload["original_content"] = "".join(content_parts_text)
-
-                    if db_payload:
-                        try:
-                            # We call the backend model directly. This updates the JSON blob
-                            # in the 'chat' table, which the frontend uses as the source of truth.
-                            await Chats.upsert_message_to_chat_by_id_and_message_id(
-                                id=chat_id,
-                                message_id=message_id,
-                                message=db_payload,
-                            )
-                            log.debug(
-                                f"Successfully persisted Gemini metadata to message {message_id}"
-                            )
-                        except Exception as e:
-                            log.error(f"Failed to persist Gemini metadata to DB: {e}")
-
+        """Reduce an SSE stream, resuming the same stored Interaction when possible."""
+        reducer = InteractionReducer()
+        current_stream = stream
+        reconnects = 0
+        visible_content_parts: list[str] = []
+        while True:
             try:
-                await self._do_post_processing(
-                    final_response_chunk,
-                    event_emitter,
-                    app.state,
-                    __metadata__,
-                    stream_error_happened=error_occurred,
+                async with current_stream:
+                    async for event in current_stream:
+                        for emission in reducer.consume_event(event):
+                            chunk = await self._present_emission(emission, app, metadata)
+                            if chunk is not None:
+                                visible_content_parts.extend(self._content_deltas(chunk))
+                                yield chunk
+                break
+            except asyncio.CancelledError:
+                # Closing a foreground SSE stream is local cleanup, not a server
+                # cancellation request. Server cancel is reserved for explicitly
+                # created background interactions.
+                raise
+            except InteractionExecutionError:
+                raise
+            except Exception as exc:
+                can_resume = bool(
+                    reducer.state.interaction_id and reducer.state.last_event_id and reconnects < 2
                 )
-            except Exception as e:
-                error_msg = f"Post-processing failed with error:\n\n{e}"
-                event_emitter.emit_toast(error_msg, "error")
-                log.exception(error_msg)
+                if not can_resume:
+                    raise InteractionExecutionError(
+                        GenerationFailureKind.INTERACTION_ERROR,
+                        f"Interaction stream interrupted and could not resume: {exc}",
+                    ) from exc
+                reconnects += 1
+                log.warning(
+                    f"Interaction stream interrupted; resuming attempt {reconnects}/2 "
+                    f"from event {reducer.state.last_event_id}."
+                )
+                current_stream = await interactions.get(
+                    cast(str, reducer.state.interaction_id),
+                    stream=True,
+                    last_event_id=cast(str, reducer.state.last_event_id),
+                )
 
-            log.debug("Unified response processor has finished.")
+        if not reducer.state.terminal:
+            raise InteractionExecutionError(
+                GenerationFailureKind.INTERACTION_STATUS,
+                "Interaction stream ended without a terminal status.",
+            )
+        reducer.finalize_steps()
+        reducer.state.original_content = "".join(visible_content_parts)
+        async for chunk in self._finalize_reduction(
+            reducer.state, app.state, event_emitter, metadata
+        ):
+            yield chunk
 
-    async def _process_part(
+    async def _present_reduction(
         self,
-        part: types.Part,
-        app: FastAPI,  # We need the app to generate URLs for model returned images.
-        __metadata__: "Metadata",
-    ) -> tuple[dict | None, int]:
-        """
-        Processes a single `types.Part` object and returns a payload dictionary
-        for the Open WebUI stream, along with a count of tag substitutions.
-        The payload key is 'reasoning_content' for thought parts and 'content' for others.
-        """
-        # Determine the payload key based on whether the part is a thought.
-        key = "reasoning_content" if part.thought else "content"
-        payload_content: str | None = None
-        count: int = 0
-
-        match part:
-            case types.Part(text=str(text)):
-                # It's regular content or a thought with text.
-                sanitized_text, count = self._disable_special_tags(text)
-                payload_content = sanitized_text
-            case types.Part(inline_data=data) if data:
-                # An image part, which can be part of a thought or regular content.
-                # Image parts don't need tag disabling.
-                processed_text, image_url = await self._process_image_part(data, __metadata__, app)
-                payload_content = processed_text
-
-                # Transform inline_data into file_data to avoid storing raw bytes in the database.
-                # This mutates the part object which is held by reference in `response_parts`.
-                if image_url and data.mime_type:
-                    part.inline_data = None
-                    part.file_data = types.FileData(file_uri=image_url, mime_type=data.mime_type)
-            case types.Part(executable_code=code) if code:
-                # Code blocks are already formatted and safe.
-                if processed_text := self._process_executable_code_part(code):
-                    payload_content = processed_text
-            case types.Part(code_execution_result=result) if result:
-                # Code results are also safe.
-                if processed_text := self._process_code_execution_result_part(result):
-                    payload_content = processed_text
-
-        if payload_content is not None:
-            return {key: payload_content}, count
-
-        return None, 0
+        *,
+        emissions: list[ReducerEmission],
+        reduction: InteractionReduction,
+        app: FastAPI,
+        event_emitter: "EventEmitter",
+        metadata: "Metadata",
+    ) -> AsyncGenerator[dict | str, None]:
+        visible_content_parts: list[str] = []
+        for emission in emissions:
+            chunk = await self._present_emission(emission, app, metadata)
+            if chunk is not None:
+                visible_content_parts.extend(self._content_deltas(chunk))
+                yield chunk
+        reduction.original_content = "".join(visible_content_parts)
+        async for chunk in self._finalize_reduction(reduction, app.state, event_emitter, metadata):
+            yield chunk
 
     @staticmethod
-    def _disable_special_tags(text: str) -> tuple[str, int]:
-        """
-        Finds special tags in a text chunk and inserts a Zero-Width Space (ZWS)
-        to prevent them from being parsed by the Open WebUI backend's legacy system.
-        This is a safeguard against accidental tag generation by the model.
-        """
-        if not text:
-            return "", 0
+    def _content_deltas(chunk: dict[str, object]) -> list[str]:
+        choices = chunk.get("choices")
+        if not isinstance(choices, list):
+            return []
+        values: list[str] = []
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if isinstance(content, str):
+                values.append(content)
+        return values
 
-        # The regex finds '<' followed by an optional '/' and then one of the special tags.
-        # The inner parentheses group the tags, so the optional '/' applies to all of them.
-        TAG_REGEX = re.compile(
-            r"<(/?" + "(" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + ")" + r")"
-        )
-        # The substitution injects a ZWS, e.g., '</think>' becomes '<ZWS/think'.
-        modified_text, num_substitutions = TAG_REGEX.subn(rf"<{ZWS}\1", text)
-        return modified_text, num_substitutions
-
-    async def _process_image_part(
+    async def _present_emission(
         self,
-        inline_data: types.Blob,
-        __metadata__: "Metadata",
+        emission: ReducerEmission,
         app: FastAPI,
-    ) -> tuple[str, str | None]:
-        """
-        Handles image data by saving it to the Open WebUI backend and returning a markdown link
-        and the URL.
-        """
-        mime_type = inline_data.mime_type
-        image_data = inline_data.data
-        image_url = None
-
-        if mime_type and image_data:
-            image_url = await self._upload_image(
-                image_data,
-                mime_type,
-                __metadata__,
-                app,
-            )
-        else:
-            log.warning(
-                "Image part has no mime_type or data, cannot upload image. "
-                "Returning a placeholder message."
-            )
-
-        markdown_text = (
+        metadata: "Metadata",
+    ) -> dict[str, object] | None:
+        if emission.kind in {"status", "source", "tool"}:
+            return None
+        if emission.kind in {"content", "reasoning"}:
+            text, _ = self._disable_special_tags(emission.text or "")
+            key = "reasoning_content" if emission.kind == "reasoning" else "content"
+            return {"choices": [{"delta": {key: text}}]}
+        payload = emission.payload or {}
+        media_type = str(payload.get("type", ""))
+        if media_type != "image":
+            uri = payload.get("uri")
+            if isinstance(uri, str):
+                return {"choices": [{"delta": {"content": f"[{media_type}]({uri})"}}]}
+            return None
+        mime_type = payload.get("mime_type")
+        data = payload.get("data")
+        uri = payload.get("uri")
+        image_url: str | None = uri if isinstance(uri, str) else None
+        if isinstance(data, str) and isinstance(mime_type, str):
+            try:
+                image_url = await self._upload_image(
+                    base64.b64decode(data, validate=True), mime_type, metadata, app
+                )
+            except ValueError as exc:
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    f"Generated image contained invalid base64 data: {exc}",
+                ) from exc
+        markdown = (
             f"![Generated Image]({image_url})"
             if image_url
             else "*An error occurred while trying to store this model generated image.*"
         )
-        return markdown_text, image_url
+        return {"choices": [{"delta": {"content": markdown}}]}
+
+    async def _finalize_reduction(
+        self,
+        reduction: InteractionReduction,
+        app_state: State,
+        event_emitter: "EventEmitter",
+        metadata: "Metadata",
+    ) -> AsyncGenerator[dict | str, None]:
+        if reduction.status != "completed":
+            raise InteractionExecutionError(
+                GenerationFailureKind.INTERACTION_STATUS,
+                f"Interaction did not complete successfully: {reduction.status}",
+            )
+        reduction.grounding = self._prepare_grounding_envelope(
+            reduction.grounding, reduction.original_content
+        )
+        usage = self._get_interaction_usage_data(
+            reduction.usage, app_state, metadata, event_emitter.start_time
+        )
+        yield {"usage": usage}
+
+        chat_id = metadata.get("chat_id")
+        message_id = metadata.get("message_id")
+        if chat_id and message_id and "local" not in chat_id and not metadata.get("task"):
+            key = (chat_id, message_id)
+            async with self._message_guard(key):
+                if not self._is_message_completed(key):
+                    store = bool(metadata.get("gemini_effective_store", False))
+                    endpoint_scope = metadata.get("gemini_endpoint_scope")
+                    model_id = metadata.get("canonical_model_id")
+                    if not isinstance(endpoint_scope, str) or not isinstance(model_id, str):
+                        raise InteractionExecutionError(
+                            GenerationFailureKind.INTERACTION_ERROR,
+                            "Cannot persist Interaction without endpoint scope and model ID.",
+                        )
+                    envelope = InteractionEnvelopeV1(
+                        interaction_id=reduction.interaction_id if store else None,
+                        endpoint_scope=endpoint_scope,
+                        model_id=model_id,
+                        store=store,
+                        status=reduction.status,
+                        steps=reduction.steps,
+                        visible_content=reduction.original_content,
+                        usage=reduction.usage,
+                        last_event_id=reduction.last_event_id,
+                        grounding=reduction.grounding,
+                    )
+                    try:
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
+                            id=chat_id,
+                            message_id=message_id,
+                            message={
+                                "gemini_interaction": envelope.model_dump(
+                                    mode="json", exclude_none=False
+                                )
+                            },
+                        )
+                        self._remember_completed_message(key)
+                    except Exception:
+                        log.exception("Failed to persist gemini_interaction envelope.")
+        event_emitter.emit_status("Response finished", done=True, is_successful_finish=True)
+        yield "data: [DONE]"
+
+    @classmethod
+    def _prepare_grounding_envelope(
+        cls, envelope: GroundingEnvelope, visible_content: str
+    ) -> GroundingEnvelope:
+        prepared = envelope.model_copy(deep=True)
+        changed_blocks: set[int] = set()
+        for block_index, block in enumerate(prepared.text_blocks):
+            sanitized, _ = cls._disable_special_tags(block.text)
+            if sanitized != block.text:
+                changed_blocks.add(block_index)
+                prepared.text_blocks[block_index] = block.model_copy(update={"text": sanitized})
+        if changed_blocks:
+            prepared.citations = [
+                citation
+                for citation in prepared.citations
+                if not (
+                    citation.block_index in changed_blocks and citation.index_unit == "provider"
+                )
+            ]
+            prepared.diagnostics.append(
+                GroundingDiagnostic(
+                    code="sanitized_provider_span",
+                    detail="Provider-indexed citations were skipped after visible text sanitization.",
+                )
+            )
+        grounded_text = "".join(block.text for block in prepared.text_blocks)
+        prepared.grounded_text_sha256 = hashlib.sha256(grounded_text.encode("utf-8")).hexdigest()
+        prepared.visible_content_sha256 = hashlib.sha256(
+            visible_content.encode("utf-8")
+        ).hexdigest()
+        return prepared
+
+    def _get_interaction_usage_data(
+        self,
+        usage: NormalizedInteractionUsage,
+        app_state: State,
+        metadata: "Metadata",
+        start_time: float,
+    ) -> dict[str, object]:
+        token_details = usage.model_dump(mode="json")
+        cost_details: dict[str, float] = {
+            "input_cost": 0.0,
+            "cache_cost": 0.0,
+            "output_cost": 0.0,
+            "image_output_cost": 0.0,
+            "total_cost": 0.0,
+        }
+        if metadata.get("is_paid_api", True):
+            model_id = str(metadata.get("canonical_model_id", ""))
+            pricing = (
+                app_state._state.get("gemini_model_config", {}).get(model_id, {}).get("pricing", {})
+            )
+            input_tokens = max(usage.input_tokens - usage.cached_tokens, 0)
+            image_output_tokens = 0
+            for item in usage.output_by_modality:
+                modality = item.get("modality")
+                tokens = item.get("tokens")
+                if (
+                    str(modality).lower() == "image"
+                    and isinstance(tokens, int)
+                    and not isinstance(tokens, bool)
+                ):
+                    image_output_tokens += tokens
+            text_output_tokens = max(usage.output_tokens - image_output_tokens, 0)
+            output_tokens = text_output_tokens + usage.thought_tokens
+            input_cost = self._calculate_cost(input_tokens, pricing.get("input", []))
+            output_cost = self._calculate_cost(output_tokens, pricing.get("output", []))
+            image_output_cost = self._calculate_cost(
+                image_output_tokens, pricing.get("image_output", [])
+            )
+            cost_details.update(
+                input_cost=round(input_cost, 6),
+                output_cost=round(output_cost, 6),
+                image_output_cost=round(image_output_cost, 6),
+                total_cost=round(input_cost + output_cost + image_output_cost, 6),
+            )
+        payload: dict[str, object] = {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens + usage.thought_tokens,
+            "token_details": token_details,
+            "cost_details": cost_details,
+            "completion_time": round(time.monotonic() - start_time, 2),
+        }
+        previous_tokens = metadata.get("cumulative_tokens")
+        previous_cost = metadata.get("cumulative_cost")
+        if isinstance(previous_tokens, int) and isinstance(previous_cost, (int, float)):
+            payload["cumulative_token_count"] = previous_tokens + usage.total_tokens
+            payload["cumulative_total_cost"] = round(
+                float(previous_cost) + cost_details["total_cost"], 6
+            )
+        return payload
+
+    @staticmethod
+    def _disable_special_tags(text: str) -> tuple[str, int]:
+        if not text:
+            return "", 0
+        tag_regex = re.compile(
+            r"<(/?" + "(" + "|".join(re.escape(tag) for tag in SPECIAL_TAGS_TO_DISABLE) + ")" + r")"
+        )
+        return tag_regex.subn(rf"<{ZWS}\1", text)
 
     async def _upload_image(
         self,
         image_data: bytes,
         mime_type: str,
-        __metadata__: "Metadata",
+        metadata: "Metadata",
         app: FastAPI,
     ) -> str | None:
-        """
-        Helper method that uploads a generated image to the configured Open WebUI storage provider.
-        Returns the url to the uploaded image.
-        """
         image_format = mimetypes.guess_extension(mime_type) or ".png"
-        id = str(uuid.uuid4())
+        file_id = str(uuid.uuid4())
         name = f"generated-image{image_format}"
-
-        # The final filename includes the unique ID to prevent collisions.
-        imagename = f"{id}_{name}"
-        image = io.BytesIO(image_data)
-
-        # Create a clean, precise metadata object linking to the generation context.
-        image_metadata = {
-            "model": __metadata__.get("canonical_model_id"),
-            "chat_id": __metadata__.get("chat_id"),
-            "message_id": __metadata__.get("message_id"),
-        }
-
-        log.info("Uploading the model-generated image to the Open WebUI backend.")
-
+        image_name = f"{file_id}_{name}"
         try:
             contents, image_path = await asyncio.to_thread(
-                Storage.upload_file, image, imagename, tags={}
+                Storage.upload_file, io.BytesIO(image_data), image_name, tags={}
+            )
+            file_item = await Files.insert_new_file(
+                metadata.get("user_id"),
+                FileForm(
+                    id=file_id,
+                    filename=name,
+                    path=image_path,
+                    meta={
+                        "name": name,
+                        "content_type": mime_type,
+                        "size": len(contents),
+                        "data": {
+                            "model": metadata.get("canonical_model_id"),
+                            "chat_id": metadata.get("chat_id"),
+                            "message_id": metadata.get("message_id"),
+                        },
+                    },
+                ),
             )
         except Exception:
-            log.exception("Error occurred during upload to the storage provider.")
+            log.exception("Could not persist a generated Interaction image.")
             return None
-
-        log.debug("Adding the image file to the Open WebUI files database.")
-        file_item = await Files.insert_new_file(
-            __metadata__.get("user_id"),
-            FileForm(
-                id=id,
-                filename=name,
-                path=image_path,
-                meta={
-                    "name": name,
-                    "content_type": mime_type,
-                    "size": len(contents),
-                    "data": image_metadata,
-                },
-            ),
-        )
         if not file_item:
-            log.warning("Image upload to Open WebUI database likely failed.")
             return None
-
-        image_url: str = app.url_path_for("get_file_content_by_id", id=file_item.id)
-        log.success("Image upload finished!")
-        return image_url
-
-    def _process_executable_code_part(
-        self, executable_code_part: types.ExecutableCode | None
-    ) -> str | None:
-        """
-        Processes an executable code part and returns the formatted string representation.
-        """
-
-        if not executable_code_part:
-            return None
-
-        lang_name = "python"  # Default language
-        if executable_code_part_lang_enum := executable_code_part.language:
-            if lang_name := executable_code_part_lang_enum.name:
-                lang_name = executable_code_part_lang_enum.name.lower()
-            else:
-                log.warning(
-                    f"Could not extract language name from {executable_code_part_lang_enum}. Default to python."
-                )
-        else:
-            log.warning("Language Enum is None, defaulting to python.")
-
-        if executable_code_part_code := executable_code_part.code:
-            return f"```{lang_name}\n{executable_code_part_code.rstrip()}\n```\n\n"
-        return ""
-
-    def _process_code_execution_result_part(
-        self, code_execution_result_part: types.CodeExecutionResult | None
-    ) -> str | None:
-        """
-        Processes a code execution result part and returns the formatted string representation.
-        """
-
-        if not code_execution_result_part:
-            return None
-
-        if code_execution_result_part_output := code_execution_result_part.output:
-            return f"**Output:**\n\n```\n{code_execution_result_part_output.rstrip()}\n```\n\n"
-        else:
-            return None
-
-    # endregion 2.4 Model response processing
-
-    # region 2.5 Post-processing
-    async def _do_post_processing(
-        self,
-        model_response: types.GenerateContentResponse | None,
-        event_emitter: "EventEmitter",
-        app_state: State,
-        __metadata__: "Metadata",
-        *,
-        stream_error_happened: bool = False,
-    ):
-        """Handles grounding and sources after the main response/stream is done."""
-        log.info("Post-processing the model response.")
-
-        if stream_error_happened:
-            log.warning("Response processing failed due to stream error.")
-            event_emitter.emit_status("Response failed [Stream Error]", done=True)
-            return
-
-        if not model_response:
-            log.warning("Response processing skipped: Model response was empty.")
-            event_emitter.emit_status("Response failed [Empty Response]", done=True)
-            return
-
-        if not (candidate := self._get_first_candidate(model_response.candidates)):
-            log.warning("Response processing skipped: No candidates found.")
-            event_emitter.emit_status("Response failed [No Candidates]", done=True)
-            return
-
-        # --- Construct detailed finish reason message ---
-        reason_name = getattr(candidate.finish_reason, "name", "UNSPECIFIED")
-        reason_description = FINISH_REASON_DESCRIPTIONS.get(reason_name)
-        finish_message = candidate.finish_message.strip() if candidate.finish_message else None
-
-        details_parts = [part for part in (reason_description, finish_message) if part]
-        details_str = f": {' '.join(details_parts)}" if details_parts else ""
-        full_finish_details = f"[{reason_name}]{details_str}"
-
-        # --- Determine final status and emit toast for errors ---
-        is_normal_finish = candidate.finish_reason in NORMAL_REASONS
-
-        if is_normal_finish:
-            log.debug(f"Response finished normally. {full_finish_details}")
-            status_prefix = "Response finished"
-        else:
-            log.error(f"Response finished with an error. {full_finish_details}")
-            status_prefix = "Response failed"
-            event_emitter.emit_toast(
-                f"An error occurred. {full_finish_details}",
-                "error",
-            )
-
-        # For the most common success case (STOP), we don't need to show the reason.
-        final_reason_str = "" if reason_name == "STOP" else f" [{reason_name}]"
-        event_emitter.emit_status(
-            f"{status_prefix}{final_reason_str}",
-            done=True,
-            is_successful_finish=is_normal_finish,
-        )
-
-        # TODO: Emit a toast message if url context retrieval was not successful.
-
-        storage_payload: dict[str, Any] = {}
-
-        if candidate and (grounding_metadata_obj := candidate.grounding_metadata):
-            storage_payload["grounding"] = grounding_metadata_obj
-
-        self._store_data_in_state(app_state, __metadata__, storage_payload)
-
-    @staticmethod
-    def _store_data_in_state(
-        app_state: State,
-        __metadata__: "Metadata",
-        data: dict[str, Any],
-    ):
-        """
-        Stores multiple values in the app state, namespaced by chat and message ID.
-        Exits early if this is a task model (e.g. title generation) to prevent
-        state bloat and interference with the main chat's filter logic.
-        """
-        # TODO: code a separate dataclass that handles all stuff that I need to store in app state
-        if __metadata__.get("task"):
-            return
-
-        chat_id = __metadata__.get("chat_id")
-        message_id = __metadata__.get("message_id")
-
-        if not chat_id or not message_id:
-            log.warning("Skipping state storage: chat_id or message_id missing from metadata.")
-            return
-
-        for key_suffix, value in data.items():
-            key = f"{key_suffix}_{chat_id}_{message_id}"
-            log.debug(f"Storing data in app state with key '{key}'.")
-            # Using shared `request.app.state` to pass data to Filter.outlet.
-            # This is necessary because Pipe.pipe and Filter.outlet operate on different requests.
-            app_state._state[key] = value
-
-    @staticmethod
-    def _get_and_clear_data_from_state(
-        app_state: State,
-        chat_id: str,
-        message_id: str,
-        key_suffix: str,
-        clear_after_read: bool,
-    ) -> Any | None:
-        """Retrieves data from the app state using a namespaced key.
-
-        Deletes the value only when clear_after_read is True.
-        """
-        key = f"{key_suffix}_{chat_id}_{message_id}"
-        value = getattr(app_state, key, None)
-        if value is None:
-            return None
-
-        if clear_after_read:
-            log.debug(f"Retrieved and cleared data from app state for key '{key}'.")
-            try:
-                delattr(app_state, key)
-            except AttributeError:
-                # This case is unlikely but handles a race condition where the attribute might already be gone.
-                log.warning(f"State key '{key}' was already gone before deletion attempt.")
-        else:
-            log.debug(f"Retrieved data from app state for key '{key}' without clearing it.")
-        return value
+        return str(app.url_path_for("get_file_content_by_id", id=file_item.id))
 
     @staticmethod
     def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
@@ -4548,148 +5902,6 @@ class Pipe:
 
         return total_cost
 
-    def _get_usage_data(
-        self,
-        response: types.GenerateContentResponse,
-        app_state: State,
-        metadata: "Metadata",
-        start_time: float,
-    ) -> dict[str, Any] | None:
-        """
-        Extracts usage data from a GenerateContentResponse object.
-        Calculates and includes cost based on pricing from YAML configuration.
-        Adds cumulative tokens and cost if previous history data is available.
-        Returns None if usage metadata is not present.
-        """
-        if not response.usage_metadata:
-            log.warning("Usage metadata is missing from the response. Cannot determine usage.")
-            return None
-
-        # Dump the raw token usage details, excluding any fields that are None.
-        token_details = response.usage_metadata.model_dump(exclude_none=True)
-
-        is_paid_api = metadata.get("is_paid_api", True)
-        model_id = metadata.get("canonical_model_id", "")
-
-        cost_details: dict[str, float] = {
-            "input_cost": 0.0,
-            "cache_cost": 0.0,
-            "output_cost": 0.0,
-            "image_output_cost": 0.0,
-            "total_cost": 0.0,
-        }
-
-        if not is_paid_api:
-            log.debug("Using free API, costs are not applicable and will be reported as 0.")
-        else:
-            # For paid APIs, attempt to calculate cost.
-            try:
-                model_config = app_state._state.get("gemini_model_config", {})
-                if model_id in model_config:
-                    pricing = model_config[model_id].get("pricing", {})
-
-                    if pricing:
-                        total_cost = input_cost = cache_cost = output_cost = image_output_cost = 0.0
-
-                        # Calculate input cost (non-cached tokens)
-                        prompt_tokens = token_details.get("prompt_token_count", 0)
-                        cached_tokens = token_details.get("cached_content_token_count", 0)
-                        non_cached_input_tokens = prompt_tokens - cached_tokens
-
-                        if non_cached_input_tokens > 0 and "input" in pricing:
-                            input_cost = self._calculate_cost(
-                                non_cached_input_tokens, pricing["input"]
-                            )
-                            total_cost += input_cost
-
-                        # Calculate cached input cost (if applicable)
-                        if cached_tokens > 0 and "caching" in pricing:
-                            cache_cost = self._calculate_cost(cached_tokens, pricing["caching"])
-                            total_cost += cache_cost
-
-                        # Calculate output cost (image + text separately)
-                        completion_tokens = token_details.get("candidates_token_count", 0)
-                        if completion_tokens > 0:
-                            # If there is an image generated, it would be in candidates_tokens_details
-                            candidates_details = token_details.get("candidates_tokens_details", [])
-                            image_tokens = 0
-                            for detail in candidates_details or []:
-                                if detail.get("modality") == "IMAGE":
-                                    image_tokens += detail.get("token_count", 0)
-                            text_tokens = completion_tokens - image_tokens
-
-                            # Calculate text output cost
-                            if text_tokens > 0 and "output" in pricing:
-                                output_cost += self._calculate_cost(text_tokens, pricing["output"])
-
-                            # Calculate image output cost
-                            if image_tokens > 0 and "image_output" in pricing:
-                                image_output_cost += self._calculate_cost(
-                                    image_tokens, pricing["image_output"]
-                                )
-                            elif image_tokens > 0 and "output" in pricing:
-                                image_output_cost += self._calculate_cost(
-                                    image_tokens, pricing["output"]
-                                )
-
-                            total_cost += output_cost + image_output_cost
-
-                        cost_details = {
-                            "input_cost": round(input_cost, 6),
-                            "cache_cost": round(cache_cost, 6),
-                            "output_cost": round(output_cost, 6),
-                            "image_output_cost": round(image_output_cost, 6),
-                            "total_cost": round(total_cost, 6),
-                        }
-                        log.debug(
-                            f"Calculated cost for model {model_id}:",
-                            payload=cost_details,
-                        )
-                    else:
-                        log.debug(
-                            f"No pricing data found for model {model_id}. Cost details will be empty."
-                        )
-                else:
-                    log.debug(f"Model {model_id} not found in config. Cost details will be empty.")
-            except Exception as e:
-                log.warning(f"Failed to calculate cost: {e}. Cost details will be empty.")
-
-        # OWUI expects 'input_tokens' and 'output_tokens' at the top level of the usage dict
-        # to populate the admin dashboard.
-        # We aggregate Gemini's specific counts into these two categories.
-        input_tokens = token_details.get("prompt_token_count", 0) + token_details.get(
-            "tool_use_prompt_token_count", 0
-        )
-        output_tokens = token_details.get("candidates_token_count", 0) + token_details.get(
-            "thoughts_token_count", 0
-        )
-
-        usage_payload = {
-            # FIXME: put these to the end of the payload
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "token_details": token_details,
-            "cost_details": cost_details,
-        }
-
-        # --- Calculate and append cumulative usage ---
-        prev_tokens = metadata.get("cumulative_tokens")
-        prev_cost = metadata.get("cumulative_cost")
-
-        # Only add cumulative data if the chain is unbroken (previous data exists)
-        if prev_tokens is not None and prev_cost is not None:
-            current_tokens = token_details.get("total_token_count", 0)
-            current_cost = cost_details.get("total_cost", 0.0)
-
-            usage_payload["cumulative_token_count"] = prev_tokens + current_tokens
-            usage_payload["cumulative_total_cost"] = round(prev_cost + current_cost, 6)
-
-        # Include completion time
-        elapsed_time = time.monotonic() - start_time
-        usage_payload["completion_time"] = round(elapsed_time, 2)
-
-        return usage_payload
-
     # endregion 2.5 Post-processing
 
     # region 2.6 Logging
@@ -4702,6 +5914,41 @@ class Pipe:
         if not isinstance(data, dict):
             return False
         return not any(isinstance(value, (dict, list)) for value in data.values())
+
+    @classmethod
+    def _redact_log_data(cls, data: object) -> object:
+        """Remove credentials, signed state, and secret-bearing locations recursively."""
+        if isinstance(data, dict):
+            redacted: dict[object, object] = {}
+            for key, value in data.items():
+                normalized = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+                sensitive = bool(
+                    normalized == "gemini_interaction"
+                    or "signature" in normalized
+                    or normalized
+                    in {
+                        "api_key",
+                        "authorization",
+                        "credential",
+                        "credential_fingerprint",
+                        "password",
+                        "secret",
+                        "access_token",
+                        "refresh_token",
+                        "uri",
+                        "url",
+                    }
+                    or normalized.endswith("_api_key")
+                    or normalized.endswith("_credential")
+                    or normalized.endswith("_secret")
+                )
+                redacted[key] = LOG_REDACTED if sensitive else cls._redact_log_data(value)
+            return redacted
+        if isinstance(data, list):
+            return [cls._redact_log_data(item) for item in data]
+        if isinstance(data, tuple):
+            return tuple(cls._redact_log_data(item) for item in data)
+        return data
 
     def _truncate_long_strings(
         self, data: Any, max_len: int, truncation_marker: str, truncation_enabled: bool
@@ -4769,6 +6016,7 @@ class Pipe:
                 serializable_data = pydantic_core.to_jsonable_python(
                     data_to_process, serialize_unknown=True, exclude_none=True
                 )
+                serializable_data = self._redact_log_data(serializable_data)
 
                 # Determine truncation settings
                 truncation_enabled = original_extra.get(TRUNCATION_ENABLED_KEY, True)
@@ -4915,6 +6163,27 @@ class Pipe:
 
     # region 2.7 Utility helpers
 
+    @staticmethod
+    def _classify_generation_failure(error: Exception) -> GenerationFailure:
+        """Classify failures without parsing mutable human-readable messages."""
+        if isinstance(error, InteractionExecutionError):
+            return GenerationFailure(error.kind, False, str(error))
+        if isinstance(error, httpx.TimeoutException | httpx.TransportError):
+            return GenerationFailure(GenerationFailureKind.TRANSPORT, True, str(error))
+        if isinstance(error, genai_errors.ClientError):
+            if error.code == 429:
+                return GenerationFailure(GenerationFailureKind.RATE_LIMIT, True, str(error))
+            if error.code in {401, 403}:
+                return GenerationFailure(GenerationFailureKind.PERMISSION, False, str(error))
+            return GenerationFailure(GenerationFailureKind.INVALID_REQUEST, False, str(error))
+        if isinstance(error, genai_errors.ServerError):
+            return GenerationFailure(
+                GenerationFailureKind.UNAVAILABLE,
+                error.code in {500, 502, 503, 504},
+                str(error),
+            )
+        return GenerationFailure(GenerationFailureKind.UNKNOWN, False, str(error))
+
     async def _determine_execution_order(
         self,
         valves: "Pipe.Valves",
@@ -4923,7 +6192,7 @@ class Pipe:
         features: "Features",
     ) -> list[str]:
         """
-        Calculates the sequence of execution tiers (free, paid, vertex).
+        Calculates the sequence of execution tiers (free, paid, enterprise).
         Returns an empty list if no valid routing configuration is found.
         """
         model_id = __metadata__.get("canonical_model_id", "")
@@ -4931,11 +6200,13 @@ class Pipe:
         has_paid_key = bool(valves.GEMINI_PAID_API_KEY)
 
         # Retrieve Toggle Statuses
-        vertex_available, vertex_toggled_on = await self._get_toggleable_feature_status(
-            "gemini_vertex_ai_toggle", __metadata__
+        enterprise_available, enterprise_toggled_on = await self._get_toggleable_feature_status(
+            "gemini_enterprise_toggle", __metadata__
         )
-        # Vertex is only viable if toggled on AND we have a project ID
-        can_use_vertex = vertex_available and vertex_toggled_on and bool(valves.VERTEX_PROJECT)
+        # Enterprise is only viable if toggled on AND we have a project ID
+        can_use_enterprise = (
+            enterprise_available and enterprise_toggled_on and bool(valves.ENTERPRISE_PROJECT)
+        )
 
         paid_toggle_available, paid_toggled_on = await self._get_toggleable_feature_status(
             "gemini_paid_api", __metadata__
@@ -4944,7 +6215,11 @@ class Pipe:
         task_type = __metadata__.get("task")
         routing_strategy = valves.TASK_MODEL_ROUTING if task_type else "match_main"
 
-        is_free_eligible = self._check_free_tier_eligibility(model_id, model_config, features)
+        is_free_eligible = self._check_free_tier_eligibility(
+            model_id,
+            model_config,
+            self._resolve_gemini_features(__metadata__),
+        )
 
         execution_order: list[str] = []
 
@@ -4970,8 +6245,8 @@ class Pipe:
                     execution_order.append("free")
 
                 # 2. Add Paid fallbacks
-                if can_use_vertex:
-                    execution_order.append("vertex")
+                if can_use_enterprise:
+                    execution_order.append("enterprise")
                 elif has_paid_key:
                     execution_order.append("paid")
 
@@ -4982,19 +6257,19 @@ class Pipe:
 
             case "only_paid":
                 log.debug("Task model routing override: only_paid")
-                if can_use_vertex:
-                    execution_order = ["vertex"]
+                if can_use_enterprise:
+                    execution_order = ["enterprise"]
                 elif has_paid_key:
                     execution_order = ["paid"]
                 else:
                     log.error(
-                        "Routing strategy 'only_paid' requested, but neither Vertex AI nor Paid API is configured."
+                        "Routing strategy 'only_paid' requested, but neither Gemini Enterprise nor Paid API is configured."
                     )
 
             case _:
                 # Default Routing Logic ("match_main")
-                if can_use_vertex:
-                    execution_order = ["vertex"]
+                if can_use_enterprise:
+                    execution_order = ["enterprise"]
                 elif paid_toggle_available and paid_toggled_on:
                     if has_paid_key:
                         execution_order = ["paid"]
@@ -5006,23 +6281,23 @@ class Pipe:
                         if is_free_eligible:
                             execution_order = ["free"]
                             if valves.ENABLE_FREE_TIER_FALLBACK:
-                                if can_use_vertex:
-                                    execution_order.append("vertex")
+                                if can_use_enterprise:
+                                    execution_order.append("enterprise")
                                 elif has_paid_key:
                                     execution_order.append("paid")
                         else:
                             # If model isn't free-eligible, jump straight to paid tiers.
                             # If no paid tier exists, we try free anyway to let the API return the specific error.
-                            if can_use_vertex:
-                                execution_order = ["vertex"]
+                            if can_use_enterprise:
+                                execution_order = ["enterprise"]
                             elif has_paid_key:
                                 execution_order = ["paid"]
                             else:
                                 log.warning(
                                     f"Model '{model_id}' is ineligible for free tier and no paid keys found."
                                 )
-                    elif can_use_vertex:
-                        execution_order = ["vertex"]
+                    elif can_use_enterprise:
+                        execution_order = ["enterprise"]
                     elif has_paid_key:
                         execution_order = ["paid"]
 
@@ -5045,7 +6320,7 @@ class Pipe:
             "stream_options",
         }
         merged_params = {key: value for key, value in body.items() if key not in known_body_keys}
-        log.debug("Model page parameters extracted from body:", payload=merged_params)
+        log.debug(f"Extracted {len(merged_params)} model page parameter(s).")
 
         if __metadata__.get("task"):
             log.debug(
@@ -5055,10 +6330,7 @@ class Pipe:
 
         chat_control_params = __metadata__.get("chat_control_params", {})
         if chat_control_params:
-            log.debug(
-                "Chat control parameters extracted from metadata:",
-                payload=chat_control_params,
-            )
+            log.debug(f"Received {len(chat_control_params)} chat control parameter(s).")
             merged_params.update(chat_control_params)
 
         return merged_params
@@ -5155,7 +6427,7 @@ class Pipe:
         - If default_valves.USER_MUST_PROVIDE_AUTH_CONFIG is True and the user is
           not on the AUTH_WHITELIST, then GEMINI_FREE_API_KEY and
           GEMINI_PAID_API_KEY in the merged result will be taken directly from
-          user_valves (even if they are None), and Vertex AI usage is disabled.
+          user_valves (even if they are None), and Gemini Enterprise usage is disabled.
 
         Args:
             default_valves: The base Valves object with default configurations.
@@ -5191,66 +6463,30 @@ class Pipe:
         if default_valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
             log.info(
                 f"User '{user_email}' is required to provide their own authentication credentials due to USER_MUST_PROVIDE_AUTH_CONFIG=True."
-                " Admin-provided API keys and Vertex AI settings will not be used."
+                " Admin-provided API keys and Gemini Enterprise settings will not be used."
             )
             # If USER_MUST_PROVIDE_AUTH_CONFIG is True and user is not in the whitelist,
             # they must provide their own API keys.
-            # They are also disallowed from using the admin's Vertex AI configuration.
+            # They are also disallowed from using the admin's Gemini Enterprise configuration.
             merged_data["GEMINI_FREE_API_KEY"] = user_valves.GEMINI_FREE_API_KEY
             merged_data["GEMINI_PAID_API_KEY"] = user_valves.GEMINI_PAID_API_KEY
-            merged_data["VERTEX_PROJECT"] = None
-            merged_data["USE_VERTEX_AI"] = False
+            merged_data["ENTERPRISE_PROJECT"] = None
+            merged_data["USE_ENTERPRISE"] = False
 
         # Create a new Valves instance with the merged data.
         # Pydantic will validate the data against the Valves model definition during instantiation.
         return Pipe.Valves(**merged_data)
 
-    def _get_first_candidate(
-        self, candidates: list[types.Candidate] | None
-    ) -> types.Candidate | None:
-        """Selects the first candidate, logging a warning if multiple exist."""
-        if not candidates:
-            # Logging warnings is handled downstream.
-            return None
-        if len(candidates) > 1:
-            log.warning("Multiple candidates found, defaulting to first candidate.")
-        return candidates[0]
-
     def _check_companion_filter_version(self, features: "Features | dict") -> None:
-        """
-        Checks for the presence and version compatibility of the Gemini Manifold Companion filter.
-        Logs warnings if the filter is missing or outdated.
-        """
+        """Require the companion that implements this breaking protocol pair."""
         companion_version = features.get("gemini_manifold_companion_version")
-
-        if companion_version is None:
-            log.warning(
-                "Gemini Manifold Companion filter not detected. "
-                "Since v2.0.0, this pipe requires the companion filter to be installed and active. "
-                "Please install the companion filter or ensure it is active "
-                "for this model (or activate it globally)."
+        if companion_version != RECOMMENDED_COMPANION_VERSION:
+            received = companion_version if companion_version is not None else "not detected"
+            raise ValueError(
+                "Gemini Manifold protocol mismatch: companion "
+                f"{RECOMMENDED_COMPANION_VERSION} is required, received {received}."
             )
-        else:
-            # Comparing tuples of integers is a robust way to handle versions like '1.10.0' vs '1.2.0'.
-            try:
-                companion_v_tuple = tuple(map(int, companion_version.split(".")))
-                recommended_v_tuple = tuple(map(int, RECOMMENDED_COMPANION_VERSION.split(".")))
-
-                if companion_v_tuple < recommended_v_tuple:
-                    log.warning(
-                        f"The installed Gemini Manifold Companion filter version ({companion_version}) is older than "
-                        f"the recommended version ({RECOMMENDED_COMPANION_VERSION}). "
-                        "Some features may not work as expected. Please update the filter."
-                    )
-                else:
-                    log.debug(
-                        f"Gemini Manifold Companion filter detected with version: {companion_version}"
-                    )
-            except (ValueError, TypeError):
-                # This handles cases where the version string is malformed (e.g., '1.a.0').
-                log.error(
-                    f"Could not parse companion version string: '{companion_version}'. Version check skipped."
-                )
+        log.debug(f"Gemini Manifold Companion protocol pair: {companion_version}")
 
     # endregion 2.7 Utility helpers
 

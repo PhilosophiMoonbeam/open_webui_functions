@@ -3,35 +3,78 @@ name: Plugin Release
 on:
   push:
     tags:
-      - '*/v*' # This will match tags like my-plugin/v1.0.0 and my-plugin/v1.1.0rc1
+      - "*/v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      # Step 1: Checkout the code (fetch all history)
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # IMPORTANT: Needed for git log between tags
+          fetch-depth: 0
 
-      # Step 2: Parse tag name
-      - name: Parse Tag
+      - name: Parse tag
         id: parse_tag
         run: .github/scripts/parse_tag.sh
-        # GITHUB_REF_NAME is implicitly available to the script
 
-      # Step 3: Find Plugin File Path
-      - name: Find Plugin File
+      - name: Reject incompatible individual Gemini v3 releases
+        env:
+          PLUGIN_NAME: ${{ steps.parse_tag.outputs.plugin_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "${PLUGIN_NAME}" in
+            gemini_manifold|gemini_manifold_google_genai|gemini_manifold_companion|gemini_reasoning_toggle|gemini_map_grounding_toggle|gemini_maps_grounding_toggle|gemini_url_context_toggle|gemini_paid_api|gemini_enterprise_toggle)
+              echo "::error::Gemini suite components cannot be released individually; use gemini-suite/v3.0.0."
+              exit 1
+              ;;
+            gemini-suite)
+              if [[ "${RELEASE_TAG}" != "gemini-suite/v3.0.0" ]]; then
+                echo "::error::No manifest exists for ${RELEASE_TAG}."
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Install uv for coordinated suite verification
+        if: steps.parse_tag.outputs.plugin_name == 'gemini-suite'
+        uses: astral-sh/setup-uv@v6
+
+      - name: Synchronize locked release environment
+        if: steps.parse_tag.outputs.plugin_name == 'gemini-suite'
+        run: uv sync --locked
+
+      - name: Build deterministic coordinated suite twice
+        if: steps.parse_tag.outputs.plugin_name == 'gemini-suite'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          make check
+          mkdir -p dist/repro
+          uv run python .github/scripts/build_gemini_suite.py --manifest release/gemini-suite-v3.0.0.yaml --tag "${RELEASE_TAG}" --output dist/gemini-suite-v3.0.0.tar.gz
+          uv run python .github/scripts/build_gemini_suite.py --manifest release/gemini-suite-v3.0.0.yaml --tag "${RELEASE_TAG}" --output dist/repro/gemini-suite-v3.0.0.tar.gz
+          cmp dist/gemini-suite-v3.0.0.tar.gz dist/repro/gemini-suite-v3.0.0.tar.gz
+          cp release/gemini-suite-v3.0.0.yaml dist/gemini-suite-v3.0.0.yaml
+          (cd dist && sha256sum gemini-suite-v3.0.0.tar.gz gemini-suite-v3.0.0.yaml > SHA256SUMS)
+
+      - name: Find individual plugin file
+        if: steps.parse_tag.outputs.plugin_name != 'gemini-suite'
         id: find_plugin_file
         run: .github/scripts/find_plugin_file.sh
         env:
           PLUGIN_NAME: ${{ steps.parse_tag.outputs.plugin_name }}
 
-      # Step 4: Generate Changelog using external script
-      - name: Generate Changelog
+      - name: Generate individual plugin changelog
+        if: steps.parse_tag.outputs.plugin_name != 'gemini-suite'
         id: changelog
         run: .github/scripts/generate_changelog.sh
         env:
@@ -39,16 +82,27 @@ jobs:
           CURRENT_TAG: ${{ github.ref_name }}
           PLUGIN_PATH: ${{ steps.find_plugin_file.outputs.plugin_path }}
 
-      # Step 5: Create the GitHub Draft Release
-      - name: Create Draft Release for Verification
+      - name: Create coordinated Gemini suite draft
+        if: steps.parse_tag.outputs.plugin_name == 'gemini-suite'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Gemini suite 3.0.0
+          body_path: release/gemini-suite-v3.0.0.md
+          files: |
+            dist/gemini-suite-v3.0.0.tar.gz
+            dist/SHA256SUMS
+            dist/gemini-suite-v3.0.0.yaml
+          draft: true
+          prerelease: ${{ steps.parse_tag.outputs.is_prerelease == 'true' }}
+
+      - name: Create individual plugin draft
+        if: steps.parse_tag.outputs.plugin_name != 'gemini-suite'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: Release ${{ steps.parse_tag.outputs.plugin_name }} ${{ steps.parse_tag.outputs.version }}
           body: ${{ steps.changelog.outputs.changelog_body }}
           files: ${{ steps.find_plugin_file.outputs.plugin_path }}
-          draft: true # Create a draft release instead of publishing immediately
-          # Dynamically set prerelease based on the parsed tag
+          draft: true
           prerelease: ${{ steps.parse_tag.outputs.is_prerelease == 'true' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
