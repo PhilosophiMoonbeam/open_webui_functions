@@ -9,11 +9,12 @@ is `gemini-suite/v3.0.0`.
 
 - Pipe and companion frontmatter/constants are 3.0.0 and the pipe requires companion 3.0.0.
 - `google-genai` is exactly 2.11.0 in plugin metadata, `pyproject.toml`, and `uv.lock`.
-- Grounding-envelope and catalog protocols are both 1.
+- The grounding-envelope protocol is 1 and the model-catalog protocol is 2.
 - The companion catalog URL is the immutable suite-tag URL, never `master`.
 - Reason 2.0.0 emits `reasoning`; Maps 2.0.0 emits `google_maps`.
 - The Paid, URL Context, and Enterprise toggles are present in the same bundle.
 - Archived `thinking_gemini.py` is excluded.
+- Unsupported custom safety configuration is absent from valves, metadata, and Interaction payloads.
 - Individual v3 tags for any suite member are rejected by both the helper and release workflow.
 
 ## Preflight and deterministic build
@@ -55,9 +56,9 @@ configuration changes.
 
 Offline tests are authoritative for deterministic contracts. Optional Developer live smoke is
 manually dispatched into a protected GitHub environment, requires `GEMINI_API_KEY`, fails rather
-than skips after explicit opt-in when that secret is absent, and never records response text. The
-Developer workflow's Enterprise job is a no-network policy contract: it proves the canonical SDK
-transport snapshot, the all-unverified catalog, and pre-client denial. A separate protected
+than skips after explicit opt-in when that secret is absent, and does not intentionally emit response
+text. The Developer workflow's Enterprise job is a no-network policy contract: it proves the
+canonical SDK transport snapshot, the all-unverified catalog, and pre-client denial. A separate protected
 Enterprise live workflow uses Workload Identity Federation, requires explicit project/location,
 model, and API-version inputs, and runs unary, SSE, and stored-continuation probes with cleanup.
 Even a green probe proves only that selected tuple; promote no catalog entry until its
@@ -65,13 +66,16 @@ service-specific capabilities and pricing are audited too.
 
 The protected environment requires reviewers/no bypass and a default-branch deployment rule. The
 Google WIF provider must bind immutable repository ID plus the default ref, environment, and
-audience; grant its service account only endpoint-required permissions. The workflow pins actions,
-disables persisted checkout credentials, checks exactly three non-skipped cases, and records a
-sanitized project hash. Retain separate `v1beta1` and `v1` run URLs in Beads before promotion.
+audience; grant its service account only endpoint-required permissions. The workflow fails a
+non-default-ref dispatch before checkout, pins actions, disables persisted checkout credentials,
+validates a bare model ID, masks identity fields before authentication, converts SDK errors to
+constant redacted messages, checks exactly three non-skipped cases, and records a sanitized project
+hash. Retain separate `v1beta1` and `v1` run URLs in Beads before promotion.
 
 The latest sanitized local Developer run was recorded on 2026-07-14 against the default
 `gemini-2.5-flash` model: unary, SSE terminal/cleanup, and stored continuation all passed. The
-test records no response text or identifiers and deletes the provider-stored continuation chain.
+test does not intentionally emit response text or identifiers and deletes the provider-stored
+continuation chain.
 
 ## Publication order
 

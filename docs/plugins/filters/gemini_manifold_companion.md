@@ -11,18 +11,18 @@ It is not compatible with pipe 2.x. Install companion 3.0.0 before pipe 3.0.0 fr
 
 For models owned by `gemini_manifold_google_genai`, the inlet:
 
-- Loads the pinned schema-2 service-qualified model catalog and denies unknown capabilities.
+- Loads and validates the pinned schema-2 service-qualified model catalog for the pipe.
 - Records companion version 3.0.0 and canonical chat controls in request metadata.
-- Converts enabled Open WebUI web search to `features.google_search_tool` when the catalog allows
-  Google Search.
-- Converts enabled code interpreter to `features.google_code_execution` when allowed.
-- Adds permissive Interactions safety settings only when explicitly configured.
+- Converts enabled Open WebUI web search to the neutral desired-feature signal
+  `features.google_search_tool`; the pipe authorizes it against the selected service policy.
+- Converts enabled code interpreter to `features.google_code_execution` under the same
+  pipe-owned authorization rule.
 - With `BYPASS_BACKEND_RAG`, removes Open WebUI RAG files and asks the pipe to process original
   documents. Temporary/local chats cannot use this bypass and fall back to Open WebUI RAG.
 
 The companion does not set temperature, implement dynamic-retrieval thresholds, or use hard-coded
 allowed-model lists. Those GenerateContent-era options were removed; the versioned catalog is the
-only capability authority.
+only capability authority, and the pipe applies it after selecting the request's service.
 
 ## Durable grounding protocol
 
@@ -45,7 +45,6 @@ and all request-local event queues are flushed and shut down before outlet compl
 
 | Valve | Purpose |
 | --- | --- |
-| `USE_PERMISSIVE_SAFETY` | Request `off` thresholds for supported Interactions safety categories. |
 | `BYPASS_BACKEND_RAG` | Let the pipe process original persistent-chat documents. |
 | `MODEL_CONFIG_PATH` | Immutable HTTP(S) schema-2 catalog. Defaults to the suite tag, never `master`. |
 | `URL_RESOLVE_TIMEOUT` | Per-attempt redirect timeout in seconds. |

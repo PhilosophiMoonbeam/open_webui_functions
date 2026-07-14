@@ -54,6 +54,22 @@ def test_maintained_contract_has_no_removed_generate_content_storage_types() -> 
     assert findings == []
 
 
+def test_maintained_contract_has_no_custom_safety_configuration_surface() -> None:
+    removed_names = {
+        "USE_" + "PERMISSIVE_SAFETY",
+        "safety_" + "settings",
+        "Safety" + "Setting",
+        "permissive " + "safety",
+    }
+    findings: list[str] = []
+    for path in MAINTAINED:
+        source = path.read_text(encoding="utf-8")
+        for name in removed_names:
+            if name in source:
+                findings.append(f"{path.relative_to(ROOT)}:{name}")
+    assert findings == []
+
+
 def test_maintained_response_path_has_no_candidate_or_usage_metadata_access() -> None:
     removed_attributes = {"candidates", "usage_" + "metadata"}
     findings: list[str] = []

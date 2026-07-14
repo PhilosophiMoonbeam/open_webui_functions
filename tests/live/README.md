@@ -1,7 +1,9 @@
 # Optional Gemini Interactions live smoke tests
 
-Live tests are disabled by default and never record response text, credentials,
-project identifiers, or uploaded content.
+Live tests are disabled by default. They do not intentionally emit response text,
+credentials, raw project identifiers, Interaction IDs, or uploaded content. The
+Enterprise workflow masks identity fields before authentication and converts SDK
+failures to constant redacted messages.
 
 Run the Developer API smoke tests with:
 
@@ -46,7 +48,8 @@ tests. A separate no-network job proves the canonical Enterprise SDK transport
 snapshot, the all-unverified catalog, and public pre-client denial. The protected
 `Optional Gemini Enterprise Interactions Live Smoke` workflow uses Workload
 Identity Federation, runs only from the repository default branch, pins every action by full commit
-SHA, validates exactly three non-skipped cases, and requires an explicit model and API version. The
+SHA, fails non-default-ref dispatches before checkout, validates a bare model ID and exactly three
+non-skipped cases, and requires an explicit model and API version. The
 `gemini-live-enterprise` environment must have required reviewers with no bypass and a default-branch
 deployment rule. Its Google provider binding must constrain immutable repository ID, default ref,
 environment, and audience; the service account receives only endpoint-required permissions. Record

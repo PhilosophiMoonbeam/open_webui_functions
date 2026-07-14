@@ -37,22 +37,36 @@ def _enterprise_settings() -> tuple[str, str, str, str]:
     missing = [name for name, value in zip(names, values, strict=True) if not value]
     if missing:
         pytest.fail("RUN_GEMINI_ENTERPRISE_LIVE_TESTS=1 requires " + ", ".join(missing))
-    project, location, model, api_version = values
-    assert project and location and model and api_version
+    project, location, model, api_version = (os.environ[name] for name in names)
     return project, location, model, api_version
 
 
 def _enterprise_client() -> tuple[genai.Client, str]:
     project, location, model, api_version = _enterprise_settings()
-    return (
-        genai.Client(
+    try:
+        client = genai.Client(
             enterprise=True,
             project=project,
             location=location,
             http_options=types.HttpOptions(api_version=api_version),
-        ),
-        model,
-    )
+        )
+    except Exception:
+        pytest.fail(
+            "Unable to initialize the Enterprise client; details were redacted.", pytrace=False
+        )
+    return client, model
+
+
+def _developer_client(api_key: str) -> genai.Client:
+    try:
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(api_version="v1"),
+        )
+    except Exception:
+        pytest.fail(
+            "Unable to initialize the Developer client; details were redacted.", pytrace=False
+        )
 
 
 async def _cleanup_stored_interactions(
@@ -81,6 +95,7 @@ async def _run_previous_interaction_probe(client: genai.Client, model: str) -> N
     token = f"T{secrets.token_hex(12).upper()}"
     created_interaction_ids: list[str] = []
     primary_failure: BaseException | None = None
+    provider_failure = False
     try:
         async with asyncio.timeout(60):
             first = await client.aio.interactions.create(
@@ -89,8 +104,10 @@ async def _run_previous_interaction_probe(client: genai.Client, model: str) -> N
                 stream=False,
                 store=True,
             )
-            assert isinstance(first, interactions.Interaction)
-            assert first.id
+            if not isinstance(first, interactions.Interaction) or not first.id:
+                pytest.fail(
+                    "First stored Interaction was invalid; details were redacted.", pytrace=False
+                )
             created_interaction_ids.append(first.id)
             second = await client.aio.interactions.create(
                 model=model,
@@ -99,15 +116,19 @@ async def _run_previous_interaction_probe(client: genai.Client, model: str) -> N
                 stream=False,
                 store=True,
             )
-            assert isinstance(second, interactions.Interaction)
-            assert second.id
+            if not isinstance(second, interactions.Interaction) or not second.id:
+                pytest.fail(
+                    "Continuation Interaction was invalid; details were redacted.", pytrace=False
+                )
             created_interaction_ids.append(second.id)
             if second.status != "completed" or (second.output_text or "").strip() != token:
                 pytest.fail(
                     "Stored Interaction did not preserve semantic continuation.", pytrace=False
                 )
-    except BaseException as exc:
+    except (asyncio.CancelledError, pytest.fail.Exception) as exc:
         primary_failure = exc
+    except Exception:
+        provider_failure = True
 
     cleanup_task = asyncio.create_task(
         _cleanup_stored_interactions(client, created_interaction_ids)
@@ -122,8 +143,65 @@ async def _run_previous_interaction_probe(client: genai.Client, model: str) -> N
         if cleanup_failures:
             primary_failure.add_note("Provider cleanup also failed; details were redacted.")
         raise primary_failure
+    if provider_failure:
+        message = "Gemini Interaction request failed; provider details were redacted."
+        if cleanup_failures:
+            message += " Provider cleanup also failed."
+        pytest.fail(message, pytrace=False)
     if cleanup_failures:
         pytest.fail("Provider cleanup failed; details were redacted.", pytrace=False)
+
+
+async def _run_text_interaction_probe(client: genai.Client, model: str, stream: bool) -> None:
+    """Run an ephemeral text probe without exposing provider objects or errors."""
+    primary_failure: BaseException | None = None
+    provider_failure = False
+    try:
+        async with asyncio.timeout(60):
+            result = await client.aio.interactions.create(
+                model=model,
+                input="Reply with one short word.",
+                stream=stream,
+                store=False,
+            )
+            if stream:
+                if isinstance(result, interactions.Interaction):
+                    pytest.fail("Streaming request returned a unary result.", pytrace=False)
+                terminal = False
+                async with result:
+                    async for event in result:
+                        terminal = terminal or isinstance(
+                            event, interactions.InteractionCompletedEvent
+                        )
+                if not terminal:
+                    pytest.fail("Streaming request had no completed terminal event.", pytrace=False)
+            else:
+                if not isinstance(result, interactions.Interaction):
+                    pytest.fail("Unary request returned an invalid result.", pytrace=False)
+                if result.status != "completed" or not result.output_text:
+                    pytest.fail("Unary request did not complete with text.", pytrace=False)
+    except (asyncio.CancelledError, pytest.fail.Exception) as exc:
+        primary_failure = exc
+    except Exception:
+        provider_failure = True
+
+    close_failure = False
+    try:
+        async with asyncio.timeout(15):
+            await client.aio.aclose()
+    except Exception:
+        close_failure = True
+
+    if primary_failure is not None:
+        if close_failure:
+            primary_failure.add_note("Client cleanup also failed; details were redacted.")
+        raise primary_failure
+    if provider_failure:
+        pytest.fail(
+            "Gemini Interaction request failed; provider details were redacted.", pytrace=False
+        )
+    if close_failure:
+        pytest.fail("Client cleanup failed; details were redacted.", pytrace=False)
 
 
 @pytest.mark.live
@@ -133,33 +211,7 @@ async def _run_previous_interaction_probe(client: genai.Client, model: str) -> N
 async def test_developer_text_interaction_live(stream: bool) -> None:
     api_key = _developer_api_key()
     model = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.5-flash")
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(api_version="v1"),
-    )
-    async with asyncio.timeout(60):
-        try:
-            result = await client.aio.interactions.create(
-                model=model,
-                input="Reply with one short word.",
-                stream=stream,
-                store=False,
-            )
-            if stream:
-                assert not isinstance(result, interactions.Interaction)
-                terminal = False
-                async with result:
-                    async for event in result:
-                        terminal = terminal or isinstance(
-                            event, interactions.InteractionCompletedEvent
-                        )
-                assert terminal
-            else:
-                assert isinstance(result, interactions.Interaction)
-                assert result.status == "completed"
-                assert bool(result.output_text)
-        finally:
-            await client.aio.aclose()
+    await _run_text_interaction_probe(_developer_client(api_key), model, stream)
 
 
 @pytest.mark.live
@@ -168,11 +220,7 @@ async def test_developer_text_interaction_live(stream: bool) -> None:
 async def test_developer_previous_interaction_live() -> None:
     api_key = _developer_api_key()
     model = os.getenv("GEMINI_LIVE_MODEL", "gemini-2.5-flash")
-    client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(api_version="v1"),
-    )
-    await _run_previous_interaction_probe(client, model)
+    await _run_previous_interaction_probe(_developer_client(api_key), model)
 
 
 @pytest.mark.live
@@ -181,29 +229,7 @@ async def test_developer_previous_interaction_live() -> None:
 @pytest.mark.parametrize("stream", [False, True], ids=["unary", "sse"])
 async def test_enterprise_text_interaction_live(stream: bool) -> None:
     client, model = _enterprise_client()
-    async with asyncio.timeout(60):
-        try:
-            result = await client.aio.interactions.create(
-                model=model,
-                input="Reply with one short word.",
-                stream=stream,
-                store=False,
-            )
-            if stream:
-                assert not isinstance(result, interactions.Interaction)
-                terminal = False
-                async with result:
-                    async for event in result:
-                        terminal = terminal or isinstance(
-                            event, interactions.InteractionCompletedEvent
-                        )
-                assert terminal
-            else:
-                assert isinstance(result, interactions.Interaction)
-                assert result.status == "completed"
-                assert bool(result.output_text)
-        finally:
-            await client.aio.aclose()
+    await _run_text_interaction_probe(client, model, stream)
 
 
 @pytest.mark.live

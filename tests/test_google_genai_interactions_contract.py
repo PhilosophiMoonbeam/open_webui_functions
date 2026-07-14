@@ -389,7 +389,6 @@ async def test_developer_request_snapshot_serializes_canonical_interactions_opti
         store=True,
         previous_interaction_id="interaction-1",
         response_format={"type": "json_schema", "name": "answer"},
-        safety_settings=[interactions.SafetySetting(type="harassment", threshold="off")],
         tools=[interactions.GoogleSearch()],
         generation_config=interactions.GenerationConfig(
             temperature=0.2,
@@ -418,6 +417,7 @@ async def test_developer_request_snapshot_serializes_canonical_interactions_opti
         "content_type": "application/json",
         "body": request.model_dump(mode="json", exclude_none=True),
     }
+    assert "safety_" + "settings" not in snapshot["body"]
     assert "secret-that-must-not-appear-in-snapshot" not in json.dumps(snapshot)
 
 

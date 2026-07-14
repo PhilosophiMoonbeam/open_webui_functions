@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import importlib.util
 import os
@@ -153,10 +154,34 @@ def test_ci_and_release_workflows_cover_all_contract_surfaces() -> None:
     assert 'test -n "$GEMINI_ENTERPRISE_PROJECT"' in enterprise_live
     assert 'test -n "$GEMINI_ENTERPRISE_LOCATION"' in enterprise_live
     assert "live and enterprise_api" in enterprise_live
-    assert "github.event.repository.default_branch" in enterprise_live
+    assert "if: github.ref" not in enterprise_live
+    assert "Require trusted default-branch dispatch" in enterprise_live
+    assert "ACTUAL_REF" in enterprise_live
+    assert "EXPECTED_REF" in enterprise_live
+    assert "must run from the repository default branch" in enterprise_live
+    assert enterprise_live.index("Require trusted default-branch dispatch") < enterprise_live.index(
+        "actions/checkout@"
+    )
     assert "persist-credentials: false" in enterprise_live
     assert "timeout-minutes: 15" in enterprise_live
     assert "cancel-in-progress: false" in enterprise_live
+    assert "group: gemini-enterprise-live-${{ inputs.api_version }}" in enterprise_live
+    assert "gemini-enterprise-live-${{ inputs.model }}" not in enterprise_live
+    assert "Enterprise model must be a bare model ID" in enterprise_live
+    assert '[[ ! "$GEMINI_ENTERPRISE_MODEL" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]' in (
+        enterprise_live
+    )
+    checkout_position = enterprise_live.index("actions/checkout@")
+    auth_position = enterprise_live.index("google-github-actions/auth@")
+    for masked_name in (
+        "GCP_WORKLOAD_IDENTITY_PROVIDER",
+        "GCP_SERVICE_ACCOUNT",
+        "GEMINI_ENTERPRISE_PROJECT",
+        "GEMINI_ENTERPRISE_LOCATION",
+    ):
+        mask_position = enterprise_live.index(f'echo "::add-mask::${masked_name}"')
+        assert mask_position < checkout_position
+        assert mask_position < auth_position
     assert "--junitxml=enterprise-live-results.xml" in enterprise_live
     assert '"tests": 3, "failures": 0, "errors": 0, "skipped": 0' in enterprise_live
     action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", enterprise_live)
@@ -228,6 +253,15 @@ def test_live_continuation_is_semantic_redacted_and_cleanup_owned() -> None:
     assert "temporary token I asked you to remember" in probe_text
     assert "ALPHA" not in probe_text
     assert "second.output_text" not in probe_text or "pytest.fail" in probe_text
+    assert not any(isinstance(node, ast.Assert) for node in ast.walk(probe))
+
+    text_probe = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_text_interaction_probe"
+    )
+    assert not any(isinstance(node, ast.Assert) for node in ast.walk(text_probe))
+    assert "provider details were redacted" in ast.unparse(text_probe)
 
     cleanup = next(
         node
@@ -276,6 +310,59 @@ async def test_live_continuation_cleanup_survives_semantic_and_delete_failures(m
         "second",
         "first",
     ]
+    client.aio.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_probes_redact_provider_exception_details(monkeypatch) -> None:
+    live = _load_live_tests()
+    monkeypatch.setattr(live.secrets, "token_hex", lambda _size: "ABC123")
+    sensitive_detail = "projects/private-project/locations/private-location provider body"
+
+    continuation_client = MagicMock()
+    continuation_client.aio.interactions.create = AsyncMock(
+        side_effect=RuntimeError(sensitive_detail)
+    )
+    continuation_client.aio.aclose = AsyncMock()
+    with pytest.raises(pytest.fail.Exception) as continuation_failure:
+        await live._run_previous_interaction_probe(continuation_client, "model")
+    assert sensitive_detail not in str(continuation_failure.value)
+    continuation_client.aio.aclose.assert_awaited_once()
+
+    text_client = MagicMock()
+    text_client.aio.interactions.create = AsyncMock(side_effect=RuntimeError(sensitive_detail))
+    text_client.aio.aclose = AsyncMock()
+    with pytest.raises(pytest.fail.Exception) as text_failure:
+        await live._run_text_interaction_probe(text_client, "model", False)
+    assert sensitive_detail not in str(text_failure.value)
+    text_client.aio.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_live_continuation_cleanup_survives_cancellation() -> None:
+    live = _load_live_tests()
+    first = live.interactions.Interaction(id="first", status="completed", steps=[])
+    second_create_started = asyncio.Event()
+
+    async def create_interaction(**_kwargs):
+        if not second_create_started.is_set():
+            second_create_started.set()
+            return first
+        await asyncio.Future()
+
+    client = MagicMock()
+    client.aio.interactions.create = AsyncMock(side_effect=create_interaction)
+    client.aio.interactions.delete = AsyncMock()
+    client.aio.aclose = AsyncMock()
+    probe = asyncio.create_task(live._run_previous_interaction_probe(client, "model"))
+    await second_create_started.wait()
+    await asyncio.sleep(0)
+    probe.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await probe
+
+    client.aio.interactions.delete.assert_awaited_once_with("first")
     client.aio.aclose.assert_awaited_once()
 
 

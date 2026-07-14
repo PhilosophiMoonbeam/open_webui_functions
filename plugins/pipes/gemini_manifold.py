@@ -73,6 +73,7 @@ from functools import cache
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     Final,
     Generic,
@@ -105,7 +106,17 @@ from open_webui.models.files import FileForm, Files
 from open_webui.models.functions import Functions
 from open_webui.storage.provider import Storage
 from open_webui.utils.misc import pop_system_message
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    RootModel,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 # This block is skipped at runtime.
 if TYPE_CHECKING:
@@ -1220,6 +1231,163 @@ class InteractionExecutionError(Exception):
         super().__init__(detail)
 
 
+CatalogServiceName = Literal["developer", "enterprise"]
+CatalogContentKind = Literal["text", "image", "video", "audio", "document"]
+CatalogThinkingLevel = Literal["minimal", "low", "medium", "high"]
+CatalogExcludedFeature = Literal["google_search", "google_maps"]
+
+
+class _PipeCatalogModel(BaseModel):
+    """Strict immutable protocol-2 record received through Open WebUI app state."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CatalogLimits(_PipeCatalogModel):
+    input_tokens: int = Field(gt=0)
+    output_tokens: int = Field(gt=0)
+
+
+class CatalogContent(_PipeCatalogModel):
+    inputs: frozenset[CatalogContentKind]
+    outputs: frozenset[CatalogContentKind]
+
+
+class CatalogThinking(_PipeCatalogModel):
+    supported: bool
+    levels: frozenset[CatalogThinkingLevel]
+    summaries: bool
+
+    @model_validator(mode="after")
+    def validate_support(self) -> "CatalogThinking":
+        if self.supported != bool(self.levels):
+            raise ValueError("thinking levels must be present exactly when thinking is supported")
+        if self.summaries and not self.supported:
+            raise ValueError("thinking summaries require thinking support")
+        return self
+
+
+class CatalogTools(_PipeCatalogModel):
+    google_search: bool
+    google_maps: bool
+    code_execution: bool
+    url_context: bool
+    file_search: bool
+
+
+class CatalogInteractions(_PipeCatalogModel):
+    store: bool
+    response_format: bool
+    thinking: CatalogThinking
+    custom_function_calling: bool
+    files: bool
+    external_urls: bool
+    tools: CatalogTools
+
+
+class CatalogPriceTier(_PipeCatalogModel):
+    up_to_tokens: int | None = Field(default=None, gt=0)
+    price_per_million: float = Field(ge=0)
+
+
+class CatalogPricing(_PipeCatalogModel):
+    free_tier: bool
+    excluded_features: frozenset[CatalogExcludedFeature]
+    input: tuple[CatalogPriceTier, ...] = Field(min_length=1)
+    output: tuple[CatalogPriceTier, ...] = Field(min_length=1)
+    image_output: tuple[CatalogPriceTier, ...] | None = None
+
+    @model_validator(mode="after")
+    def validate_tiers(self) -> "CatalogPricing":
+        tier_groups: tuple[tuple[str, tuple[CatalogPriceTier, ...] | None], ...] = (
+            ("input", self.input),
+            ("output", self.output),
+            ("image_output", self.image_output),
+        )
+        for name, tiers in tier_groups:
+            if tiers is None:
+                continue
+            thresholds = [tier.up_to_tokens for tier in tiers]
+            if thresholds[-1] is not None:
+                raise ValueError(f"{name} pricing must end with an unbounded tier")
+            bounded = [threshold for threshold in thresholds[:-1] if threshold is not None]
+            if len(bounded) != len(thresholds) - 1 or bounded != sorted(set(bounded)):
+                raise ValueError(f"{name} pricing thresholds must be unique and ascending")
+        return self
+
+
+class CatalogSupportedService(_PipeCatalogModel):
+    availability: Literal["supported"]
+    verified_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source_refs: frozenset[str] = Field(min_length=1)
+    lifecycle: Literal["stable", "preview"]
+    limits: CatalogLimits
+    content: CatalogContent
+    interactions: CatalogInteractions
+    pricing: CatalogPricing
+
+    @model_validator(mode="after")
+    def validate_capability_dependencies(self) -> "CatalogSupportedService":
+        image_output = "image" in self.content.outputs
+        if image_output != (self.pricing.image_output is not None):
+            raise ValueError("image output requires image-output pricing, and vice versa")
+        if self.interactions.external_urls and not self.interactions.tools.url_context:
+            raise ValueError("external URL input requires the URL-context tool")
+        return self
+
+
+class CatalogUnavailableService(_PipeCatalogModel):
+    availability: Literal["unsupported", "unverified"]
+    reason: str = Field(min_length=1)
+
+
+CatalogService = Annotated[
+    CatalogSupportedService | CatalogUnavailableService,
+    Field(discriminator="availability"),
+]
+
+
+class CatalogServices(_PipeCatalogModel):
+    developer: CatalogService
+    enterprise: CatalogService
+
+    def select(self, service: CatalogServiceName) -> CatalogService:
+        return self.enterprise if service == "enterprise" else self.developer
+
+
+class CatalogModel(_PipeCatalogModel):
+    services: CatalogServices
+
+    @model_validator(mode="after")
+    def validate_somewhere_actionable(self) -> "CatalogModel":
+        if all(
+            service.availability == "unsupported"
+            for service in (self.services.developer, self.services.enterprise)
+        ):
+            raise ValueError("a catalog model must be supported or pending verification somewhere")
+        return self
+
+
+class AppStateModelCatalog(RootModel[dict[str, CatalogModel]]):
+    """Validated Pipe-side view of the companion's protocol-2 model mapping."""
+
+    @model_validator(mode="after")
+    def validate_model_ids(self) -> "AppStateModelCatalog":
+        invalid = [model_id for model_id in self.root if not model_id.startswith("gemini-")]
+        if invalid:
+            raise ValueError(f"invalid Gemini model ids: {invalid}")
+        return self
+
+
+@dataclass(frozen=True)
+class SelectedCatalogService:
+    """The immutable service/model policy authorized for one generation attempt."""
+
+    model_id: str
+    service: CatalogServiceName
+    policy: CatalogSupportedService
+
+
 class ResolvedGeminiFeatures(BaseModel):
     """Single canonical feature contract consumed by routing and request assembly."""
 
@@ -1237,7 +1405,6 @@ class InteractionRequestOptions(BaseModel):
 
     generation_config: interaction_types.GenerationConfig
     system_instruction: str | None = None
-    safety_settings: list[interaction_types.SafetySetting] = Field(default_factory=list)
     response_format: interaction_types.CreateModelInteractionResponseFormat | None = None
     tools: list[interaction_types.Tool] = Field(default_factory=list)
     features: ResolvedGeminiFeatures
@@ -2444,7 +2611,7 @@ class GeminiContentBuilder:
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
         pdf_mitigation_manager: PDFMitigationManager,
-        service_policy: dict[str, object],
+        service_policy: CatalogSupportedService,
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -2456,16 +2623,11 @@ class GeminiContentBuilder:
         self.valves = valves
         self.files_api_manager = files_api_manager
         self.pdf_mitigation_manager = pdf_mitigation_manager
-        content_policy = service_policy.get("content")
-        interaction_policy = service_policy.get("interactions")
-        if not isinstance(content_policy, dict) or not isinstance(interaction_policy, dict):
-            raise ValueError("Selected Gemini service policy is missing content capabilities.")
-        inputs = content_policy.get("inputs")
-        if not isinstance(inputs, list) or "text" not in inputs:
+        if "text" not in service_policy.content.inputs:
             raise ValueError("Selected Gemini service policy does not support text input.")
-        self.allowed_input_content = frozenset(str(value) for value in inputs)
-        self.files_api_supported = interaction_policy.get("files") is True
-        self.external_urls_supported = interaction_policy.get("external_urls") is True
+        self.allowed_input_content = service_policy.content.inputs
+        self.files_api_supported = service_policy.interactions.files
+        self.external_urls_supported = service_policy.interactions.external_urls
         # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.is_enterprise = self.files_api_manager.endpoint_identity.service == "enterprise"
@@ -4070,8 +4232,8 @@ class Pipe:
 
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
-        model_config: dict[str, Any] | None = app_state._state.get("gemini_model_config")
-        if model_config is None:
+        raw_model_config = app_state._state.get("gemini_model_config")
+        if raw_model_config is None:
             error_msg = (
                 "FATAL: Gemini model configuration not found in app state. "
                 "Please ensure the Gemini Manifold Companion filter is installed and enabled."
@@ -4084,6 +4246,7 @@ class Pipe:
                 f"expected {MODEL_CATALOG_SCHEMA_VERSION}, received {catalog_version!r}. "
                 "Update and enable the matching Gemini Manifold Companion filter."
             )
+        model_config = self._validate_app_state_catalog(raw_model_config).root
 
         merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
@@ -4159,14 +4322,13 @@ class Pipe:
                 current_valves.USE_ENTERPRISE = True
                 __metadata__["is_paid_api"] = True
 
-            service = "enterprise" if current_valves.USE_ENTERPRISE else "developer"
-            service_policy = self._get_catalog_service_policy(
-                catalog_model, cast(Literal["developer", "enterprise"], service)
+            service: CatalogServiceName = (
+                "enterprise" if current_valves.USE_ENTERPRISE else "developer"
             )
-            availability = service_policy.get("availability", "unsupported")
-            if availability != "supported":
+            service_policy = catalog_model.services.select(service)
+            if not isinstance(service_policy, CatalogSupportedService):
                 message = (
-                    f"Model '{model_id}' is {availability!r} for the Gemini {service} "
+                    f"Model '{model_id}' is {service_policy.availability!r} for the Gemini {service} "
                     "Interactions service; this attempt is denied by catalog policy."
                 )
                 if is_last_attempt:
@@ -4175,8 +4337,11 @@ class Pipe:
                 log.warning(message)
                 continue
 
-            resolved_model_config = dict(model_config)
-            resolved_model_config[model_id] = service_policy
+            selected_service = SelectedCatalogService(
+                model_id=model_id,
+                service=service,
+                policy=service_policy,
+            )
             __metadata__["gemini_catalog_service"] = service
 
             try:
@@ -4192,7 +4357,7 @@ class Pipe:
                 async def execute_attempt(
                     attempt_tier: str = tier,
                     attempt_valves: Pipe.Valves = current_valves,
-                    attempt_model_config: dict[str, Any] = resolved_model_config,
+                    attempt_selected_service: SelectedCatalogService = selected_service,
                 ):
                     return await self._execute_generation_attempt(
                         tier=attempt_tier,
@@ -4202,7 +4367,7 @@ class Pipe:
                         __metadata__=__metadata__,
                         __request__=__request__,
                         event_emitter=event_emitter,
-                        model_config=attempt_model_config,
+                        selected_service=attempt_selected_service,
                         __tools__=__tools__,
                     )
 
@@ -4822,43 +4987,19 @@ class Pipe:
         return canonical_model_name
 
     @staticmethod
-    def _is_image_model(model_id: str, config: dict) -> bool:
-        """Return whether a catalogued model may emit images; unknown models deny."""
-        outputs = config.get(model_id, {}).get("content", {}).get("outputs", [])
-        return "image" in outputs
+    def _validate_app_state_catalog(raw_catalog: object) -> AppStateModelCatalog:
+        """Validate the companion-owned mapping before any request policy is selected."""
+        try:
+            return AppStateModelCatalog.model_validate(raw_catalog)
+        except ValidationError as exc:
+            raise ValueError(
+                "FATAL: Gemini model configuration in app state does not satisfy "
+                f"catalog protocol {MODEL_CATALOG_SCHEMA_VERSION}."
+            ) from exc
 
     @staticmethod
-    def _get_catalog_service_policy(
-        model: object,
-        service: Literal["developer", "enterprise"],
-    ) -> dict[str, object]:
-        """Resolve one service policy; malformed or absent records deny by default."""
-        if not isinstance(model, dict):
-            return {}
-        services = model.get("services")
-        if not isinstance(services, dict):
-            return {}
-        policy = services.get(service)
-        if not isinstance(policy, dict):
-            return {}
-        availability = policy.get("availability")
-        if availability == "supported":
-            required = {
-                "availability",
-                "verified_at",
-                "source_refs",
-                "lifecycle",
-                "limits",
-                "content",
-                "interactions",
-                "pricing",
-            }
-            return cast(dict[str, object], policy) if required <= policy.keys() else {}
-        if availability in {"unverified", "unsupported"}:
-            return (
-                cast(dict[str, object], policy) if set(policy) == {"availability", "reason"} else {}
-            )
-        return {}
+    def _is_image_model(service_policy: CatalogSupportedService) -> bool:
+        return "image" in service_policy.content.outputs
 
     # endregion 2.2 Model retrival from Google API
 
@@ -4869,16 +5010,13 @@ class Pipe:
         body: "Body",
         __metadata__: "Metadata",
         valves: "Valves",
-        config: dict,
+        selected_service: SelectedCatalogService,
         custom_functions: list[interaction_types.Function] | None = None,
     ) -> InteractionRequestOptions:
         """Build canonical, capability-checked Interactions create options."""
-        model_id = str(__metadata__.get("canonical_model_id", ""))
-        model_policy = config.get(model_id)
-        if not isinstance(model_policy, dict):
-            raise ValueError(f"Model '{model_id}' is absent from the validated catalog.")
-        interaction_policy = model_policy.get("interactions", {})
-        limits_policy = model_policy.get("limits", {})
+        model_id = selected_service.model_id
+        interaction_policy = selected_service.policy.interactions
+        limits_policy = selected_service.policy.limits
         features = self._resolve_gemini_features(__metadata__)
 
         if body.get("top_k") is not None:
@@ -4889,12 +5027,11 @@ class Pipe:
         if reasoning_effort is not None and not isinstance(reasoning_effort, str):
             raise ValueError("'reasoning_effort' must be minimal, low, medium, or high.")
         thinking_level = reasoning_effort or valves.THINKING_LEVEL
-        thinking_policy = interaction_policy.get("thinking", {})
+        thinking_policy = interaction_policy.thinking
         if features.reasoning:
-            if not thinking_policy.get("supported", False):
+            if not thinking_policy.supported:
                 raise ValueError(f"Model '{model_id}' does not support thinking.")
-            allowed_levels = thinking_policy.get("levels", [])
-            if thinking_level not in allowed_levels:
+            if thinking_level not in thinking_policy.levels:
                 raise ValueError(
                     f"Thinking level '{thinking_level}' is not supported by model '{model_id}'."
                 )
@@ -4903,9 +5040,7 @@ class Pipe:
         if isinstance(stop, str):
             stop = [stop]
         max_output_tokens = body.get("max_tokens")
-        catalog_output_limit = (
-            limits_policy.get("output_tokens") if isinstance(limits_policy, dict) else None
-        )
+        catalog_output_limit = limits_policy.output_tokens
         if (
             isinstance(max_output_tokens, int)
             and isinstance(catalog_output_limit, int)
@@ -4927,46 +5062,11 @@ class Pipe:
             }
         )
 
-        safety_settings = __metadata__.get("safety_settings", []) or []
-        safety_types = {
-            "hate_speech",
-            "dangerous_content",
-            "harassment",
-            "sexually_explicit",
-            "civic_integrity",
-            "image_hate",
-            "image_dangerous_content",
-            "image_harassment",
-            "image_sexually_explicit",
-            "jailbreak",
-        }
-        safety_thresholds = {
-            "block_low_and_above",
-            "block_medium_and_above",
-            "block_only_high",
-            "block_none",
-            "off",
-        }
-        safety_payloads = [
-            setting.model_dump(mode="python", exclude_none=True)
-            if isinstance(setting, interaction_types.SafetySetting)
-            else setting
-            for setting in safety_settings
-        ]
-        for setting in safety_payloads:
-            if not isinstance(setting, dict) or setting.get("type") not in safety_types:
-                raise ValueError("Safety setting type must use a canonical lowercase literal.")
-            if setting.get("threshold") not in safety_thresholds:
-                raise ValueError("Safety threshold must use a canonical lowercase literal.")
-        canonical_safety = [
-            interaction_types.SafetySetting.model_validate(setting) for setting in safety_payloads
-        ]
-
         response_format: interaction_types.CreateModelInteractionResponseFormat | None
         response_format = interaction_types.TextResponseFormat(mime_type="text/plain")
         requested_format = body.get("response_format")
         if requested_format:
-            if not interaction_policy.get("response_format", False):
+            if not interaction_policy.response_format:
                 raise ValueError(f"Model '{model_id}' does not support structured output.")
             if (
                 not isinstance(requested_format, dict)
@@ -4979,7 +5079,7 @@ class Pipe:
             response_format = interaction_types.TextResponseFormat(
                 mime_type="application/json", schema_=json_schema["schema"]
             )
-        elif self._is_image_model(model_id, config):
+        elif self._is_image_model(selected_service.policy):
             response_format = interaction_types.ImageResponseFormat(
                 image_size=valves.IMAGE_RESOLUTION,
                 aspect_ratio=valves.IMAGE_ASPECT_RATIO,
@@ -4989,15 +5089,15 @@ class Pipe:
 
         tools: list[interaction_types.Tool] = []
         if not __metadata__.get("task"):
-            tool_policy = interaction_policy.get("tools", {})
-            requested_tools: list[tuple[str, bool]] = [
-                ("google_search", features.google_search),
-                ("code_execution", features.code_execution),
-                ("url_context", features.url_context),
-                ("google_maps", features.google_maps),
+            tool_policy = interaction_policy.tools
+            requested_tools: list[tuple[str, bool, bool]] = [
+                ("google_search", features.google_search, tool_policy.google_search),
+                ("code_execution", features.code_execution, tool_policy.code_execution),
+                ("url_context", features.url_context, tool_policy.url_context),
+                ("google_maps", features.google_maps, tool_policy.google_maps),
             ]
             unsupported = [
-                name for name, enabled in requested_tools if enabled and not tool_policy.get(name)
+                name for name, enabled, supported in requested_tools if enabled and not supported
             ]
             if unsupported:
                 raise ValueError(
@@ -5034,7 +5134,6 @@ class Pipe:
 
         return InteractionRequestOptions(
             generation_config=generation_config,
-            safety_settings=canonical_safety,
             response_format=response_format,
             tools=tools,
             features=features,
@@ -5045,16 +5144,13 @@ class Pipe:
         raw_tools: dict[str, dict[str, object]] | None,
         *,
         model_id: str,
-        model_policy: dict[str, object],
+        interactions_policy: CatalogInteractions,
         is_task: bool,
     ) -> dict[str, OpenWebUITool]:
         """Validate only executable tools already authorized by Open WebUI."""
         if not raw_tools or is_task:
             return {}
-        interactions_policy = model_policy.get("interactions")
-        if not isinstance(interactions_policy, dict) or not interactions_policy.get(
-            "custom_function_calling", False
-        ):
+        if not interactions_policy.custom_function_calling:
             raise ValueError(f"Model '{model_id}' is not approved for custom function calling.")
 
         registry: dict[str, OpenWebUITool] = {}
@@ -5522,7 +5618,7 @@ class Pipe:
         __metadata__: "Metadata",
         __request__: Request,
         event_emitter: "EventEmitter",
-        model_config: dict,
+        selected_service: SelectedCatalogService,
         __tools__: dict[str, dict[str, object]] | None = None,
     ) -> AsyncGenerator[dict | str, None] | dict:
         """
@@ -5534,8 +5630,12 @@ class Pipe:
         # 1. Client Creation
         binding = self._get_user_client(valves, __user__["email"])
         client = binding.client
-        model_id = str(__metadata__.get("canonical_model_id", ""))
+        model_id = selected_service.model_id
         endpoint_identity = binding.identity.for_model(model_id)
+        if endpoint_identity.service != selected_service.service:
+            raise ValueError(
+                "Selected Gemini catalog service does not match the initialized endpoint service."
+            )
         metadata_state = cast(dict[str, object], __metadata__)
         metadata_state["is_enterprise"] = endpoint_identity.service == "enterprise"
         metadata_state["gemini_endpoint_scope"] = endpoint_identity.scope
@@ -5544,7 +5644,6 @@ class Pipe:
             if endpoint_identity.service == "enterprise"
             else "Gemini Developer API"
         )
-        model_policy = cast(dict[str, object], model_config.get(model_id, {}))
 
         # 2. Files API Manager (Scoped to the current client)
         files_api_manager = FilesAPIManager(
@@ -5564,7 +5663,7 @@ class Pipe:
             valves=valves,
             files_api_manager=files_api_manager,
             pdf_mitigation_manager=self.pdf_mitigation_manager,
-            service_policy=model_policy,
+            service_policy=selected_service.policy,
         )
 
         event_emitter.emit_status("Preparing request...")
@@ -5574,35 +5673,37 @@ class Pipe:
         tool_registry = self._resolve_open_webui_tools(
             __tools__,
             model_id=model_id,
-            model_policy=model_policy,
+            interactions_policy=selected_service.policy.interactions,
             is_task=bool(__metadata__.get("task")),
         )
         request_options = await self._build_interaction_request_options(
             body,
             __metadata__,
             valves,
-            model_config,
+            selected_service,
             [tool.declaration for tool in tool_registry.values()],
         )
         request_options.system_instruction = builder.system_prompt
 
-        model_id = __metadata__.get("canonical_model_id", "")
-        store_interaction = self._resolve_store_policy(
-            admin_allows=bool(__metadata__.get("gemini_store_interactions", True)),
-            user_preference=None,
-            is_temp=builder.is_temp_chat,
-            is_task=bool(__metadata__.get("task")),
-        ) and self._service_supports_interaction_store(model_policy)
+        store_interaction = (
+            self._resolve_store_policy(
+                admin_allows=bool(__metadata__.get("gemini_store_interactions", True)),
+                user_preference=None,
+                is_temp=builder.is_temp_chat,
+                is_task=bool(__metadata__.get("task")),
+            )
+            and selected_service.policy.interactions.store
+        )
         metadata_state["gemini_effective_store"] = store_interaction
         continuation = builder.select_continuation(
             full_contents,
             store=store_interaction,
             endpoint_scope=endpoint_identity.scope,
-            model_id=str(model_id),
+            model_id=model_id,
         )
 
         # Check for image/system prompt compatibility
-        is_image_model = self._is_image_model(model_id, model_config)
+        is_image_model = self._is_image_model(selected_service.policy)
         if (is_image_model or "gemma" in model_id) and request_options.system_instruction:
             request_options.system_instruction = None
             log.warning(f"Model '{model_id}' does not support system prompts. Removing.")
@@ -5617,10 +5718,6 @@ class Pipe:
             "generation_config": request_options.generation_config.model_dump(
                 mode="json", exclude_none=True
             ),
-            "safety_settings": [
-                setting.model_dump(mode="json", exclude_none=True)
-                for setting in request_options.safety_settings
-            ],
             "tools": [
                 tool.model_dump(mode="json", exclude_none=True) for tool in request_options.tools
             ],
@@ -5649,6 +5746,7 @@ class Pipe:
                 app=__request__.app,
                 event_emitter=event_emitter,
                 metadata=__metadata__,
+                selected_service=selected_service,
             )
             if is_streaming_request:
                 return processor
@@ -5680,6 +5778,7 @@ class Pipe:
                 app=__request__.app,
                 event_emitter=event_emitter,
                 metadata=__metadata__,
+                selected_service=selected_service,
             )
 
         request = cast(
@@ -5706,6 +5805,7 @@ class Pipe:
             app=__request__.app,
             event_emitter=event_emitter,
             metadata=__metadata__,
+            selected_service=selected_service,
         )
         return await self._aggregate_to_dict(processor)
 
@@ -5720,15 +5820,10 @@ class Pipe:
         """Privacy is monotonic: either administrator or user may disable storage."""
         return bool(admin_allows and user_preference is not False and not is_temp and not is_task)
 
-    @staticmethod
-    def _service_supports_interaction_store(service_policy: dict[str, object]) -> bool:
-        interactions_policy = service_policy.get("interactions")
-        return isinstance(interactions_policy, dict) and interactions_policy.get("store") is True
-
     def _check_free_tier_eligibility(
         self,
         model_id: str,
-        model_config: dict,
+        model_config: dict[str, CatalogModel],
         features: ResolvedGeminiFeatures,
     ) -> bool:
         """
@@ -5739,17 +5834,15 @@ class Pipe:
         if model_id not in model_config:
             return False
 
-        developer_policy = self._get_catalog_service_policy(model_config[model_id], "developer")
-        if developer_policy.get("availability") != "supported":
+        developer_policy = model_config[model_id].services.developer
+        if not isinstance(developer_policy, CatalogSupportedService):
             return False
-        pricing = developer_policy.get("pricing", {})
-        if not isinstance(pricing, dict):
-            return False
-        if not pricing.get("free_tier", False):
+        pricing = developer_policy.pricing
+        if not pricing.free_tier:
             return False
 
         # 2. Check for feature exclusions (e.g. Google Search is often Paid only)
-        excluded_features = pricing.get("excluded_features", [])
+        excluded_features = pricing.excluded_features
 
         # Check Search
         is_search_requested = features.google_search
@@ -5772,6 +5865,7 @@ class Pipe:
         app: FastAPI,
         event_emitter: "EventEmitter",
         metadata: "Metadata",
+        selected_service: SelectedCatalogService,
     ) -> AsyncGenerator[dict | str, None]:
         """Reduce an SSE stream, resuming the same stored Interaction when possible."""
         reducer = InteractionReducer()
@@ -5823,7 +5917,7 @@ class Pipe:
         reducer.finalize_steps()
         reducer.state.original_content = "".join(visible_content_parts)
         async for chunk in self._finalize_reduction(
-            reducer.state, app.state, event_emitter, metadata
+            reducer.state, event_emitter, metadata, selected_service
         ):
             yield chunk
 
@@ -5835,6 +5929,7 @@ class Pipe:
         app: FastAPI,
         event_emitter: "EventEmitter",
         metadata: "Metadata",
+        selected_service: SelectedCatalogService,
     ) -> AsyncGenerator[dict | str, None]:
         visible_content_parts: list[str] = []
         for emission in emissions:
@@ -5843,7 +5938,9 @@ class Pipe:
                 visible_content_parts.extend(self._content_deltas(chunk))
                 yield chunk
         reduction.original_content = "".join(visible_content_parts)
-        async for chunk in self._finalize_reduction(reduction, app.state, event_emitter, metadata):
+        async for chunk in self._finalize_reduction(
+            reduction, event_emitter, metadata, selected_service
+        ):
             yield chunk
 
     @staticmethod
@@ -5904,9 +6001,9 @@ class Pipe:
     async def _finalize_reduction(
         self,
         reduction: InteractionReduction,
-        app_state: State,
         event_emitter: "EventEmitter",
         metadata: "Metadata",
+        selected_service: SelectedCatalogService,
     ) -> AsyncGenerator[dict | str, None]:
         if reduction.status != "completed":
             raise InteractionExecutionError(
@@ -5917,7 +6014,7 @@ class Pipe:
             reduction.grounding, reduction.original_content
         )
         usage = self._get_interaction_usage_data(
-            reduction.usage, app_state, metadata, event_emitter.start_time
+            reduction.usage, selected_service, metadata, event_emitter.start_time
         )
         yield {"usage": usage}
 
@@ -5998,7 +6095,7 @@ class Pipe:
     def _get_interaction_usage_data(
         self,
         usage: NormalizedInteractionUsage,
-        app_state: State,
+        selected_service: SelectedCatalogService,
         metadata: "Metadata",
         start_time: float,
     ) -> dict[str, object]:
@@ -6011,15 +6108,7 @@ class Pipe:
             "total_cost": 0.0,
         }
         if metadata.get("is_paid_api", True):
-            model_id = str(metadata.get("canonical_model_id", ""))
-            service = metadata.get("gemini_catalog_service")
-            service_policy = self._get_catalog_service_policy(
-                app_state._state.get("gemini_model_config", {}).get(model_id),
-                "enterprise" if service == "enterprise" else "developer",
-            )
-            pricing = service_policy.get("pricing", {})
-            if not isinstance(pricing, dict):
-                pricing = {}
+            pricing = selected_service.policy.pricing
             input_tokens = max(usage.input_tokens - usage.cached_tokens, 0)
             image_output_tokens = 0
             for item in usage.output_by_modality:
@@ -6033,10 +6122,10 @@ class Pipe:
                     image_output_tokens += tokens
             text_output_tokens = max(usage.output_tokens - image_output_tokens, 0)
             output_tokens = text_output_tokens + usage.thought_tokens
-            input_cost = self._calculate_cost(input_tokens, pricing.get("input", []))
-            output_cost = self._calculate_cost(output_tokens, pricing.get("output", []))
+            input_cost = self._calculate_cost(input_tokens, pricing.input)
+            output_cost = self._calculate_cost(output_tokens, pricing.output)
             image_output_cost = self._calculate_cost(
-                image_output_tokens, pricing.get("image_output", [])
+                image_output_tokens, pricing.image_output or ()
             )
             cost_details.update(
                 input_cost=round(input_cost, 6),
@@ -6110,7 +6199,7 @@ class Pipe:
         return str(app.url_path_for("get_file_content_by_id", id=file_item.id))
 
     @staticmethod
-    def _calculate_cost(token_count: int, pricing_tiers: list[dict]) -> float:
+    def _calculate_cost(token_count: int, pricing_tiers: tuple[CatalogPriceTier, ...]) -> float:
         """
         Calculates cost based on tiered pricing structure (in USD)
         """
@@ -6121,8 +6210,8 @@ class Pipe:
         remaining_tokens = token_count
 
         for tier in pricing_tiers:
-            price_per_million = tier.get("price_per_million", 0.0)
-            tier_limit = tier.get("up_to_tokens")  # None means unlimited
+            price_per_million = tier.price_per_million
+            tier_limit = tier.up_to_tokens  # None means unlimited
 
             if tier_limit is None:
                 # Last tier with no limit - use all remaining tokens
@@ -6426,7 +6515,7 @@ class Pipe:
         self,
         valves: "Pipe.Valves",
         __metadata__: "Metadata",
-        model_config: dict[str, Any],
+        model_config: dict[str, CatalogModel],
         features: "Features",
     ) -> list[str]:
         """

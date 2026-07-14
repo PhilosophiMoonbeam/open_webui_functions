@@ -20,14 +20,14 @@ artifacts:
     role: pipe
     version: 3.0.0
     path: plugins/pipes/gemini_manifold.py
-    sha256: f680d828d709852a67898891d275ba489d4523b1bb8829d3afb93f88c4656926
-    bytes: 288669
+    sha256: bcf2a6cbb6ef41459b48209eded5bfeea8fe3ab3e7e47a89346a3299dd99b7f4
+    bytes: 290703
   - id: gemini_manifold_companion
     role: companion
     version: 3.0.0
     path: plugins/filters/gemini_manifold_companion.py
-    sha256: 8d8cf5202b9a810861a163fdc9f70916ba214b40a558cb2c8ee12fc209855e16
-    bytes: 54630
+    sha256: a4de56d77128b1a96d8b536e6b3c552aabc787bfbeb7b0655e91afc35fa148ea
+    bytes: 53500
   - id: gemini_model_catalog
     role: catalog
     version: 2
@@ -68,5 +68,5 @@ artifacts:
     role: release_notes
     version: 3.0.0
     path: release/gemini-suite-v3.0.0.md
-    sha256: 5e339b9381e25ac576b9083d8b90865d1fe11a76f4dc0a950b129fb10a5e93a6
-    bytes: 3331
+    sha256: 510a7e289e03b328d0516391ef2675b7de12cf362109b6bd72d2ddcb94d3fc64
+    bytes: 3422

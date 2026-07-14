@@ -31,9 +31,10 @@ with both 3.0 components; mutable branch URLs are unsupported.
 - **Gemini Developer API:** deterministically validated `v1` Interactions route. Free and paid API
   keys use the same protocol but separate credentials/routing policy.
 - **Gemini Enterprise:** the SDK's tested route is `v1beta1` with project/location identity.
-  However, every bundled catalog entry currently says `enterprise: unverified`; generation is
-  denied before network access. Configuration or a successful models-list call is not evidence of
-  Interactions model support.
+  However, every bundled catalog entry currently has
+  `services.enterprise.availability: unverified`; public-pipe generation is denied before network
+  access. Configuration or a successful models-list call is not evidence of Interactions model
+  support.
 - **Custom base URL:** applies to Developer API and is included in endpoint identity. Interaction
   IDs and signed replay ledgers never cross service, credential, base-URL, API-version, or model
   scope.
@@ -44,16 +45,20 @@ Unknown or unverified models and capabilities fail closed. `MODEL_WHITELIST` and
 ## Inputs, outputs, and tools
 
 The exact per-model, per-service catalog controls text, image, audio, video, document,
-external-URL, Files API, storage, limits, pricing, thinking, response-format, image-output, and
-tool availability. Unverified/unsupported service nodes cannot contain capabilities or pricing.
-Supported request construction
+external-URL, Files API, storage, pricing, thinking, response-format, image-output, requested
+maximum output, and tool availability. It records the provider input-context limit, while the
+provider remains authoritative for actual input token accounting. Unverified/unsupported service
+nodes cannot contain capabilities or pricing. Supported request construction
 includes multimodal user content, Open WebUI files, YouTube URLs, PDFs, system instructions, JSON
-schema response format, reasoning summaries, and safety settings.
+schema response format, and reasoning summaries. The Interactions API does not support custom safety
+configuration, so the suite exposes no valve, metadata field, request option, or payload key for it.
 
-Server tools are Google Search, URL Context, Google Maps, code execution, and catalog-declared
-file search. The companion translates Open WebUI search/code controls; the optional toggles emit
-canonical `reasoning`, `google_maps`, and `url_context` feature flags. Unsupported combinations are
-rejected before an API call.
+Requestable server tools are Google Search, URL Context, Google Maps, and code execution. The
+reducer also recognizes file-search results, but no bundled service policy enables file-search
+requests. The companion translates Open WebUI search/code controls into neutral desired-feature
+signals; the optional toggles emit canonical `reasoning`, `google_maps`, and `url_context` feature
+flags. The pipe authorizes every requested feature against the selected service policy before an
+API call.
 
 Custom Open WebUI functions are deliberately narrower:
 
@@ -156,8 +161,11 @@ make check
 
 Optional credential-gated, output-redacted smoke commands are in
 [tests/live/README.md](../../../tests/live/README.md). Developer unary/SSE and stored continuation
-are available. Enterprise has no generation smoke while every catalog entry is `unverified`; CI
-instead runs the non-network canonical-transport and pre-client-denial policy contract.
+are available. A separate direct-SDK Enterprise probe covers unary, SSE, and stored continuation
+for an explicitly selected project/location/model/API-version tuple, but no successful Enterprise
+run is currently recorded and the public pipe remains fail-closed while every catalog entry is
+`unverified`. Normal CI runs only the non-network canonical-transport and pre-client-denial policy
+contract.
 
 ### Process shutdown
 

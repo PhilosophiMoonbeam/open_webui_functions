@@ -31,7 +31,6 @@ import pydantic_core
 import yaml
 from fastapi import Request
 from fastapi.datastructures import State
-from google.genai import interactions as interaction_types
 from loguru import logger
 from open_webui.models.chats import Chats
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
@@ -482,11 +481,6 @@ class EventEmitter:
 
 class Filter:
     class Valves(BaseModel):
-        USE_PERMISSIVE_SAFETY: bool = Field(
-            default=False,
-            description="""Whether to request relaxed safety filtering.
-            Default value is False.""",
-        )
         BYPASS_BACKEND_RAG: bool = Field(
             default=True,
             description="""Decide if you want ot bypass Open WebUI's RAG and send your documents directly to Google API.
@@ -567,7 +561,7 @@ class Filter:
 
         log.debug(f"inlet method has been called. Gemini Manifold Companion version is {VERSION}")
 
-        canonical_model_name, is_manifold = self._get_model_name(body)
+        _, is_manifold = self._get_model_name(body)
 
         # Exit early if we are filtering an unsupported model.
         if not is_manifold:
@@ -609,9 +603,6 @@ class Filter:
             )
             features["code_interpreter"] = False
             metadata_features["google_code_execution"] = True
-        if self.valves.USE_PERMISSIVE_SAFETY:
-            log.info("Adding permissive safety settings to body.metadata")
-            metadata["safety_settings"] = self._get_permissive_safety_settings(canonical_model_name)
         if self.valves.BYPASS_BACKEND_RAG:
             if __metadata__["chat_id"] == "local":
                 # TODO toast notification
@@ -890,27 +881,7 @@ class Filter:
     # TODO: Remove citation markers from model input.
     # endregion 1.2 Remove citation markers
 
-    # region 1.3 Get permissive safety settings
-
-    def _get_permissive_safety_settings(
-        self, model_name: str
-    ) -> list[interaction_types.SafetySetting]:
-        """Return the canonical lowercase Interactions safety contract."""
-        del model_name
-        return [
-            interaction_types.SafetySetting(type=category, threshold="off")
-            for category in (
-                "harassment",
-                "hate_speech",
-                "sexually_explicit",
-                "dangerous_content",
-                "civic_integrity",
-            )
-        ]
-
-    # endregion 1.3 Get permissive safety settings
-
-    # region 1.4 Configuration loading
+    # region 1.3 Configuration loading
 
     @staticmethod
     @functools.lru_cache(maxsize=1)
@@ -949,7 +920,7 @@ class Filter:
                 f"Gemini model catalog is unavailable or invalid at {config_path}: {e}"
             ) from e
 
-    # endregion 1.4 Configuration loading
+    # endregion 1.3 Configuration loading
 
     # region 1.5 Model capability checks
 

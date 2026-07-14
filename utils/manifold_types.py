@@ -1,7 +1,5 @@
 from typing import Any, Literal, NotRequired, TypedDict
 
-from google.genai import interactions as interaction_types
-
 
 # region `__files__` and `__metadata__.files`
 class FileContentDataTD(TypedDict):
@@ -316,7 +314,6 @@ class Metadata(TypedDict):
     task_body: NotRequired[dict[str, Any] | None]
 
     # These are my own added custom keys, not used by Open WebUI.
-    safety_settings: list[interaction_types.SafetySetting]  # Added in `Filter.inlet`
     chat_control_params: dict[str, Any]  # Added in `Filter.inlet`
     merged_custom_params: dict[str, Any]  # Added in `Pipe.pipe`
     is_paid_api: NotRequired[bool]  # Added in `Pipe.pipe`

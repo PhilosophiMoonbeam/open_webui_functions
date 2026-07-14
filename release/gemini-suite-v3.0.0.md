@@ -14,6 +14,7 @@ companion with a 2.x component.
 - The Reason toggle now emits `features.reasoning` and is version 2.0.0.
 - The Maps toggle now emits `features.google_maps` and is version 2.0.0.
 - The old Vertex AI toggle is removed and replaced by the Gemini Enterprise toggle.
+- The unsupported custom content-filter control and its request configuration are removed.
 - Storage and privacy policy is explicit for persisted, temporary, task, edited, and branched
   chats.
 

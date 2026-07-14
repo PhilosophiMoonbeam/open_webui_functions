@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import copy
 import hashlib
 import sys
 from datetime import UTC, datetime, timedelta
@@ -21,7 +20,7 @@ from google.genai import interactions as interaction_types
 from plugins.filters.gemini_map_grounding_toggle import Filter as MapsToggleFilter
 from plugins.filters.gemini_reasoning_toggle import Filter as ReasoningToggleFilter
 from plugins.filters.gemini_url_context_toggle import Filter as URLContextToggleFilter
-from utils.manifold_types import Body, Event, Metadata
+from utils.manifold_types import Body, Event, Metadata, UserData
 
 # --- Mock problematic Open WebUI modules BEFORE they are imported by your plugin ---
 mock_chats_module = MagicMock()
@@ -63,12 +62,19 @@ from plugins.filters.gemini_manifold_companion import (
 from plugins.filters.gemini_manifold_companion import (
     GroundingEnvelope as CompanionGroundingEnvelope,
 )
+from plugins.filters.gemini_manifold_companion import (
+    ModelCatalog as CompanionModelCatalog,
+)
 from plugins.pipes.gemini_manifold import (
     CATALOG_MODEL_IDS,
     DEVELOPER_CATALOG_MODEL_IDS,
     ENTERPRISE_CATALOG_MODEL_IDS,
+    AppStateModelCatalog,
     AsyncInteractionsBoundary,
     AsyncInteractionStream,
+    CatalogInteractions,
+    CatalogSupportedService,
+    CatalogUnavailableService,
     ContentBuildError,
     EndpointIdentity,
     FilesAPIError,
@@ -91,6 +97,7 @@ from plugins.pipes.gemini_manifold import (
     PipeEventEmitter,
     PreparedPDFPart,
     PreparedPDFResult,
+    SelectedCatalogService,
     genai_errors,
 )
 from plugins.pipes.gemini_manifold import (
@@ -145,19 +152,47 @@ def _client_error(code: int, status: str, message: str) -> genai_errors.ClientEr
     )
 
 
+def _server_error(code: int, status: str, message: str) -> genai_errors.ServerError:
+    return genai_errors.ServerError(
+        code,
+        {"error": {"code": code, "message": message, "status": status}},
+    )
+
+
 def test_catalogued_model_ids_and_image_policy_default_deny() -> None:
     catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
     raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
     catalog_models = raw_catalog["models"]
-    developer_models = {
-        model_id: model["services"]["developer"] for model_id, model in catalog_models.items()
-    }
+    validated = AppStateModelCatalog.model_validate(catalog_models)
+    image_policy = validated.root["gemini-2.5-flash-image"].services.developer
 
     assert set(catalog_models) == CATALOG_MODEL_IDS
     assert DEVELOPER_CATALOG_MODEL_IDS == CATALOG_MODEL_IDS
     assert ENTERPRISE_CATALOG_MODEL_IDS == frozenset()
-    assert Pipe._is_image_model("gemini-2.5-flash-image", developer_models) is True
-    assert Pipe._is_image_model("gemini-future-unknown", developer_models) is False
+    assert isinstance(image_policy, CatalogSupportedService)
+    assert Pipe._is_image_model(image_policy) is True
+    assert "gemini-future-unknown" not in validated.root
+
+
+def test_pipe_and_companion_protocol_2_catalog_models_round_trip_in_parity() -> None:
+    def canonicalize(value):
+        if isinstance(value, dict):
+            return {key: canonicalize(item) for key, item in sorted(value.items())}
+        if isinstance(value, list):
+            normalized = [canonicalize(item) for item in value]
+            return sorted(normalized, key=repr)
+        return value
+
+    catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+    raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    companion = CompanionModelCatalog.model_validate(raw_catalog)
+    pipe_models = AppStateModelCatalog.model_validate(raw_catalog["models"])
+    pipe_round_trip = {**raw_catalog, "models": pipe_models.model_dump(mode="json")}
+    reparsed = CompanionModelCatalog.model_validate(pipe_round_trip)
+
+    assert canonicalize(reparsed.model_dump(mode="json")) == canonicalize(
+        companion.model_dump(mode="json")
+    )
 
 
 @pytest.mark.parametrize("version", [None, "2.1.0", "3.0.1", "invalid"])
@@ -172,6 +207,45 @@ def test_pipe_accepts_exact_companion_protocol_pair() -> None:
     Pipe._check_companion_filter_version(
         MagicMock(), {"gemini_manifold_companion_version": "3.0.0"}
     )
+
+
+@pytest.mark.asyncio
+async def test_pipe_rejects_malformed_app_state_catalog_before_routing_or_client_creation(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    malformed = _catalog_model_entry()
+    developer = cast(dict, cast(dict, malformed["services"])["developer"])
+    cast(dict, developer["interactions"]).pop("tools")
+    request = MagicMock()
+    request.app = FastAPI()
+    request.app.state._state.update(
+        {
+            "gemini_model_config": {"gemini-test": malformed},
+            "gemini_model_catalog_schema_version": 2,
+        }
+    )
+    determine_order = AsyncMock()
+    get_client = MagicMock()
+
+    with (
+        patch.object(pipe, "_determine_execution_order", determine_order),
+        patch.object(pipe, "_get_user_client", get_client),
+        pytest.raises(ValueError, match="catalog protocol 2"),
+    ):
+        await pipe.pipe(
+            body=cast(Body, {"model": "gemini-test", "messages": []}),
+            __user__=cast(UserData, {"email": "user@example.test"}),
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(
+                Metadata,
+                {"features": {"gemini_manifold_companion_version": "3.0.0"}},
+            ),
+        )
+
+    determine_order.assert_not_awaited()
+    get_client.assert_not_called()
 
 
 def test_companion_catalog_default_is_version_pinned_and_fails_visibly() -> None:
@@ -398,32 +472,71 @@ def test_client_creation_falls_back_to_gemini_api_with_warning(pipe_instance_fix
 # endregion Test _get_or_create_genai_client
 
 
-def _interaction_policy(*, image: bool = False) -> dict[str, dict]:
-    return {
-        "gemini-test": {
-            "content": {
-                "inputs": ["text", "image", "video", "audio", "document"],
-                "outputs": ["text", "image"] if image else ["text"],
+def _selected_service(
+    *,
+    model_id: str = "gemini-test",
+    service: Literal["developer", "enterprise"] = "developer",
+    image: bool = False,
+    inputs: list[str] | None = None,
+    files: bool = True,
+    external_urls: bool = True,
+    store: bool = True,
+    url_context: bool = True,
+    output_tokens: int = 65_536,
+    free_tier: bool = True,
+    input_price: float = 1.0,
+    output_price: float = 2.0,
+    image_price: float = 30.0,
+    custom_function_calling: bool = True,
+) -> SelectedCatalogService:
+    payload = {
+        "availability": "supported",
+        "verified_at": "2026-07-14",
+        "source_refs": ["models"],
+        "lifecycle": "stable",
+        "limits": {"input_tokens": 1_048_576, "output_tokens": output_tokens},
+        "content": {
+            "inputs": inputs or ["text", "image", "video", "audio", "document"],
+            "outputs": ["text", "image"] if image else ["text"],
+        },
+        "interactions": {
+            "store": store,
+            "files": files,
+            "external_urls": external_urls,
+            "response_format": True,
+            "custom_function_calling": custom_function_calling,
+            "thinking": {
+                "supported": True,
+                "levels": ["minimal", "low", "medium", "high"],
+                "summaries": True,
             },
-            "interactions": {
-                "store": True,
-                "files": True,
-                "external_urls": True,
-                "response_format": True,
-                "thinking": {
-                    "supported": True,
-                    "levels": ["minimal", "low", "medium", "high"],
-                    "summaries": True,
-                },
-                "tools": {
-                    "google_search": True,
-                    "code_execution": True,
-                    "url_context": True,
-                    "google_maps": True,
-                },
+            "tools": {
+                "google_search": True,
+                "code_execution": True,
+                "url_context": url_context,
+                "google_maps": True,
+                "file_search": False,
             },
-        }
+        },
+        "pricing": {
+            "free_tier": free_tier,
+            "excluded_features": [],
+            "input": [{"up_to_tokens": None, "price_per_million": input_price}],
+            "output": [{"up_to_tokens": None, "price_per_million": output_price}],
+            "image_output": (
+                [{"up_to_tokens": None, "price_per_million": image_price}] if image else None
+            ),
+        },
     }
+    return SelectedCatalogService(
+        model_id=model_id,
+        service=service,
+        policy=CatalogSupportedService.model_validate(payload),
+    )
+
+
+def _interaction_policy(*, image: bool = False) -> SelectedCatalogService:
+    return _selected_service(image=image)
 
 
 def _builder_service_policy(
@@ -431,30 +544,16 @@ def _builder_service_policy(
     inputs: list[str] | None = None,
     files: bool = True,
     external_urls: bool = True,
-) -> dict[str, object]:
-    return {
-        "content": {"inputs": inputs or ["text", "image", "video", "audio", "document"]},
-        "interactions": {"files": files, "external_urls": external_urls, "store": True},
-    }
+) -> CatalogSupportedService:
+    return _selected_service(
+        inputs=inputs,
+        files=files,
+        external_urls=external_urls,
+    ).policy
 
 
 def _catalog_model_entry(*, image: bool = False, free_tier: bool = True) -> dict[str, object]:
-    supported = _interaction_policy(image=image)["gemini-test"]
-    supported.update(
-        {
-            "availability": "supported",
-            "verified_at": "2026-07-14",
-            "source_refs": ["models"],
-            "lifecycle": "stable",
-            "limits": {"input_tokens": 1_048_576, "output_tokens": 65_536},
-            "pricing": {
-                "free_tier": free_tier,
-                "excluded_features": [],
-                "input": [{"up_to_tokens": None, "price_per_million": 1.0}],
-                "output": [{"up_to_tokens": None, "price_per_million": 2.0}],
-            },
-        }
-    )
+    supported = _selected_service(image=image, free_tier=free_tier).policy.model_dump(mode="json")
     return {
         "services": {
             "developer": supported,
@@ -479,7 +578,7 @@ async def test_toggle_filters_write_canonical_feature_schema(filter_type, featur
 
 
 @pytest.mark.asyncio
-async def test_interaction_options_map_generation_thinking_safety_and_schema(
+async def test_interaction_options_map_generation_thinking_and_schema(
     pipe_instance_fixture,
 ):
     pipe, _ = pipe_instance_fixture
@@ -487,7 +586,6 @@ async def test_interaction_options_map_generation_thinking_safety_and_schema(
         "canonical_model_id": "gemini-test",
         "features": {"reasoning": True},
         "merged_custom_params": {"reasoning_effort": "medium"},
-        "safety_settings": [{"type": "harassment", "threshold": "block_only_high"}],
     }
     options = await pipe._build_interaction_request_options(
         {
@@ -510,7 +608,6 @@ async def test_interaction_options_map_generation_thinking_safety_and_schema(
     assert options.generation_config.thinking_level == "medium"
     assert options.generation_config.thinking_summaries == "auto"
     assert options.generation_config.stop_sequences == ["END"]
-    assert options.safety_settings[0].type == "harassment"
     assert isinstance(options.response_format, interaction_types.TextResponseFormat)
     assert options.response_format.model_dump(by_alias=True)["schema"] == {"type": "object"}
 
@@ -561,14 +658,6 @@ async def test_task_interaction_options_disable_tools(pipe_instance_fixture):
             "reasoning_effort",
         ),
         ({}, {"features": {"url_context": True}}, "does not support requested tools"),
-        (
-            {},
-            {
-                "features": {},
-                "safety_settings": [{"type": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"}],
-            },
-            "canonical lowercase",
-        ),
     ],
 )
 async def test_interaction_options_reject_legacy_or_unsupported_configuration(
@@ -576,9 +665,11 @@ async def test_interaction_options_reject_legacy_or_unsupported_configuration(
 ):
     pipe, _ = pipe_instance_fixture
     metadata["canonical_model_id"] = "gemini-test"
-    policy = _interaction_policy()
-    if "url_context" in metadata.get("features", {}):
-        policy["gemini-test"]["interactions"]["tools"]["url_context"] = False
+    url_context_supported = "url_context" not in metadata.get("features", {})
+    policy = _selected_service(
+        url_context=url_context_supported,
+        external_urls=url_context_supported,
+    )
     with pytest.raises(ValueError, match=message):
         await pipe._build_interaction_request_options(body, metadata, pipe.valves, policy)
 
@@ -601,6 +692,30 @@ def test_endpoint_identity_isolates_model_project_service_and_base_url():
             model="gemini-2.5-flash",
         ).scope
     )
+
+
+@pytest.mark.asyncio
+async def test_execute_attempt_rejects_endpoint_service_mismatch(pipe_instance_fixture) -> None:
+    pipe, _ = pipe_instance_fixture
+    request = MagicMock()
+    request.app = FastAPI()
+    emitter = MagicMock(spec=EventEmitter)
+    binding = GenAIClientBinding(client=MagicMock(), identity=_developer_identity())
+
+    with (
+        patch.object(pipe, "_get_user_client", return_value=binding),
+        pytest.raises(ValueError, match="does not match the initialized endpoint service"),
+    ):
+        await pipe._execute_generation_attempt(
+            tier="enterprise",
+            valves=pipe.valves,
+            body=cast(Body, {"messages": []}),
+            __user__=cast(UserData, {"email": "user@example.test"}),
+            __metadata__=cast(Metadata, {"canonical_model_id": "gemini-test"}),
+            __request__=request,
+            event_emitter=emitter,
+            selected_service=_selected_service(service="enterprise"),
+        )
 
 
 @pytest.mark.asyncio
@@ -664,12 +779,28 @@ def test_logger_capture_redacts_signed_state_credentials_and_locations(
             GenerationFailureKind.PERMISSION,
             False,
         ),
+        (
+            _client_error(401, "UNAUTHENTICATED", "invalid credential"),
+            GenerationFailureKind.PERMISSION,
+            False,
+        ),
+        (
+            _client_error(400, "INVALID_ARGUMENT", "invalid request"),
+            GenerationFailureKind.INVALID_REQUEST,
+            False,
+        ),
+        (
+            _server_error(503, "UNAVAILABLE", "temporarily unavailable"),
+            GenerationFailureKind.UNAVAILABLE,
+            True,
+        ),
         (httpx.ReadTimeout("timed out"), GenerationFailureKind.TRANSPORT, True),
         (
             InteractionExecutionError(GenerationFailureKind.INTERACTION_STATUS, "budget_exceeded"),
             GenerationFailureKind.INTERACTION_STATUS,
             False,
         ),
+        (RuntimeError("unknown failure"), GenerationFailureKind.UNKNOWN, False),
     ],
 )
 def test_generation_failure_policy_is_typed(error, kind, retryable):
@@ -999,16 +1130,7 @@ async def test_interactions_usage_costs_image_output_once(
     expected: dict[str, float],
 ):
     pipe, _ = pipe_instance_fixture
-    app = FastAPI()
-    pricing = {
-        "input": [{"price_per_million": 1.0}],
-        "output": [{"price_per_million": 2.0}],
-    }
-    if include_image_price:
-        pricing["image_output"] = [{"price_per_million": 30.0}]
-    catalog_entry = _catalog_model_entry()
-    cast(dict, cast(dict, catalog_entry["services"])["developer"])["pricing"] = pricing
-    app.state._state["gemini_model_config"] = {"gemini-test": catalog_entry}
+    selected = _selected_service(image=include_image_price)
     metadata = cast(
         Metadata,
         {
@@ -1026,30 +1148,25 @@ async def test_interactions_usage_costs_image_output_once(
         output_by_modality=[{"modality": "image", "tokens": 10}],
     )
 
-    result = pipe._get_interaction_usage_data(usage, app.state, metadata, 0.0)
+    result = pipe._get_interaction_usage_data(usage, selected, metadata, 0.0)
 
     assert result["cost_details"] == expected
 
 
 def test_usage_pricing_is_resolved_from_completed_attempt_service(pipe_instance_fixture):
     pipe, _ = pipe_instance_fixture
-    entry = _catalog_model_entry(free_tier=False)
-    services = cast(dict, entry["services"])
-    enterprise = copy.deepcopy(services["developer"])
-    enterprise["pricing"] = {
-        "free_tier": False,
-        "excluded_features": [],
-        "input": [{"up_to_tokens": None, "price_per_million": 10.0}],
-        "output": [{"up_to_tokens": None, "price_per_million": 20.0}],
-    }
-    services["enterprise"] = enterprise
-    app = FastAPI()
-    app.state._state["gemini_model_config"] = {"gemini-test": entry}
+    developer_selected = _selected_service(free_tier=False)
+    enterprise_selected = _selected_service(
+        service="enterprise",
+        free_tier=False,
+        input_price=10.0,
+        output_price=20.0,
+    )
     usage = NormalizedInteractionUsage(input_tokens=100, output_tokens=50, total_tokens=150)
 
     developer = pipe._get_interaction_usage_data(
         usage,
-        app.state,
+        developer_selected,
         cast(
             Metadata,
             {
@@ -1062,13 +1179,14 @@ def test_usage_pricing_is_resolved_from_completed_attempt_service(pipe_instance_
     )
     enterprise_result = pipe._get_interaction_usage_data(
         usage,
-        app.state,
+        enterprise_selected,
         cast(
             Metadata,
             {
                 "canonical_model_id": "gemini-test",
                 "is_paid_api": True,
-                "gemini_catalog_service": "enterprise",
+                # Stale observability metadata must not override the completed selection.
+                "gemini_catalog_service": "developer",
             },
         ),
         0.0,
@@ -1725,6 +1843,7 @@ async def test_interaction_stream_closes_and_emits_done_only_on_completed(
             app=app,
             event_emitter=emitter,
             metadata=cast("Metadata", {}),
+            selected_service=_selected_service(),
         )
     ]
 
@@ -1759,6 +1878,7 @@ async def test_interaction_stream_resumes_same_id_and_event_cursor(pipe_instance
             app=app,
             event_emitter=emitter,
             metadata=cast("Metadata", {}),
+            selected_service=_selected_service(),
         )
     ]
 
@@ -1790,6 +1910,7 @@ async def test_interaction_stream_empty_error_and_cancel_never_emit_done(
                 app=app,
                 event_emitter=emitter,
                 metadata=cast("Metadata", {}),
+                selected_service=_selected_service(),
             )
         ]
     assert empty.closed
@@ -1806,6 +1927,7 @@ async def test_interaction_stream_empty_error_and_cancel_never_emit_done(
                 app=app,
                 event_emitter=emitter,
                 metadata=cast("Metadata", {}),
+                selected_service=_selected_service(),
             )
         ]
     assert failed.closed
@@ -1820,6 +1942,7 @@ async def test_interaction_stream_empty_error_and_cancel_never_emit_done(
                 app=app,
                 event_emitter=emitter,
                 metadata=cast("Metadata", {}),
+                selected_service=_selected_service(),
             )
         ]
     assert cancelled.closed
@@ -1848,8 +1971,8 @@ def _authorized_tool(
     }
 
 
-def _function_policy(enabled: bool = True) -> dict[str, object]:
-    return {"interactions": {"custom_function_calling": enabled}}
+def _function_policy(enabled: bool = True) -> CatalogInteractions:
+    return _selected_service(custom_function_calling=enabled).policy.interactions
 
 
 def test_open_webui_tool_registry_uses_authorized_mapping_name_and_task_gating():
@@ -1857,7 +1980,7 @@ def test_open_webui_tool_registry_uses_authorized_mapping_name_and_task_gating()
     registry = Pipe._resolve_open_webui_tools(
         {"catalog_lookup": _authorized_tool(function)},
         model_id="gemini-3.5-flash",
-        model_policy=_function_policy(),
+        interactions_policy=_function_policy(),
         is_task=False,
     )
 
@@ -1872,7 +1995,7 @@ def test_open_webui_tool_registry_uses_authorized_mapping_name_and_task_gating()
         Pipe._resolve_open_webui_tools(
             {"catalog_lookup": _authorized_tool(function)},
             model_id="gemini-3.5-flash",
-            model_policy=_function_policy(),
+            interactions_policy=_function_policy(),
             is_task=True,
         )
         == {}
@@ -1906,7 +2029,7 @@ def test_open_webui_tool_registry_fails_closed(tools, policy, message):
         Pipe._resolve_open_webui_tools(
             tools,
             model_id="gemini-3.5-flash",
-            model_policy=policy,
+            interactions_policy=policy,
             is_task=False,
         )
 
@@ -1935,8 +2058,7 @@ async def test_interaction_options_add_custom_function_and_allowed_tools(pipe_in
 @pytest.mark.asyncio
 async def test_selected_service_output_limit_is_enforced(pipe_instance_fixture):
     pipe, _ = pipe_instance_fixture
-    policy = _interaction_policy()
-    policy["gemini-test"]["limits"] = {"input_tokens": 1000, "output_tokens": 64}
+    policy = _selected_service(output_tokens=64)
 
     with pytest.raises(ValueError, match="selected service limit of 64"):
         await pipe._build_interaction_request_options(
@@ -1947,16 +2069,37 @@ async def test_selected_service_output_limit_is_enforced(pipe_instance_fixture):
         )
 
 
-def test_catalog_service_policy_is_complete_and_capability_empty_when_unverified() -> None:
-    entry = _catalog_model_entry()
-    developer = Pipe._get_catalog_service_policy(entry, "developer")
-    enterprise = Pipe._get_catalog_service_policy(entry, "enterprise")
+def test_app_state_catalog_boundary_narrows_supported_and_unavailable_services() -> None:
+    catalog = Pipe._validate_app_state_catalog({"gemini-test": _catalog_model_entry()})
+    developer = catalog.root["gemini-test"].services.developer
+    enterprise = catalog.root["gemini-test"].services.enterprise
 
-    assert developer["availability"] == "supported"
-    assert enterprise == {"availability": "unverified", "reason": "not verified"}
-    malformed = copy.deepcopy(entry)
-    cast(dict, cast(dict, malformed["services"])["enterprise"])["pricing"] = {}
-    assert Pipe._get_catalog_service_policy(malformed, "enterprise") == {}
+    assert isinstance(developer, CatalogSupportedService)
+    assert developer.limits.output_tokens == 65_536
+    assert isinstance(enterprise, CatalogUnavailableService)
+    assert enterprise.availability == "unverified"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda entry: cast(dict, cast(dict, entry["services"])["developer"])["interactions"].pop(
+            "tools"
+        ),
+        lambda entry: cast(dict, cast(dict, entry["services"])["enterprise"]).__setitem__(
+            "pricing", {}
+        ),
+        lambda entry: cast(dict, cast(dict, entry["services"])["developer"]).__setitem__(
+            "unexpected", True
+        ),
+    ],
+)
+def test_app_state_catalog_boundary_rejects_malformed_nested_policy(mutate) -> None:
+    entry = _catalog_model_entry()
+    mutate(entry)
+
+    with pytest.raises(ValueError, match="catalog protocol 2"):
+        Pipe._validate_app_state_catalog({"gemini-test": entry})
 
 
 def _function_call(call_id: str, arguments: dict | None = None, name: str = "lookup"):
@@ -2054,7 +2197,7 @@ def _tool_registry(function: AsyncMock):
     return Pipe._resolve_open_webui_tools(
         {"lookup": _authorized_tool(function)},
         model_id="gemini-3.5-flash",
-        model_policy=_function_policy(),
+        interactions_policy=_function_policy(),
         is_task=False,
     )
 
@@ -2567,19 +2710,14 @@ def test_interaction_storage_policy_is_explicit_and_privacy_monotonic(
 
 
 def test_selected_service_must_explicitly_support_interaction_storage() -> None:
-    supported = _interaction_policy()["gemini-test"]
-    assert Pipe._service_supports_interaction_store(supported) is True
-    supported["interactions"]["store"] = False
-    assert Pipe._service_supports_interaction_store(supported) is False
-    assert Pipe._service_supports_interaction_store({}) is False
+    assert _selected_service(store=True).policy.interactions.store is True
+    assert _selected_service(store=False).policy.interactions.store is False
 
 
 @pytest.mark.asyncio
 async def test_completed_reduction_persists_one_envelope_idempotently(pipe_instance_fixture):
     pipe, _ = pipe_instance_fixture
     mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id = AsyncMock()
-    app = FastAPI()
-    app.state._state["gemini_model_config"] = {}
     emitter = MagicMock(spec=EventEmitter)
     emitter.start_time = 0.0
     metadata = cast(
@@ -2609,7 +2747,12 @@ async def test_completed_reduction_persists_one_envelope_idempotently(pipe_insta
     for _ in range(2):
         _ = [
             chunk
-            async for chunk in pipe._finalize_reduction(reduction, app.state, emitter, metadata)
+            async for chunk in pipe._finalize_reduction(
+                reduction,
+                emitter,
+                metadata,
+                _selected_service(model_id="gemini-3.5-flash"),
+            )
         ]
 
     mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.assert_awaited_once()
@@ -2630,7 +2773,6 @@ async def test_stateless_envelope_drops_server_id_and_temp_chat_never_persists(
 ):
     pipe, _ = pipe_instance_fixture
     mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id = AsyncMock()
-    app = FastAPI()
     emitter = MagicMock(spec=EventEmitter)
     emitter.start_time = 0.0
     reduction = gemini_manifold_module.InteractionReduction(
@@ -2650,7 +2792,8 @@ async def test_stateless_envelope_drops_server_id_and_temp_chat_never_persists(
             "gemini_effective_store": False,
         },
     )
-    _ = [item async for item in pipe._finalize_reduction(reduction, app.state, emitter, stateless)]
+    selected = _selected_service(model_id="gemini-3.5-flash")
+    _ = [item async for item in pipe._finalize_reduction(reduction, emitter, stateless, selected)]
     awaited = mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.await_args
     assert awaited is not None
     envelope = InteractionEnvelopeV1.model_validate(awaited.kwargs["message"]["gemini_interaction"])
@@ -2668,7 +2811,7 @@ async def test_stateless_envelope_drops_server_id_and_temp_chat_never_persists(
             "gemini_effective_store": False,
         },
     )
-    _ = [item async for item in pipe._finalize_reduction(reduction, app.state, emitter, temporary)]
+    _ = [item async for item in pipe._finalize_reduction(reduction, emitter, temporary, selected)]
     mock_chats_module.Chats.upsert_message_to_chat_by_id_and_message_id.assert_not_awaited()
 
 
@@ -3240,12 +3383,179 @@ async def test_paid_api_toggle_selects_correct_key(
 
 
 # region Test _get_genai_models
-@pytest.mark.asyncio
-async def test_enterprise_discovery_hides_unverified_catalog_models(pipe_instance_fixture):
-    pipe, _ = pipe_instance_fixture
+async def _clear_model_discovery_cache(pipe: Pipe) -> None:
     cache = getattr(pipe._get_genai_models, "cache", None)
     if isinstance(cache, BaseCache):
         await cache.clear()
+
+
+def _developer_discovery_binding() -> GenAIClientBinding:
+    return GenAIClientBinding(
+        client=MagicMock(),
+        identity=_developer_identity(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_developer_discovery_uses_catalog_not_legacy_supported_actions(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    await _clear_model_discovery_cache(pipe)
+    listed_models = [
+        gemini_types.Model(
+            name="models/gemini-2.5-flash",
+            display_name="Catalogued without legacy actions",
+            supported_actions=[],
+        ),
+        gemini_types.Model(
+            name="models/gemini-future-uncatalogued",
+            display_name="Uncatalogued with legacy action",
+            supported_actions=["generateContent"],
+        ),
+    ]
+    fetch = AsyncMock(return_value=listed_models)
+
+    with (
+        patch.object(
+            pipe,
+            "_get_or_create_genai_client",
+            return_value=_developer_discovery_binding(),
+        ),
+        patch.object(pipe, "_fetch_models_from_client_internal", new=fetch),
+    ):
+        models = await pipe._get_genai_models(free_api_key="developer-key")
+
+    assert models == [
+        {
+            "id": "gemini-2.5-flash",
+            "name": "Catalogued without legacy actions",
+            "description": None,
+        }
+    ]
+    fetch.assert_awaited_once()
+    await _clear_model_discovery_cache(pipe)
+
+
+@pytest.mark.asyncio
+async def test_developer_discovery_applies_whitelist_and_blacklist(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    await _clear_model_discovery_cache(pipe)
+    listed_models = [
+        gemini_types.Model(name="models/gemini-2.5-flash"),
+        gemini_types.Model(name="models/gemini-2.5-pro"),
+        gemini_types.Model(name="models/gemini-3.5-flash"),
+    ]
+
+    with (
+        patch.object(
+            pipe,
+            "_get_or_create_genai_client",
+            return_value=_developer_discovery_binding(),
+        ),
+        patch.object(
+            pipe,
+            "_fetch_models_from_client_internal",
+            new=AsyncMock(return_value=listed_models),
+        ),
+    ):
+        models = await pipe._get_genai_models(
+            free_api_key="developer-key",
+            whitelist_str="gemini-2.5-*",
+            blacklist_str="*-pro",
+        )
+
+    assert [model["id"] for model in models] == ["gemini-2.5-flash"]
+    await _clear_model_discovery_cache(pipe)
+
+
+@pytest.mark.asyncio
+async def test_combined_discovery_deduplicates_developer_models_before_merge(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    await _clear_model_discovery_cache(pipe)
+    developer_models = [
+        gemini_types.Model(
+            name="models/gemini-2.5-flash",
+            display_name="First Developer listing",
+        ),
+        gemini_types.Model(
+            name="publishers/google/models/gemini-2.5-flash",
+            display_name="Duplicate Developer listing",
+        ),
+    ]
+    enterprise_binding = GenAIClientBinding(
+        client=MagicMock(),
+        identity=EndpointIdentity(
+            service="enterprise",
+            credential_fingerprint="credential",
+            project="project",
+            location="global",
+            api_version="v1beta1",
+        ),
+    )
+
+    with (
+        patch.object(
+            pipe,
+            "_get_or_create_genai_client",
+            side_effect=[_developer_discovery_binding(), enterprise_binding],
+        ),
+        patch.object(
+            pipe,
+            "_fetch_models_from_client_internal",
+            new=AsyncMock(side_effect=[developer_models, []]),
+        ),
+    ):
+        models = await pipe._get_genai_models(
+            free_api_key="developer-key",
+            use_enterprise=True,
+            enterprise_project="project",
+            enterprise_location="global",
+        )
+
+    assert models == [
+        {
+            "id": "gemini-2.5-flash",
+            "name": "First Developer listing",
+            "description": None,
+        }
+    ]
+    await _clear_model_discovery_cache(pipe)
+
+
+@pytest.mark.asyncio
+async def test_developer_discovery_cache_avoids_duplicate_provider_listing(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    await _clear_model_discovery_cache(pipe)
+    fetch = AsyncMock(return_value=[gemini_types.Model(name="models/gemini-2.5-flash")])
+
+    with (
+        patch.object(
+            pipe,
+            "_get_or_create_genai_client",
+            return_value=_developer_discovery_binding(),
+        ),
+        patch.object(pipe, "_fetch_models_from_client_internal", new=fetch),
+    ):
+        first = await pipe._get_genai_models(free_api_key="developer-cache-key")
+        second = await pipe._get_genai_models(free_api_key="developer-cache-key")
+
+    assert first == second
+    assert [model["id"] for model in first] == ["gemini-2.5-flash"]
+    fetch.assert_awaited_once()
+    await _clear_model_discovery_cache(pipe)
+
+
+@pytest.mark.asyncio
+async def test_enterprise_discovery_hides_unverified_catalog_models(pipe_instance_fixture):
+    pipe, _ = pipe_instance_fixture
+    await _clear_model_discovery_cache(pipe)
     binding = GenAIClientBinding(
         client=MagicMock(),
         identity=EndpointIdentity(
@@ -3278,8 +3588,7 @@ async def test_enterprise_discovery_hides_unverified_catalog_models(pipe_instanc
         )
 
     assert models == []
-    if isinstance(cache, BaseCache):
-        await cache.clear()
+    await _clear_model_discovery_cache(pipe)
 
 
 @pytest.mark.asyncio
@@ -3287,9 +3596,7 @@ async def test_combined_discovery_does_not_leak_developer_policy_from_enterprise
     pipe_instance_fixture,
 ):
     pipe, _ = pipe_instance_fixture
-    cache = getattr(pipe._get_genai_models, "cache", None)
-    if isinstance(cache, BaseCache):
-        await cache.clear()
+    await _clear_model_discovery_cache(pipe)
     developer_binding = GenAIClientBinding(
         client=MagicMock(),
         identity=_developer_identity(),
@@ -3328,8 +3635,7 @@ async def test_combined_discovery_does_not_leak_developer_policy_from_enterprise
         )
 
     assert models == []
-    if isinstance(cache, BaseCache):
-        await cache.clear()
+    await _clear_model_discovery_cache(pipe)
 
 
 # endregion Test _get_genai_models
@@ -4805,6 +5111,65 @@ def _public_pipe_harness(
     pipe.valves.GEMINI_FREE_API_KEY = "sanitized-test-key"
     pipe.valves.GEMINI_PAID_API_KEY = None
     return body, metadata, request, binding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_failure", "expected_tiers", "expect_success"),
+    [
+        (
+            _client_error(429, "RESOURCE_EXHAUSTED", "free quota exhausted"),
+            ["free", "paid"],
+            True,
+        ),
+        (
+            _client_error(400, "INVALID_ARGUMENT", "invalid request"),
+            ["free"],
+            False,
+        ),
+    ],
+    ids=["retryable-advances-to-paid", "nonretryable-stops"],
+)
+async def test_public_pipe_retries_only_retryable_free_failures(
+    pipe_instance_fixture,
+    first_failure: Exception,
+    expected_tiers: list[str],
+    expect_success: bool,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    body, metadata, request, _binding = _public_pipe_harness(pipe, FakeInteractions([]))
+    body["stream"] = False
+    pipe.valves.GEMINI_PAID_API_KEY = "sanitized-paid-key"
+    pipe.valves.ENABLE_FREE_TIER_FALLBACK = True
+    success = {
+        "choices": [{"message": {"role": "assistant", "content": "paid success"}}],
+        "usage": {},
+    }
+    attempt = AsyncMock(side_effect=[first_failure, success])
+
+    with (
+        patch.object(
+            pipe,
+            "_get_toggleable_feature_status",
+            AsyncMock(return_value=(False, False)),
+        ),
+        patch.object(pipe, "_execute_generation_attempt", new=attempt),
+    ):
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert [call.kwargs["tier"] for call in attempt.await_args_list] == expected_tiers
+    content = result["choices"][0]["message"]["content"]
+    if expect_success:
+        assert content == "paid success"
+    else:
+        assert "Gemini request failed" in content
 
 
 @pytest.mark.asyncio
