@@ -17,7 +17,7 @@ VERSION = "3.0.0"
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
 RECOMMENDED_COMPANION_VERSION = "3.0.0"
-MODEL_CATALOG_SCHEMA_VERSION = 1
+MODEL_CATALOG_SCHEMA_VERSION = 2
 GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 CATALOG_MODEL_IDS = frozenset(
     {
@@ -34,6 +34,10 @@ CATALOG_MODEL_IDS = frozenset(
         "gemini-2.5-flash-lite",
     }
 )
+DEVELOPER_CATALOG_MODEL_IDS = CATALOG_MODEL_IDS
+# Promotion requires a coordinated code/catalog release so standalone discovery
+# cannot expose a service tuple that the embedded policy does not authorize.
+ENTERPRISE_CATALOG_MODEL_IDS: frozenset[str] = frozenset()
 
 
 # Keys `title`, `id` and `description` in the frontmatter above are used for my own development purposes.
@@ -584,6 +588,7 @@ class InteractionReducer:
         self._stopped: set[int] = set()
         self._emitted_text: dict[tuple[int, str], str] = {}
         self._step_models: dict[int, InteractionStep] = {}
+        self._argument_fragments: dict[int, list[str]] = {}
         self._pending_annotations: dict[int, list[interaction_types.Annotation]] = {}
         self._retrieval_records: list[GroundingToolRecord] = []
 
@@ -659,6 +664,34 @@ class InteractionReducer:
     def finalize_steps(self) -> None:
         self.state.steps = [self._step_payloads[index] for index in sorted(self._step_payloads)]
         self.state.grounding = self._build_grounding_envelope()
+
+    def function_calls(self) -> list[interaction_types.FunctionCallStep]:
+        """Return function calls in provider step order, assembling streamed arguments."""
+        calls: list[interaction_types.FunctionCallStep] = []
+        for index in sorted(self._step_models):
+            step = self._step_models[index]
+            if not isinstance(step, interaction_types.FunctionCallStep):
+                continue
+            fragments = self._argument_fragments.get(index)
+            if not fragments:
+                calls.append(step)
+                continue
+            try:
+                arguments = json.loads("".join(fragments))
+            except json.JSONDecodeError as exc:
+                raise self._protocol_error(
+                    f"Function call at step {index} returned malformed streamed arguments"
+                ) from exc
+            if not isinstance(arguments, dict):
+                raise self._protocol_error(
+                    f"Function call at step {index} streamed arguments that were not an object"
+                )
+            if step.arguments and step.arguments != arguments:
+                raise self._protocol_error(
+                    f"Function call at step {index} changed its streamed arguments"
+                )
+            calls.append(step.model_copy(update={"arguments": arguments}))
+        return calls
 
     def _consume_interaction_header(
         self, interaction: interaction_types.InteractionSseEventInteraction
@@ -814,6 +847,12 @@ class InteractionReducer:
         if isinstance(delta, interaction_types.TextAnnotationDelta):
             self._pending_annotations.setdefault(index, []).extend(delta.annotations or [])
             return []
+        if isinstance(delta, interaction_types.ArgumentsDelta):
+            if self._step_types[index] != "function_call" or not isinstance(delta.arguments, str):
+                raise self._protocol_error(
+                    f"Invalid function arguments delta for step index {index}"
+                )
+            self._argument_fragments.setdefault(index, []).append(delta.arguments)
         if isinstance(delta, interaction_types.RetrievalCallDelta):
             arguments = delta.arguments
             queries = list(arguments.queries or []) if arguments else []
@@ -2405,6 +2444,7 @@ class GeminiContentBuilder:
         valves: "Pipe.Valves",
         files_api_manager: "FilesAPIManager",
         pdf_mitigation_manager: PDFMitigationManager,
+        service_policy: dict[str, object],
     ):
         self.messages_body = messages_body
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
@@ -2416,6 +2456,16 @@ class GeminiContentBuilder:
         self.valves = valves
         self.files_api_manager = files_api_manager
         self.pdf_mitigation_manager = pdf_mitigation_manager
+        content_policy = service_policy.get("content")
+        interaction_policy = service_policy.get("interactions")
+        if not isinstance(content_policy, dict) or not isinstance(interaction_policy, dict):
+            raise ValueError("Selected Gemini service policy is missing content capabilities.")
+        inputs = content_policy.get("inputs")
+        if not isinstance(inputs, list) or "text" not in inputs:
+            raise ValueError("Selected Gemini service policy does not support text input.")
+        self.allowed_input_content = frozenset(str(value) for value in inputs)
+        self.files_api_supported = interaction_policy.get("files") is True
+        self.external_urls_supported = interaction_policy.get("external_urls") is True
         # FIXME: chat id could be `None`, leading to an iteration error.
         self.is_temp_chat = "local" in metadata_body.get("chat_id", "")
         self.is_enterprise = self.files_api_manager.endpoint_identity.service == "enterprise"
@@ -3241,6 +3291,7 @@ class GeminiContentBuilder:
         # override the `mime_type` variable to 'text/plain' to allow the upload.
 
         # Determine whether to use the Files API based on the specified conditions.
+        self._require_media_input(mime_type)
         use_files_api = True
         reason = ""
 
@@ -3249,6 +3300,9 @@ class GeminiContentBuilder:
             use_files_api = False
         elif not self.valves.USE_FILES_API:
             reason = "disabled by user setting (USE_FILES_API=False)"
+            use_files_api = False
+        elif not self.files_api_supported:
+            reason = "the selected service policy does not support the Files API"
             use_files_api = False
         elif self.is_enterprise:
             reason = "the active client is configured for Gemini Enterprise, which does not support the Files API"
@@ -3287,6 +3341,7 @@ class GeminiContentBuilder:
         force_raw: bool = False,
     ) -> interaction_types.ContentParam:
         """Create Interaction content from a local path without foreign URI reuse."""
+        self._require_media_input(mime_type)
         use_files_api = True
         reason = ""
 
@@ -3295,6 +3350,9 @@ class GeminiContentBuilder:
             use_files_api = False
         elif not self.valves.USE_FILES_API:
             reason = "disabled by user setting (USE_FILES_API=False)"
+            use_files_api = False
+        elif not self.files_api_supported:
+            reason = "the selected service policy does not support the Files API"
             use_files_api = False
         elif self.is_enterprise:
             reason = "the active client is configured for Gemini Enterprise, which does not support the Files API"
@@ -3329,6 +3387,20 @@ class GeminiContentBuilder:
     @staticmethod
     def _encode_data(file_bytes: bytes) -> str:
         return base64.b64encode(file_bytes).decode("ascii")
+
+    def _require_media_input(self, mime_type: str) -> None:
+        if mime_type.startswith("image/"):
+            kind = "image"
+        elif mime_type.startswith("audio/"):
+            kind = "audio"
+        elif mime_type.startswith("video/"):
+            kind = "video"
+        else:
+            kind = "document"
+        if kind not in self.allowed_input_content:
+            raise ContentBuildError(
+                f"Selected Gemini service policy does not support {kind} input."
+            )
 
     @staticmethod
     def _media_content(
@@ -3379,6 +3451,10 @@ class GeminiContentBuilder:
         self, uri: str
     ) -> interaction_types.VideoContentParam | None:
         """Canonicalize a YouTube URL into the fields supported by Interactions."""
+        if not self.external_urls_supported or "video" not in self.allowed_input_content:
+            raise ContentBuildError(
+                "Selected Gemini service policy does not support external video URLs."
+            )
         # Convert YouTube Music URLs to standard YouTube URLs for consistent parsing.
         if "music.youtube.com" in uri:
             uri = uri.replace("music.youtube.com", "www.youtube.com")
@@ -4084,7 +4160,10 @@ class Pipe:
                 __metadata__["is_paid_api"] = True
 
             service = "enterprise" if current_valves.USE_ENTERPRISE else "developer"
-            availability = catalog_model.get("services", {}).get(service, "unsupported")
+            service_policy = self._get_catalog_service_policy(
+                catalog_model, cast(Literal["developer", "enterprise"], service)
+            )
+            availability = service_policy.get("availability", "unsupported")
             if availability != "supported":
                 message = (
                     f"Model '{model_id}' is {availability!r} for the Gemini {service} "
@@ -4095,6 +4174,10 @@ class Pipe:
                     raise ValueError(message)
                 log.warning(message)
                 continue
+
+            resolved_model_config = dict(model_config)
+            resolved_model_config[model_id] = service_policy
+            __metadata__["gemini_catalog_service"] = service
 
             try:
                 log.info(f"Starting generation attempt on tier: {tier}")
@@ -4109,6 +4192,7 @@ class Pipe:
                 async def execute_attempt(
                     attempt_tier: str = tier,
                     attempt_valves: Pipe.Valves = current_valves,
+                    attempt_model_config: dict[str, Any] = resolved_model_config,
                 ):
                     return await self._execute_generation_attempt(
                         tier=attempt_tier,
@@ -4118,7 +4202,7 @@ class Pipe:
                         __metadata__=__metadata__,
                         __request__=__request__,
                         event_emitter=event_emitter,
-                        model_config=model_config,
+                        model_config=attempt_model_config,
                         __tools__=__tools__,
                     )
 
@@ -4402,6 +4486,15 @@ class Pipe:
 
         # Condition for fetching from both sources
         fetch_both = bool(use_enterprise and enterprise_project and (free_api_key or paid_api_key))
+        catalog_model_ids = (
+            DEVELOPER_CATALOG_MODEL_IDS | ENTERPRISE_CATALOG_MODEL_IDS
+            if fetch_both
+            else (
+                ENTERPRISE_CATALOG_MODEL_IDS
+                if use_enterprise and enterprise_project
+                else DEVELOPER_CATALOG_MODEL_IDS
+            )
+        )
 
         if fetch_both:
             log.info(
@@ -4460,6 +4553,12 @@ class Pipe:
             for model in gemini_models_list:
                 if model.name:
                     model_id = self._strip_api_prefix(model.name)
+                    if model_id not in DEVELOPER_CATALOG_MODEL_IDS:
+                        log.info(
+                            f"Hiding Developer API model '{model_id}'; its Developer "
+                            "Interactions policy is not supported in the catalog."
+                        )
+                        continue
                     if model_id and model_id not in combined_models_dict:
                         combined_models_dict[model_id] = model
                 else:
@@ -4470,6 +4569,12 @@ class Pipe:
             for model in enterprise_models_list:
                 if model.name:
                     model_id = self._strip_api_prefix(model.name)
+                    if model_id not in ENTERPRISE_CATALOG_MODEL_IDS:
+                        log.info(
+                            f"Hiding Enterprise model '{model_id}'; its Enterprise "
+                            "Interactions policy is not supported in the catalog."
+                        )
+                        continue
                     if model_id:
                         if model_id not in combined_models_dict:
                             combined_models_dict[model_id] = model
@@ -4583,7 +4688,7 @@ class Pipe:
                 )
                 continue
 
-            if stripped_name not in CATALOG_MODEL_IDS:
+            if stripped_name not in catalog_model_ids:
                 log.info(
                     f"Hiding uncatalogued model '{stripped_name}'; Interactions capabilities "
                     "are denied until the versioned catalog is audited and updated."
@@ -4722,6 +4827,39 @@ class Pipe:
         outputs = config.get(model_id, {}).get("content", {}).get("outputs", [])
         return "image" in outputs
 
+    @staticmethod
+    def _get_catalog_service_policy(
+        model: object,
+        service: Literal["developer", "enterprise"],
+    ) -> dict[str, object]:
+        """Resolve one service policy; malformed or absent records deny by default."""
+        if not isinstance(model, dict):
+            return {}
+        services = model.get("services")
+        if not isinstance(services, dict):
+            return {}
+        policy = services.get(service)
+        if not isinstance(policy, dict):
+            return {}
+        availability = policy.get("availability")
+        if availability == "supported":
+            required = {
+                "availability",
+                "verified_at",
+                "source_refs",
+                "lifecycle",
+                "limits",
+                "content",
+                "interactions",
+                "pricing",
+            }
+            return cast(dict[str, object], policy) if required <= policy.keys() else {}
+        if availability in {"unverified", "unsupported"}:
+            return (
+                cast(dict[str, object], policy) if set(policy) == {"availability", "reason"} else {}
+            )
+        return {}
+
     # endregion 2.2 Model retrival from Google API
 
     # region 2.3 Interactions request option assembly
@@ -4740,6 +4878,7 @@ class Pipe:
         if not isinstance(model_policy, dict):
             raise ValueError(f"Model '{model_id}' is absent from the validated catalog.")
         interaction_policy = model_policy.get("interactions", {})
+        limits_policy = model_policy.get("limits", {})
         features = self._resolve_gemini_features(__metadata__)
 
         if body.get("top_k") is not None:
@@ -4763,11 +4902,24 @@ class Pipe:
         stop = body.get("stop")
         if isinstance(stop, str):
             stop = [stop]
+        max_output_tokens = body.get("max_tokens")
+        catalog_output_limit = (
+            limits_policy.get("output_tokens") if isinstance(limits_policy, dict) else None
+        )
+        if (
+            isinstance(max_output_tokens, int)
+            and isinstance(catalog_output_limit, int)
+            and max_output_tokens > catalog_output_limit
+        ):
+            raise ValueError(
+                f"Requested max_tokens exceeds the selected service limit of "
+                f"{catalog_output_limit}."
+            )
         generation_config = interaction_types.GenerationConfig.model_validate(
             {
                 "temperature": body.get("temperature"),
                 "top_p": body.get("top_p"),
-                "max_output_tokens": body.get("max_tokens"),
+                "max_output_tokens": max_output_tokens,
                 "stop_sequences": stop,
                 "seed": body.get("seed"),
                 "thinking_level": thinking_level if features.reasoning else None,
@@ -5074,8 +5226,9 @@ class Pipe:
         common_request: dict[str, object],
         registry: dict[str, OpenWebUITool],
         root_replay_input: list[interaction_types.StepParam] | None = None,
+        stream: bool = False,
     ) -> tuple[list[ReducerEmission], InteractionReduction]:
-        """Run sequential custom functions without emitting OpenAI tool-call deltas."""
+        """Run custom functions without exposing provider tool-call deltas to Open WebUI."""
         if common_request.get("store") is not True:
             raise ValueError("Custom function calling requires store=true continuation.")
         records: dict[str, ToolCallRecord] = {}
@@ -5085,12 +5238,12 @@ class Pipe:
         request_payload = dict(common_request)
 
         for _round_index in range(GEMINI_TOOL_MAX_ROUNDS):
-            request = cast(
-                interaction_types.CreateModelInteractionParamsNonStreaming,
-                {**request_payload, "stream": False},
-            )
             try:
-                response = await interactions.create(**request)
+                emissions, reduction, calls = await self._execute_custom_function_round(
+                    interactions=interactions,
+                    request_payload=request_payload,
+                    stream=stream,
+                )
             except Exception as exc:
                 can_replay_root = bool(
                     _round_index == 0
@@ -5102,15 +5255,12 @@ class Pipe:
                     raise
                 request_payload = {**common_request, "input": root_replay_input}
                 request_payload.pop("previous_interaction_id", None)
-                request = cast(
-                    interaction_types.CreateModelInteractionParamsNonStreaming,
-                    {**request_payload, "stream": False},
+                emissions, reduction, calls = await self._execute_custom_function_round(
+                    interactions=interactions,
+                    request_payload=request_payload,
+                    stream=stream,
                 )
-                response = await interactions.create(**request)
-            reducer = InteractionReducer()
-            emissions = reducer.consume_interaction(response)
-            reducer.finalize_steps()
-            ledger.extend(reducer.state.steps)
+            ledger.extend(reduction.steps)
             for field_name in (
                 "input_tokens",
                 "output_tokens",
@@ -5122,29 +5272,24 @@ class Pipe:
                 setattr(
                     total_usage,
                     field_name,
-                    getattr(total_usage, field_name) + getattr(reducer.state.usage, field_name),
+                    getattr(total_usage, field_name) + getattr(reduction.usage, field_name),
                 )
 
-            calls = [
-                step
-                for step in (response.steps or [])
-                if isinstance(step, interaction_types.FunctionCallStep)
-            ]
             if not calls:
-                if reducer.state.status != "completed":
+                if reduction.status != "completed":
                     raise InteractionExecutionError(
                         GenerationFailureKind.INTERACTION_STATUS,
-                        f"Interaction ended with status {reducer.state.status} without function calls.",
+                        f"Interaction ended with status {reduction.status} without function calls.",
                     )
-                reducer.state.steps = ledger
-                reducer.state.usage = total_usage
-                return emissions, reducer.state
-            if reducer.state.status != "requires_action":
+                reduction.steps = ledger
+                reduction.usage = total_usage
+                return emissions, reduction
+            if reduction.status != "requires_action":
                 raise InteractionExecutionError(
                     GenerationFailureKind.INTERACTION_STATUS,
-                    f"Interaction returned function calls with status {reducer.state.status}.",
+                    f"Interaction returned function calls with status {reduction.status}.",
                 )
-            if not response.id:
+            if not reduction.interaction_id:
                 raise InteractionExecutionError(
                     GenerationFailureKind.INTERACTION_ERROR,
                     "Function-calling interaction did not return an interaction ID.",
@@ -5159,15 +5304,30 @@ class Pipe:
                     GenerationFailureKind.INTERACTION_ERROR,
                     "Interaction exceeded the per-round function call limit.",
                 )
+            call_ids = [call.id for call in calls]
+            if len(set(call_ids)) != len(call_ids):
+                raise InteractionExecutionError(
+                    GenerationFailureKind.INTERACTION_ERROR,
+                    "Interaction returned duplicate function call IDs in one round.",
+                )
             total_calls += len(calls)
             if total_calls > GEMINI_TOOL_MAX_TOTAL_CALLS:
                 raise InteractionExecutionError(
                     GenerationFailureKind.INTERACTION_ERROR,
                     "Interaction exceeded the total function call limit.",
                 )
-            results = [
-                await self._execute_custom_function_call(call, registry, records) for call in calls
+            tasks = [
+                asyncio.create_task(self._execute_custom_function_call(call, registry, records))
+                for call in calls
             ]
+            try:
+                results = await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             result_payloads = [
                 cast(
                     interaction_types.StepParam,
@@ -5179,13 +5339,74 @@ class Pipe:
             request_payload = {
                 **common_request,
                 "input": result_payloads,
-                "previous_interaction_id": response.id,
+                "previous_interaction_id": reduction.interaction_id,
             }
 
         raise InteractionExecutionError(
             GenerationFailureKind.INTERACTION_ERROR,
             f"Interaction exceeded the {GEMINI_TOOL_MAX_ROUNDS}-round function loop limit.",
         )
+
+    async def _execute_custom_function_round(
+        self,
+        *,
+        interactions: AsyncInteractionsBoundary,
+        request_payload: dict[str, object],
+        stream: bool,
+    ) -> tuple[
+        list[ReducerEmission],
+        InteractionReduction,
+        list[interaction_types.FunctionCallStep],
+    ]:
+        """Execute one unary or SSE function round and return one normalized timeline."""
+        reducer = InteractionReducer()
+        if not stream:
+            request = cast(
+                interaction_types.CreateModelInteractionParamsNonStreaming,
+                {**request_payload, "stream": False},
+            )
+            response = await interactions.create(**request)
+            emissions = reducer.consume_interaction(response)
+            reducer.finalize_steps()
+            return emissions, reducer.state, reducer.function_calls()
+
+        request = cast(
+            interaction_types.CreateModelInteractionParamsStreaming,
+            {**request_payload, "stream": True},
+        )
+        current_stream = await interactions.create(**request)
+        emissions: list[ReducerEmission] = []
+        reconnects = 0
+        while True:
+            try:
+                async with current_stream:
+                    async for event in current_stream:
+                        emissions.extend(reducer.consume_event(event))
+                break
+            except (asyncio.CancelledError, InteractionExecutionError):
+                raise
+            except Exception as exc:
+                can_resume = bool(
+                    reducer.state.interaction_id and reducer.state.last_event_id and reconnects < 2
+                )
+                if not can_resume:
+                    raise InteractionExecutionError(
+                        GenerationFailureKind.INTERACTION_ERROR,
+                        f"Function-calling Interaction stream interrupted and could not resume: {exc}",
+                    ) from exc
+                reconnects += 1
+                current_stream = await interactions.get(
+                    cast(str, reducer.state.interaction_id),
+                    stream=True,
+                    last_event_id=cast(str, reducer.state.last_event_id),
+                )
+        if reducer.state.status not in {"completed", "requires_action"}:
+            raise InteractionExecutionError(
+                GenerationFailureKind.INTERACTION_STATUS,
+                f"Function-calling Interaction stream ended with status {reducer.state.status}.",
+            )
+        reducer.finalize_steps()
+        return emissions, reducer.state, reducer.function_calls()
 
     @staticmethod
     def _is_interaction_not_found(exc: Exception) -> bool:
@@ -5323,6 +5544,7 @@ class Pipe:
             if endpoint_identity.service == "enterprise"
             else "Gemini Developer API"
         )
+        model_policy = cast(dict[str, object], model_config.get(model_id, {}))
 
         # 2. Files API Manager (Scoped to the current client)
         files_api_manager = FilesAPIManager(
@@ -5342,13 +5564,13 @@ class Pipe:
             valves=valves,
             files_api_manager=files_api_manager,
             pdf_mitigation_manager=self.pdf_mitigation_manager,
+            service_policy=model_policy,
         )
 
         event_emitter.emit_status("Preparing request...")
         full_contents = await builder.build_contents()
 
         # 4. Configuration Building
-        model_policy = cast(dict[str, object], model_config.get(model_id, {}))
         tool_registry = self._resolve_open_webui_tools(
             __tools__,
             model_id=model_id,
@@ -5370,7 +5592,7 @@ class Pipe:
             user_preference=None,
             is_temp=builder.is_temp_chat,
             is_task=bool(__metadata__.get("task")),
-        )
+        ) and self._service_supports_interaction_store(model_policy)
         metadata_state["gemini_effective_store"] = store_interaction
         continuation = builder.select_continuation(
             full_contents,
@@ -5419,6 +5641,7 @@ class Pipe:
                 common_request=cast(dict[str, object], common_request),
                 registry=tool_registry,
                 root_replay_input=full_contents,
+                stream=is_streaming_request,
             )
             processor = self._present_reduction(
                 emissions=emissions,
@@ -5497,6 +5720,11 @@ class Pipe:
         """Privacy is monotonic: either administrator or user may disable storage."""
         return bool(admin_allows and user_preference is not False and not is_temp and not is_task)
 
+    @staticmethod
+    def _service_supports_interaction_store(service_policy: dict[str, object]) -> bool:
+        interactions_policy = service_policy.get("interactions")
+        return isinstance(interactions_policy, dict) and interactions_policy.get("store") is True
+
     def _check_free_tier_eligibility(
         self,
         model_id: str,
@@ -5511,7 +5739,12 @@ class Pipe:
         if model_id not in model_config:
             return False
 
-        pricing = model_config[model_id].get("pricing", {})
+        developer_policy = self._get_catalog_service_policy(model_config[model_id], "developer")
+        if developer_policy.get("availability") != "supported":
+            return False
+        pricing = developer_policy.get("pricing", {})
+        if not isinstance(pricing, dict):
+            return False
         if not pricing.get("free_tier", False):
             return False
 
@@ -5779,9 +6012,14 @@ class Pipe:
         }
         if metadata.get("is_paid_api", True):
             model_id = str(metadata.get("canonical_model_id", ""))
-            pricing = (
-                app_state._state.get("gemini_model_config", {}).get(model_id, {}).get("pricing", {})
+            service = metadata.get("gemini_catalog_service")
+            service_policy = self._get_catalog_service_policy(
+                app_state._state.get("gemini_model_config", {}).get(model_id),
+                "enterprise" if service == "enterprise" else "developer",
             )
+            pricing = service_policy.get("pricing", {})
+            if not isinstance(pricing, dict):
+                pricing = {}
             input_tokens = max(usage.input_tokens - usage.cached_tokens, 0)
             image_output_tokens = 0
             for item in usage.output_by_modality:

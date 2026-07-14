@@ -40,7 +40,7 @@ creating/pushing the coordinated tag. It never publishes the GitHub draft or Com
 
 `plugins/pipes/gemini_models.yaml` is fail-closed policy, not a discovery cache. Every model and
 service/capability claim needs current authoritative evidence and a new immutable catalog/release
-hash. An override must use HTTP(S), schema 1, and immutable reviewed content. Mutable branch URLs,
+hash. An override must use HTTP(S), schema 2, and immutable reviewed content. Mutable branch URLs,
 uncatalogued models, and `unverified` services are denied.
 
 The 3.0 companion URL is prospective until the coordinated tag is pushed. Before exposing traffic,
@@ -56,9 +56,18 @@ configuration changes.
 Offline tests are authoritative for deterministic contracts. Optional Developer live smoke is
 manually dispatched into a protected GitHub environment, requires `GEMINI_API_KEY`, fails rather
 than skips after explicit opt-in when that secret is absent, and never records response text. The
-Enterprise workflow job is a no-network policy contract: it proves the canonical SDK transport
-snapshot, the all-unverified catalog, and pre-client denial. It must not be reported as supported
-Enterprise generation evidence.
+Developer workflow's Enterprise job is a no-network policy contract: it proves the canonical SDK
+transport snapshot, the all-unverified catalog, and pre-client denial. A separate protected
+Enterprise live workflow uses Workload Identity Federation, requires explicit project/location,
+model, and API-version inputs, and runs unary, SSE, and stored-continuation probes with cleanup.
+Even a green probe proves only that selected tuple; promote no catalog entry until its
+service-specific capabilities and pricing are audited too.
+
+The protected environment requires reviewers/no bypass and a default-branch deployment rule. The
+Google WIF provider must bind immutable repository ID plus the default ref, environment, and
+audience; grant its service account only endpoint-required permissions. The workflow pins actions,
+disables persisted checkout credentials, checks exactly three non-skipped cases, and records a
+sanitized project hash. Retain separate `v1beta1` and `v1` run URLs in Beads before promotion.
 
 The latest sanitized local Developer run was recorded on 2026-07-14 against the default
 `gemini-2.5-flash` model: unary, SSE terminal/cleanup, and stored continuation all passed. The

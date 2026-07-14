@@ -24,7 +24,7 @@ import sys
 import time
 import urllib.request
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 import aiohttp
 import pydantic_core
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 log = logger.bind(auditable=False)
 
 DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.0.0/plugins/pipes/gemini_models.yaml"
-MODEL_CATALOG_SCHEMA_VERSION = 1
+MODEL_CATALOG_SCHEMA_VERSION = 2
 GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 
 # Default timeout for URL resolution
@@ -59,11 +59,6 @@ class ModelCatalogError(ValueError):
 
 class _CatalogModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-class CatalogServices(_CatalogModel):
-    developer: Literal["supported", "unsupported", "unverified"]
-    enterprise: Literal["supported", "unsupported", "unverified"]
 
 
 class CatalogLimits(_CatalogModel):
@@ -135,18 +130,18 @@ class CatalogPricing(_CatalogModel):
         return self
 
 
-class CatalogModel(_CatalogModel):
+class CatalogSupportedService(_CatalogModel):
+    availability: Literal["supported"]
+    verified_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    source_refs: set[str] = Field(min_length=1)
     lifecycle: Literal["stable", "preview"]
-    services: CatalogServices
     limits: CatalogLimits
     content: CatalogContent
     interactions: CatalogInteractions
     pricing: CatalogPricing
 
     @model_validator(mode="after")
-    def validate_capability_dependencies(self) -> "CatalogModel":
-        if self.services.developer == self.services.enterprise == "unsupported":
-            raise ValueError("a catalog model must be supported or pending verification somewhere")
+    def validate_capability_dependencies(self) -> "CatalogSupportedService":
         image_output = "image" in self.content.outputs
         if image_output != (self.pricing.image_output is not None):
             raise ValueError("image output requires image-output pricing, and vice versa")
@@ -155,10 +150,43 @@ class CatalogModel(_CatalogModel):
         return self
 
 
+class CatalogUnavailableService(_CatalogModel):
+    availability: Literal["unsupported", "unverified"]
+    reason: str = Field(min_length=1)
+
+
+CatalogService = Annotated[
+    CatalogSupportedService | CatalogUnavailableService,
+    Field(discriminator="availability"),
+]
+
+
+class CatalogServices(_CatalogModel):
+    developer: CatalogService
+    enterprise: CatalogService
+
+
+class CatalogModel(_CatalogModel):
+    services: CatalogServices
+
+    @model_validator(mode="after")
+    def validate_somewhere_actionable(self) -> "CatalogModel":
+        if all(
+            service.availability == "unsupported"
+            for service in (self.services.developer, self.services.enterprise)
+        ):
+            raise ValueError("a catalog model must be supported or pending verification somewhere")
+        return self
+
+
+class CatalogSources(_CatalogModel):
+    developer: dict[str, str]
+    enterprise: dict[str, str]
+
+
 class ModelCatalog(_CatalogModel):
-    schema_version: Literal[1]
-    verified_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    sources: dict[Literal["models", "interactions", "function_calling", "pricing"], str]
+    schema_version: Literal[2]
+    sources: CatalogSources
     models: dict[str, CatalogModel] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -166,6 +194,18 @@ class ModelCatalog(_CatalogModel):
         invalid = [model_id for model_id in self.models if not model_id.startswith("gemini-")]
         if invalid:
             raise ValueError(f"invalid Gemini model ids: {invalid}")
+        for model_id, model in self.models.items():
+            for service_name in ("developer", "enterprise"):
+                service = getattr(model.services, service_name)
+                if not isinstance(service, CatalogSupportedService):
+                    continue
+                available_refs = getattr(self.sources, service_name)
+                missing_refs = sorted(service.source_refs - available_refs.keys())
+                if missing_refs:
+                    raise ValueError(
+                        f"model '{model_id}' {service_name} policy references unknown sources: "
+                        f"{missing_refs}"
+                    )
         return self
 
 
@@ -536,15 +576,6 @@ class Filter:
             )
             return body
 
-        # Check if the model supports grounding or code execution using YAML config
-        is_grounding_model = self._check_model_capability(
-            canonical_model_name, model_config, "search_grounding"
-        )
-        is_code_exec_model = self._check_model_capability(
-            canonical_model_name, model_config, "code_execution"
-        )
-        log.debug(f"{is_grounding_model=}, {is_code_exec_model=}")
-
         features = body.get("features", {})
         log.debug(f"Received {len(features)} request feature flag(s).")
 
@@ -560,28 +591,24 @@ class Filter:
         # Add the companion version to the payload for the pipe to consume.
         metadata_features["gemini_manifold_companion_version"] = VERSION
 
-        if is_grounding_model:
-            web_search_enabled = (
-                features.get("web_search", False) if isinstance(features, dict) else False
+        web_search_enabled = (
+            features.get("web_search", False) if isinstance(features, dict) else False
+        )
+        if web_search_enabled:
+            log.info(
+                "Search feature was requested; the pipe will authorize it against the selected service policy."
             )
-            if web_search_enabled:
-                log.info(
-                    "Search feature is enabled, disabling it and adding custom feature called google_search_tool."
-                )
-                # Disable web_search
-                features["web_search"] = False
-                metadata_features["google_search_tool"] = True
-        if is_code_exec_model:
-            code_execution_enabled = (
-                features.get("code_interpreter", False) if isinstance(features, dict) else False
+            features["web_search"] = False
+            metadata_features["google_search_tool"] = True
+        code_execution_enabled = (
+            features.get("code_interpreter", False) if isinstance(features, dict) else False
+        )
+        if code_execution_enabled:
+            log.info(
+                "Code execution was requested; the pipe will authorize it against the selected service policy."
             )
-            if code_execution_enabled:
-                log.info(
-                    "Code interpreter feature is enabled, disabling it and adding custom feature called google_code_execution."
-                )
-                # Disable code_interpreter
-                features["code_interpreter"] = False
-                metadata_features["google_code_execution"] = True
+            features["code_interpreter"] = False
+            metadata_features["google_code_execution"] = True
         if self.valves.USE_PERMISSIVE_SAFETY:
             log.info("Adding permissive safety settings to body.metadata")
             metadata["safety_settings"] = self._get_permissive_safety_settings(canonical_model_name)
@@ -912,7 +939,7 @@ class Filter:
             }
             log.success(
                 f"Loaded Gemini model catalog protocol {catalog.schema_version} "
-                f"with {len(config)} model(s), verified {catalog.verified_at}."
+                f"with {len(config)} model(s)."
             )
             return config
         except ModelCatalogError:
@@ -927,7 +954,13 @@ class Filter:
     # region 1.5 Model capability checks
 
     @staticmethod
-    def _check_model_capability(model_id: str, config: dict, capability: str) -> bool:
+    def _check_model_capability(
+        model_id: str,
+        config: dict,
+        capability: str,
+        *,
+        service: Literal["developer", "enterprise"] = "developer",
+    ) -> bool:
         """Check if a model supports a specific capability based on YAML config.
 
         Args:
@@ -945,6 +978,9 @@ class Filter:
             return False
 
         model_config = config[model_id]
+        service_policy = model_config.get("services", {}).get(service, {})
+        if service_policy.get("availability") != "supported":
+            return False
         capability_paths = {
             "search_grounding": ("tools", "google_search"),
             "code_execution": ("tools", "code_execution"),
@@ -959,7 +995,7 @@ class Filter:
         if path is None:
             log.warning(f"Unknown catalog capability '{capability}' denied for '{model_id}'.")
             return False
-        value: object = model_config.get("interactions", {})
+        value: object = service_policy.get("interactions", {})
         for key in path:
             if not isinstance(value, dict):
                 return False

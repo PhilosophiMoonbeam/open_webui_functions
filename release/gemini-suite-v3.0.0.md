@@ -10,7 +10,7 @@ companion with a 2.x component.
 - Developer API requests use `v1`.
 - Stateful `previous_interaction_id` continuation and signed local stateless replay replace
   GenerateContent-era chat reconstruction.
-- Grounding-envelope protocol 1 and model-catalog protocol 1 become hard boundaries.
+- Grounding-envelope protocol 1 and service-qualified model-catalog protocol 2 become hard boundaries.
 - The Reason toggle now emits `features.reasoning` and is version 2.0.0.
 - The Maps toggle now emits `features.google_maps` and is version 2.0.0.
 - The old Vertex AI toggle is removed and replaced by the Gemini Enterprise toggle.
@@ -51,8 +51,9 @@ input contract for a 2.x pipe; start a new branch/chat after rollback if replay 
   an immutable reviewed catalog URL with the same schema and content.
 - Deleting an Open WebUI chat does not delete provider-held Interactions.
 - Duplicate suppression is process-local; concurrent workers do not share a transaction.
-- Custom Open WebUI function rounds require `store=true`, are unary, and are bounded by the
-  pipe's round/call/time/result-size limits.
+- Custom Open WebUI function rounds require `store=true`, support unary and SSE transport, execute
+  same-round calls concurrently with deterministic result order, and remain bounded by the pipe's
+  round/call/time/result-size limits.
 
 ## Reproduce locally
 

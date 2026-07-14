@@ -10,7 +10,7 @@ Provider URL statuses such as `paywall` or `unsafe` are surfaced as warnings rat
 as successful source reads.
 
 Enable this filter only for Gemini Manifold models. The selected model must have
-`interactions.tools.url_context: true` in the immutable schema-1 catalog.
+`services.<selected>.interactions.tools.url_context: true` in the immutable schema-2 catalog.
 
 See the [pipe guide](../pipes/gemini_manifold.md) and
 [companion guide](gemini_manifold_companion.md).

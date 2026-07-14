@@ -6,7 +6,7 @@ release_policy: coordinated_only
 protocols:
   google_genai: 2.11.0
   grounding_envelope: 1
-  model_catalog: 1
+  model_catalog: 2
 install_order:
   - gemini_manifold_companion
   - gemini_reasoning_toggle
@@ -20,20 +20,20 @@ artifacts:
     role: pipe
     version: 3.0.0
     path: plugins/pipes/gemini_manifold.py
-    sha256: 11f373d2bf092200c542ec3dd540e6872a35b6b4554cfd954e3cdf0327c4b9ae
-    bytes: 277580
+    sha256: f680d828d709852a67898891d275ba489d4523b1bb8829d3afb93f88c4656926
+    bytes: 288669
   - id: gemini_manifold_companion
     role: companion
     version: 3.0.0
     path: plugins/filters/gemini_manifold_companion.py
-    sha256: 32e13e6c03a3f90320d19fc41b368afa381eec46694abe30e69d6afae4072fb4
-    bytes: 53784
+    sha256: 8d8cf5202b9a810861a163fdc9f70916ba214b40a558cb2c8ee12fc209855e16
+    bytes: 54630
   - id: gemini_model_catalog
     role: catalog
-    version: 1
+    version: 2
     path: plugins/pipes/gemini_models.yaml
-    sha256: 61ae746366b64adcb0c8234d4418a85ba1084e90b088b0cbe2dec86c4f9dd856
-    bytes: 9587
+    sha256: 06e634f76b084817369adb23c3710b41eb663f3fbf16aea629673595d3b8ff65
+    bytes: 11867
   - id: gemini_reasoning_toggle
     role: toggle
     version: 2.0.0
@@ -68,5 +68,5 @@ artifacts:
     role: release_notes
     version: 3.0.0
     path: release/gemini-suite-v3.0.0.md
-    sha256: ff26e6a208da07361e385bfddcee1282159d4a703d982333c0744727cecc70a3
-    bytes: 3215
+    sha256: 5e339b9381e25ac576b9083d8b90865d1fe11a76f4dc0a950b129fb10a5e93a6
+    bytes: 3331

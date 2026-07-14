@@ -11,7 +11,7 @@ Authoritative references: [Interactions overview](https://ai.google.dev/gemini-a
 
 ## Required coordinated components
 
-Install pipe 3.0.0 with companion 3.0.0 and catalog protocol 1 from the same
+Install pipe 3.0.0 with companion 3.0.0 and catalog protocol 2 from the same
 `gemini-suite/v3.0.0` manifest. The pipe rejects a missing/wrong companion version and a missing or
 wrong catalog protocol. The Reason and Maps filters have breaking 2.0.0 feature keys; the old
 Vertex AI toggle is replaced by the Enterprise toggle.
@@ -23,7 +23,7 @@ https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.
 ```
 
 That prospective URL works only after the tag exists. Do not enable the release before the tag
-and catalog are reachable. An override must be immutable, reviewable, schema 1, and compatible
+and catalog are reachable. An override must be immutable, reviewable, schema 2, and compatible
 with both 3.0 components; mutable branch URLs are unsupported.
 
 ## Service support
@@ -43,8 +43,10 @@ Unknown or unverified models and capabilities fail closed. `MODEL_WHITELIST` and
 
 ## Inputs, outputs, and tools
 
-The exact per-model catalog controls text, image, audio, video, document, external-URL, Files API,
-thinking, response-format, image-output, and tool availability. Supported request construction
+The exact per-model, per-service catalog controls text, image, audio, video, document,
+external-URL, Files API, storage, limits, pricing, thinking, response-format, image-output, and
+tool availability. Unverified/unsupported service nodes cannot contain capabilities or pricing.
+Supported request construction
 includes multimodal user content, Open WebUI files, YouTube URLs, PDFs, system instructions, JSON
 schema response format, reasoning summaries, and safety settings.
 
@@ -55,9 +57,12 @@ rejected before an API call.
 
 Custom Open WebUI functions are deliberately narrower:
 
-- They require effective `store=true` and non-streaming Interaction rounds.
+- They require effective `store=true`; unary Open WebUI requests use unary Interaction rounds and
+  streaming requests use SSE rounds with indexed `arguments_delta` assembly.
 - Only authorized request-local callables with object JSON schemas are exposed.
 - Direct frontend tools are rejected.
+- Calls from one provider round execute concurrently, while submitted results retain provider
+  step order. Cancellation cleans up every in-flight callable before propagating.
 - The loop allows at most 8 rounds, 16 calls per round, and 32 calls total.
 - Each call has a 30-second timeout and each serialized result is limited to 1 MiB.
 - Repeated call IDs must have identical names/arguments; results are reused rather than executed

@@ -12,7 +12,9 @@ import tarfile
 from pathlib import Path
 from types import ModuleType
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).parents[1]
@@ -28,6 +30,15 @@ def _load_builder() -> ModuleType:
     return module
 
 
+def _load_live_tests() -> ModuleType:
+    path = ROOT / "tests" / "live" / "test_gemini_interactions_live.py"
+    spec = importlib.util.spec_from_file_location("gemini_live_contract", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_manifest_hashes_every_coordinated_artifact() -> None:
     raw = cast(dict[str, object], yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8")))
     artifacts = cast(list[dict[str, object]], raw["artifacts"])
@@ -37,7 +48,7 @@ def test_manifest_hashes_every_coordinated_artifact() -> None:
     assert cast(dict[str, object], raw["protocols"]) == {
         "google_genai": "2.11.0",
         "grounding_envelope": 1,
-        "model_catalog": 1,
+        "model_catalog": 2,
     }
     assert {artifact["role"] for artifact in artifacts} >= {"pipe", "companion", "catalog"}
     for artifact in artifacts:
@@ -95,7 +106,8 @@ def test_ci_and_release_workflows_cover_all_contract_surfaces() -> None:
     ci_path = ROOT / ".github" / "workflows" / "python-ci.yml"
     release_path = ROOT / ".github" / "workflows" / "release.yml"
     live_path = ROOT / ".github" / "workflows" / "gemini-live-smoke.yml"
-    for path in (ci_path, release_path, live_path):
+    enterprise_live_path = ROOT / ".github" / "workflows" / "gemini-enterprise-live-smoke.yml"
+    for path in (ci_path, release_path, live_path, enterprise_live_path):
         parsed = yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
         assert isinstance(parsed, dict)
         assert "on" in parsed
@@ -133,11 +145,31 @@ def test_ci_and_release_workflows_cover_all_contract_surfaces() -> None:
     assert "test_public_pipe_denies_unverified_enterprise_before_create" in live
     assert "GCP_WORKLOAD_IDENTITY_PROVIDER" not in live
 
+    enterprise_live = enterprise_live_path.read_text(encoding="utf-8")
+    assert "environment: gemini-live-enterprise" in enterprise_live
+    assert "id-token: write" in enterprise_live
+    assert "google-github-actions/auth@" in enterprise_live
+    assert 'test -n "$GCP_WORKLOAD_IDENTITY_PROVIDER"' in enterprise_live
+    assert 'test -n "$GEMINI_ENTERPRISE_PROJECT"' in enterprise_live
+    assert 'test -n "$GEMINI_ENTERPRISE_LOCATION"' in enterprise_live
+    assert "live and enterprise_api" in enterprise_live
+    assert "github.event.repository.default_branch" in enterprise_live
+    assert "persist-credentials: false" in enterprise_live
+    assert "timeout-minutes: 15" in enterprise_live
+    assert "cancel-in-progress: false" in enterprise_live
+    assert "--junitxml=enterprise-live-results.xml" in enterprise_live
+    assert '"tests": 3, "failures": 0, "errors": 0, "skipped": 0' in enterprise_live
+    action_refs = re.findall(r"uses:\s+[^@\s]+@([^\s#]+)", enterprise_live)
+    assert len(action_refs) == 4
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+
     live_tests = (ROOT / "tests" / "live" / "test_gemini_interactions_live.py").read_text(
         encoding="utf-8"
     )
     assert 'pytest.fail("RUN_GEMINI_LIVE_TESTS=1 requires GEMINI_API_KEY")' in live_tests
-    assert "enterprise_api" not in live_tests
+    assert "RUN_GEMINI_ENTERPRISE_LIVE_TESTS=1 requires" in live_tests
+    assert "test_enterprise_text_interaction_live" in live_tests
+    assert "test_enterprise_previous_interaction_live" in live_tests
 
 
 def test_release_tag_parser_rejects_malformed_tags(tmp_path: Path) -> None:
@@ -166,18 +198,17 @@ def test_release_tag_parser_rejects_malformed_tags(tmp_path: Path) -> None:
     assert malformed.returncode != 0
 
 
-def test_live_continuation_stores_and_deletes_provider_interactions() -> None:
+def test_live_continuation_is_semantic_redacted_and_cleanup_owned() -> None:
     live_path = ROOT / "tests" / "live" / "test_gemini_interactions_live.py"
     tree = ast.parse(live_path.read_text(encoding="utf-8"), filename=str(live_path))
-    function = next(
+    probe = next(
         node
         for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "test_developer_previous_interaction_live"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_previous_interaction_probe"
     )
     continuation_calls = [
         node
-        for node in ast.walk(function)
+        for node in ast.walk(probe)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "create"
@@ -193,17 +224,59 @@ def test_live_continuation_stores_and_deletes_provider_interactions() -> None:
     assert isinstance(store_node, ast.Constant)
     assert store_node.value is True
 
-    cleanup_calls = [
-        nested
-        for node in ast.walk(function)
-        if isinstance(node, ast.Try)
-        for final_node in node.finalbody
-        for nested in ast.walk(final_node)
-        if isinstance(nested, ast.Call)
-        and isinstance(nested.func, ast.Attribute)
-        and nested.func.attr == "delete"
+    probe_text = ast.unparse(probe)
+    assert "temporary token I asked you to remember" in probe_text
+    assert "ALPHA" not in probe_text
+    assert "second.output_text" not in probe_text or "pytest.fail" in probe_text
+
+    cleanup = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_cleanup_stored_interactions"
+    )
+    cleanup_attributes = {
+        node.attr for node in ast.walk(cleanup) if isinstance(node, ast.Attribute)
+    }
+    assert {"delete", "aclose"} <= cleanup_attributes
+    assert "asyncio.shield" in ast.unparse(probe)
+
+    test_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name.endswith("previous_interaction_live")
+    }
+    assert test_names == {
+        "test_developer_previous_interaction_live",
+        "test_enterprise_previous_interaction_live",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_continuation_cleanup_survives_semantic_and_delete_failures(monkeypatch) -> None:
+    live = _load_live_tests()
+    monkeypatch.setattr(live.secrets, "token_hex", lambda _size: "ABC123")
+    first = live.interactions.Interaction(id="first", status="completed", steps=[])
+    second = live.interactions.Interaction(
+        id="second",
+        status="completed",
+        steps=[
+            live.interactions.ModelOutputStep(content=[live.interactions.TextContent(text="wrong")])
+        ],
+    )
+    client = MagicMock()
+    client.aio.interactions.create = AsyncMock(side_effect=[first, second])
+    client.aio.interactions.delete = AsyncMock(side_effect=[RuntimeError("redacted"), None])
+    client.aio.aclose = AsyncMock()
+
+    with pytest.raises(pytest.fail.Exception, match="semantic continuation"):
+        await live._run_previous_interaction_probe(client, "model")
+
+    assert [call.args[0] for call in client.aio.interactions.delete.await_args_list] == [
+        "second",
+        "first",
     ]
-    assert len(cleanup_calls) == 1
+    client.aio.aclose.assert_awaited_once()
 
 
 def test_gemini_docs_have_valid_local_links_and_no_stale_companion_contract() -> None:

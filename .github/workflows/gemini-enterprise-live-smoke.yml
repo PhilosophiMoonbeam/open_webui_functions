@@ -1,0 +1,99 @@
+name: Optional Gemini Enterprise Interactions Live Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Audited Enterprise model ID to probe
+        required: true
+        type: string
+      api_version:
+        description: Interactions API version to probe with google-genai 2.11.0
+        required: true
+        default: v1beta1
+        type: choice
+        options:
+          - v1beta1
+          - v1
+
+permissions:
+  contents: read
+
+jobs:
+  enterprise:
+    name: Enterprise API live smoke
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: gemini-enterprise-live-${{ inputs.model }}-${{ inputs.api_version }}
+      cancel-in-progress: false
+    environment: gemini-live-enterprise
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - run: uv sync --locked
+      - name: Require configured Enterprise identity and scope
+        env:
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GEMINI_ENTERPRISE_PROJECT: ${{ vars.GEMINI_ENTERPRISE_PROJECT }}
+          GEMINI_ENTERPRISE_LOCATION: ${{ vars.GEMINI_ENTERPRISE_LOCATION }}
+        run: |
+          test -n "$GCP_WORKLOAD_IDENTITY_PROVIDER"
+          test -n "$GCP_SERVICE_ACCOUNT"
+          test -n "$GEMINI_ENTERPRISE_PROJECT"
+          test -n "$GEMINI_ENTERPRISE_LOCATION"
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      - name: Run redacted Enterprise API tests
+        env:
+          RUN_GEMINI_ENTERPRISE_LIVE_TESTS: "1"
+          GEMINI_ENTERPRISE_PROJECT: ${{ vars.GEMINI_ENTERPRISE_PROJECT }}
+          GEMINI_ENTERPRISE_LOCATION: ${{ vars.GEMINI_ENTERPRISE_LOCATION }}
+          GEMINI_ENTERPRISE_MODEL: ${{ inputs.model }}
+          GEMINI_ENTERPRISE_API_VERSION: ${{ inputs.api_version }}
+        run: >-
+          uv run pytest -ra tests/live -m "live and enterprise_api"
+          --junitxml=enterprise-live-results.xml
+      - name: Verify exact smoke matrix and record sanitized evidence
+        env:
+          GEMINI_ENTERPRISE_PROJECT: ${{ vars.GEMINI_ENTERPRISE_PROJECT }}
+          GEMINI_ENTERPRISE_LOCATION: ${{ vars.GEMINI_ENTERPRISE_LOCATION }}
+          GEMINI_ENTERPRISE_MODEL: ${{ inputs.model }}
+          GEMINI_ENTERPRISE_API_VERSION: ${{ inputs.api_version }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          root = ET.parse("enterprise-live-results.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          totals = {
+              name: sum(int(suite.attrib.get(name, "0")) for suite in suites)
+              for name in ("tests", "failures", "errors", "skipped")
+          }
+          if totals != {"tests": 3, "failures": 0, "errors": 0, "skipped": 0}:
+              raise SystemExit(f"unexpected Enterprise live matrix totals: {totals}")
+          PY
+          echo "::add-mask::$GEMINI_ENTERPRISE_PROJECT"
+          project_hash="$(printf '%s' "$GEMINI_ENTERPRISE_PROJECT" | sha256sum | cut -d' ' -f1)"
+          {
+            echo "### Gemini Enterprise Interactions live evidence"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- google-genai: \`2.11.0\`"
+            echo "- Model: \`$GEMINI_ENTERPRISE_MODEL\`"
+            echo "- API version: \`$GEMINI_ENTERPRISE_API_VERSION\`"
+            echo "- Location: \`$GEMINI_ENTERPRISE_LOCATION\`"
+            echo "- Project SHA-256: \`$project_hash\`"
+            echo "- Result: 3 passed, 0 skipped"
+          } >> "$GITHUB_STEP_SUMMARY"

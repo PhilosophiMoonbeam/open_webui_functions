@@ -11,7 +11,7 @@ It is not compatible with pipe 2.x. Install companion 3.0.0 before pipe 3.0.0 fr
 
 For models owned by `gemini_manifold_google_genai`, the inlet:
 
-- Loads the pinned schema-1 model catalog and denies unknown capabilities.
+- Loads the pinned schema-2 service-qualified model catalog and denies unknown capabilities.
 - Records companion version 3.0.0 and canonical chat controls in request metadata.
 - Converts enabled Open WebUI web search to `features.google_search_tool` when the catalog allows
   Google Search.
@@ -47,7 +47,7 @@ and all request-local event queues are flushed and shut down before outlet compl
 | --- | --- |
 | `USE_PERMISSIVE_SAFETY` | Request `off` thresholds for supported Interactions safety categories. |
 | `BYPASS_BACKEND_RAG` | Let the pipe process original persistent-chat documents. |
-| `MODEL_CONFIG_PATH` | Immutable HTTP(S) schema-1 catalog. Defaults to the suite tag, never `master`. |
+| `MODEL_CONFIG_PATH` | Immutable HTTP(S) schema-2 catalog. Defaults to the suite tag, never `master`. |
 | `URL_RESOLVE_TIMEOUT` | Per-attempt redirect timeout in seconds. |
 | `URL_RESOLVE_MAX_RETRIES` | Additional redirect attempts. |
 | `URL_RESOLVE_BASE_DELAY` | Exponential retry base delay. |

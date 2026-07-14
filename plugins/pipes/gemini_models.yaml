@@ -1,230 +1,288 @@
 # Gemini Interactions model policy catalog.
 # Protocol changes are breaking: both the pipe and companion require this version.
-schema_version: 1
-verified_at: "2026-07-13"
+schema_version: 2
 sources:
-  models: "https://ai.google.dev/gemini-api/docs/models"
-  interactions: "https://ai.google.dev/gemini-api/docs/interactions-overview"
-  function_calling: "https://ai.google.dev/gemini-api/docs/function-calling"
-  pricing: "https://ai.google.dev/gemini-api/docs/pricing"
+  developer:
+    models: "https://ai.google.dev/gemini-api/docs/models"
+    interactions: "https://ai.google.dev/gemini-api/docs/interactions-overview"
+    function_calling: "https://ai.google.dev/gemini-api/docs/function-calling"
+    pricing: "https://ai.google.dev/gemini-api/docs/pricing"
+  enterprise: {}
 
 models:
   gemini-3.5-flash:
-    lifecycle: stable
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: true
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search, google_maps]
-      input: [{up_to_tokens: null, price_per_million: 1.50}]
-      output: [{up_to_tokens: null, price_per_million: 9.00}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: &developer_source_refs [models, interactions, function_calling, pricing]
+        lifecycle: stable
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: true
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search, google_maps]
+          input: [{up_to_tokens: null, price_per_million: 1.50}]
+          output: [{up_to_tokens: null, price_per_million: 9.00}]
+      enterprise: &enterprise_unverified
+        availability: unverified
+        reason: "No credential-backed Enterprise Interactions model and capability evidence is recorded."
 
   gemini-3.1-flash-lite:
-    lifecycle: stable
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search]
-      input: [{up_to_tokens: null, price_per_million: 0.25}]
-      output: [{up_to_tokens: null, price_per_million: 1.50}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: stable
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search]
+          input: [{up_to_tokens: null, price_per_million: 0.25}]
+          output: [{up_to_tokens: null, price_per_million: 1.50}]
+      enterprise: *enterprise_unverified
 
   gemini-3.1-flash-lite-preview:
-    lifecycle: preview
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search]
-      input: [{up_to_tokens: null, price_per_million: 0.25}]
-      output: [{up_to_tokens: null, price_per_million: 1.50}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: preview
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search]
+          input: [{up_to_tokens: null, price_per_million: 0.25}]
+          output: [{up_to_tokens: null, price_per_million: 1.50}]
+      enterprise: *enterprise_unverified
 
   gemini-3.1-flash-image-preview:
-    lifecycle: preview
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 131072, output_tokens: 32768}
-    content: {inputs: [text, image, document], outputs: [text, image]}
-    interactions:
-      store: true
-      response_format: false
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: false
-      tools: {google_search: true, google_maps: false, code_execution: false, url_context: false, file_search: false}
-    pricing:
-      free_tier: false
-      excluded_features: []
-      input: [{up_to_tokens: null, price_per_million: 0.25}]
-      output: [{up_to_tokens: null, price_per_million: 1.50}]
-      image_output: [{up_to_tokens: null, price_per_million: 60.00}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: preview
+        limits: {input_tokens: 131072, output_tokens: 32768}
+        content: {inputs: [text, image, document], outputs: [text, image]}
+        interactions:
+          store: true
+          response_format: false
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: false
+          tools: {google_search: true, google_maps: false, code_execution: false, url_context: false, file_search: false}
+        pricing:
+          free_tier: false
+          excluded_features: []
+          input: [{up_to_tokens: null, price_per_million: 0.25}]
+          output: [{up_to_tokens: null, price_per_million: 1.50}]
+          image_output: [{up_to_tokens: null, price_per_million: 60.00}]
+      enterprise: *enterprise_unverified
 
   gemini-3-flash-preview:
-    lifecycle: preview
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search]
-      input: [{up_to_tokens: null, price_per_million: 0.50}]
-      output: [{up_to_tokens: null, price_per_million: 3.00}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: preview
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search]
+          input: [{up_to_tokens: null, price_per_million: 0.50}]
+          output: [{up_to_tokens: null, price_per_million: 3.00}]
+      enterprise: *enterprise_unverified
 
   gemini-3.1-pro-preview:
-    lifecycle: preview
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: false
-      excluded_features: []
-      input:
-        - {up_to_tokens: 200000, price_per_million: 2.00}
-        - {up_to_tokens: null, price_per_million: 4.00}
-      output:
-        - {up_to_tokens: 200000, price_per_million: 12.00}
-        - {up_to_tokens: null, price_per_million: 18.00}
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: preview
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: false
+          excluded_features: []
+          input:
+            - {up_to_tokens: 200000, price_per_million: 2.00}
+            - {up_to_tokens: null, price_per_million: 4.00}
+          output:
+            - {up_to_tokens: 200000, price_per_million: 12.00}
+            - {up_to_tokens: null, price_per_million: 18.00}
+      enterprise: *enterprise_unverified
 
   gemini-3-pro-image-preview:
-    lifecycle: preview
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 65536, output_tokens: 32768}
-    content: {inputs: [text, image, document], outputs: [text, image]}
-    interactions:
-      store: true
-      response_format: false
-      thinking: {supported: true, levels: [low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: false
-      tools: {google_search: true, google_maps: false, code_execution: false, url_context: false, file_search: false}
-    pricing:
-      free_tier: false
-      excluded_features: []
-      input: [{up_to_tokens: null, price_per_million: 2.00}]
-      output: [{up_to_tokens: null, price_per_million: 12.00}]
-      image_output: [{up_to_tokens: null, price_per_million: 120.00}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: preview
+        limits: {input_tokens: 65536, output_tokens: 32768}
+        content: {inputs: [text, image, document], outputs: [text, image]}
+        interactions:
+          store: true
+          response_format: false
+          thinking: {supported: true, levels: [low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: false
+          tools: {google_search: true, google_maps: false, code_execution: false, url_context: false, file_search: false}
+        pricing:
+          free_tier: false
+          excluded_features: []
+          input: [{up_to_tokens: null, price_per_million: 2.00}]
+          output: [{up_to_tokens: null, price_per_million: 12.00}]
+          image_output: [{up_to_tokens: null, price_per_million: 120.00}]
+      enterprise: *enterprise_unverified
 
   gemini-2.5-pro:
-    lifecycle: stable
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [low, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search, google_maps]
-      input:
-        - {up_to_tokens: 200000, price_per_million: 1.25}
-        - {up_to_tokens: null, price_per_million: 2.50}
-      output:
-        - {up_to_tokens: 200000, price_per_million: 10.00}
-        - {up_to_tokens: null, price_per_million: 15.00}
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: stable
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [low, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search, google_maps]
+          input:
+            - {up_to_tokens: 200000, price_per_million: 1.25}
+            - {up_to_tokens: null, price_per_million: 2.50}
+          output:
+            - {up_to_tokens: 200000, price_per_million: 10.00}
+            - {up_to_tokens: null, price_per_million: 15.00}
+      enterprise: *enterprise_unverified
 
   gemini-2.5-flash:
-    lifecycle: stable
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search, google_maps]
-      input: [{up_to_tokens: null, price_per_million: 0.30}]
-      output: [{up_to_tokens: null, price_per_million: 2.50}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: stable
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search, google_maps]
+          input: [{up_to_tokens: null, price_per_million: 0.30}]
+          output: [{up_to_tokens: null, price_per_million: 2.50}]
+      enterprise: *enterprise_unverified
 
   gemini-2.5-flash-image:
-    lifecycle: stable
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 32768, output_tokens: 32768}
-    content: {inputs: [text, image], outputs: [text, image]}
-    interactions:
-      store: true
-      response_format: false
-      thinking: {supported: false, levels: [], summaries: false}
-      custom_function_calling: false
-      files: true
-      external_urls: false
-      tools: {google_search: false, google_maps: false, code_execution: false, url_context: false, file_search: false}
-    pricing:
-      free_tier: false
-      excluded_features: []
-      input: [{up_to_tokens: null, price_per_million: 0.30}]
-      output: [{up_to_tokens: null, price_per_million: 2.50}]
-      image_output: [{up_to_tokens: null, price_per_million: 30.00}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: stable
+        limits: {input_tokens: 32768, output_tokens: 32768}
+        content: {inputs: [text, image], outputs: [text, image]}
+        interactions:
+          store: true
+          response_format: false
+          thinking: {supported: false, levels: [], summaries: false}
+          custom_function_calling: false
+          files: true
+          external_urls: false
+          tools: {google_search: false, google_maps: false, code_execution: false, url_context: false, file_search: false}
+        pricing:
+          free_tier: false
+          excluded_features: []
+          input: [{up_to_tokens: null, price_per_million: 0.30}]
+          output: [{up_to_tokens: null, price_per_million: 2.50}]
+          image_output: [{up_to_tokens: null, price_per_million: 30.00}]
+      enterprise: *enterprise_unverified
 
   gemini-2.5-flash-lite:
-    lifecycle: stable
-    services: {developer: supported, enterprise: unverified}
-    limits: {input_tokens: 1048576, output_tokens: 65536}
-    content: {inputs: [text, image, video, audio, document], outputs: [text]}
-    interactions:
-      store: true
-      response_format: true
-      thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-      custom_function_calling: false
-      files: true
-      external_urls: true
-      tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-    pricing:
-      free_tier: true
-      excluded_features: [google_search]
-      input: [{up_to_tokens: null, price_per_million: 0.10}]
-      output: [{up_to_tokens: null, price_per_million: 0.40}]
+    services:
+      developer:
+        availability: supported
+        verified_at: "2026-07-14"
+        source_refs: *developer_source_refs
+        lifecycle: stable
+        limits: {input_tokens: 1048576, output_tokens: 65536}
+        content: {inputs: [text, image, video, audio, document], outputs: [text]}
+        interactions:
+          store: true
+          response_format: true
+          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
+          custom_function_calling: false
+          files: true
+          external_urls: true
+          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
+        pricing:
+          free_tier: true
+          excluded_features: [google_search]
+          input: [{up_to_tokens: null, price_per_million: 0.10}]
+          output: [{up_to_tokens: null, price_per_million: 0.40}]
+      enterprise: *enterprise_unverified

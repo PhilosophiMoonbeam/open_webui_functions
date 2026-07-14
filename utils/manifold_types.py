@@ -325,6 +325,7 @@ class Metadata(TypedDict):
     gemini_store_interactions: NotRequired[bool]
     gemini_effective_store: NotRequired[bool]
     gemini_endpoint_scope: NotRequired[str]
+    gemini_catalog_service: NotRequired[Literal["developer", "enterprise"]]
     cumulative_tokens: NotRequired[int | None]  # Added in `Pipe.pipe`
     cumulative_cost: NotRequired[float | None]  # Added in `Pipe.pipe`
 

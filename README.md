@@ -22,7 +22,7 @@ Gemini suite 3.0.0 integrates Open WebUI with the Google Gen AI SDK
 
 - `gemini_manifold.py` 3.0.0: Developer API `v1` pipe with catalog-gated Enterprise routing.
 - `gemini_manifold_companion.py` 3.0.0: request integration, durable grounding protocol 1,
-  citations, and catalog protocol 1.
+  citations, and service-qualified catalog protocol 2.
 - Reason 2.0.0, Maps 2.0.0, URL Context 1.0.0, Paid API 1.0.0, and Enterprise 1.0.0 toggles.
 - The immutable model catalog shipped in the same release.
 
@@ -32,9 +32,9 @@ manifest and checksums. The pipe and companion are not backward compatible with 
 [companion guide](docs/plugins/filters/gemini_manifold_companion.md), and
 [release procedure](docs/development/gemini-suite-release.md).
 
-The catalog currently marks all Enterprise model/service combinations `unverified`; the pipe
-therefore denies Enterprise generation before a network request. The Developer API is the
-deterministically validated supported surface; credentialed live evidence is tracked separately.
+The catalog keeps complete capabilities and pricing inside each service policy. Developer entries
+are audited; every Enterprise entry is capability-empty and `unverified`, so the pipe denies it
+before client creation. Deterministic transport tests are not Enterprise model-support evidence.
 
 ### Other plugins
 
