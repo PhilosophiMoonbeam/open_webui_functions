@@ -418,6 +418,18 @@ async def test_developer_request_snapshot_serializes_canonical_interactions_opti
         "body": request.model_dump(mode="json", exclude_none=True),
     }
     assert "safety_" + "settings" not in snapshot["body"]
+    assert all(
+        field not in snapshot["body"]
+        for field in (
+            "automatic_function_calling",
+            "automatic_function_calling_config",
+            "cached_content",
+            "batch",
+            "batch_api",
+            "batch_config",
+            "video_metadata",
+        )
+    )
     assert "secret-that-must-not-appear-in-snapshot" not in json.dumps(snapshot)
 
 

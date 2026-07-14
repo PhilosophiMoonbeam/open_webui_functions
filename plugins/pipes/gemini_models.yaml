@@ -1,288 +1,1201 @@
-# Gemini Interactions model policy catalog.
-# Protocol changes are breaking: both the pipe and companion require this version.
-schema_version: 2
+# Gemini Interactions model policy catalog. Protocol 3 is a strict breaking boundary.
+schema_version: 3
+provenance_sha256: 9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10
+freshness:
+  freshness_days: 30
+  retrieved_at: '2026-07-14'
+  expires_after: '2026-08-13'
 sources:
-  developer:
-    models: "https://ai.google.dev/gemini-api/docs/models"
-    interactions: "https://ai.google.dev/gemini-api/docs/interactions-overview"
-    function_calling: "https://ai.google.dev/gemini-api/docs/function-calling"
-    pricing: "https://ai.google.dev/gemini-api/docs/pricing"
-  enterprise: {}
-
-models:
+  developer_pricing:
+    kind: provider_developer_pricing
+    url: https://ai.google.dev/gemini-api/docs/pricing
+    section: Exact model Standard pricing tables
+    published_last_updated: '2026-07-09'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:df78b251d5b18fbfd4880ca56351bb1c88f62d710de85c8db653d24952453a7e
+    subject_model_ids: &id001
+    - gemini-3.5-flash
+    - gemini-3.1-pro-preview
+    - gemini-3.1-flash-lite
+    - gemini-3-flash-preview
+    - gemini-2.5-pro
+    - gemini-2.5-flash
+    - gemini-2.5-flash-lite
+    - gemini-3-pro-image
+    - gemini-3.1-flash-image
+  interactions_supported:
+    kind: provider_interactions_availability
+    url: https://ai.google.dev/gemini-api/docs/interactions-overview
+    section: Supported models & agents; exact Model ID column
+    published_last_updated: '2026-07-09'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a
+    subject_model_ids: *id001
+  model_gemini_2_5_flash:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash
+    section: gemini-2.5-flash property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:f1a199c5e4a59b6567743ecd4b26a02a95cdd8bd1f5b1a97926e328746458b65
+    subject_model_ids:
+    - gemini-2.5-flash
+  model_gemini_2_5_flash_lite:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite
+    section: gemini-2.5-flash-lite property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:b5a013b5ab4ca3bcf2e47eea3ec3d293e9f9af6bbe62e2537ffe09f441b052e4
+    subject_model_ids:
+    - gemini-2.5-flash-lite
+  model_gemini_2_5_pro:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro
+    section: gemini-2.5-pro property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:546e340fb46a1a378235413a17dc9fe35508ce4146c65edc007521054029c9e0
+    subject_model_ids:
+    - gemini-2.5-pro
+  model_gemini_3_1_flash_image:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-image
+    section: gemini-3.1-flash-image property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:57880128e11b6e9f3017eeb800dac2159c85d38c3d48ab6c93bce83a97e2ab82
+    subject_model_ids:
+    - gemini-3.1-flash-image
+  model_gemini_3_1_flash_lite:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite
+    section: gemini-3.1-flash-lite property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:3ada7b07847a43defcc3fb5c68e460c9256967845a241316e84510f86cace8fd
+    subject_model_ids:
+    - gemini-3.1-flash-lite
+  model_gemini_3_1_pro_preview:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview
+    section: gemini-3.1-pro-preview property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:37fda140d566ee32c1017a0e294f9012c891287bae42779b89a11d5129762cb8
+    subject_model_ids:
+    - gemini-3.1-pro-preview
+  model_gemini_3_5_flash:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash
+    section: gemini-3.5-flash property table and Versions
+    published_last_updated: '2026-06-24'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:7c0f39d99f7a0f30dd95c7902a2b008b32b71a2176cbe963e0b14d58d9ccc643
+    subject_model_ids:
+    - gemini-3.5-flash
+  model_gemini_3_flash_preview:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview
+    section: gemini-3-flash-preview property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:cc9160686215e90a856d5ac100c98da55ca5702add120d92acb88901fbfce6ae
+    subject_model_ids:
+    - gemini-3-flash-preview
+  model_gemini_3_pro_image:
+    kind: provider_model_properties
+    url: https://ai.google.dev/gemini-api/docs/models/gemini-3-pro-image
+    section: gemini-3-pro-image property table and Versions
+    published_last_updated: '2026-06-23'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:26957affc199ca888da0e97b7b90b4cbeef4dad6ae5e1f1ce5c9c7f02d12c1ae
+    subject_model_ids:
+    - gemini-3-pro-image
+  product_implementation:
+    kind: repository_implementation
+    url: plugins/pipes/gemini_manifold.py
+    section: typed catalog policy, request builder, media/files, tools, reducer, usage
+    published_last_updated: null
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:9894db3145b35b84916a2f6a2a26bcf9c417f4fa1b572d6333e6977c5c7cfd61
+  product_tests:
+    kind: repository_test_evidence
+    url: tests/test_gemini_manifold.py
+    section: catalog gates, request snapshots, media, tools, usage, public orchestration
+    published_last_updated: null
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:40dff60b8ae85afe50518b6c86c297c7edb7e9b384dc4299503c5ed6ffe9169c
+  thinking_controls:
+    kind: provider_interactions_thinking
+    url: https://ai.google.dev/gemini-api/docs/thinking
+    section: Controlling thinking; Model / Levels Supported table
+    published_last_updated: '2026-07-06'
+    retrieved_at: '2026-07-14'
+    content_digest: sha256:94f414c6982dfdda33ce753ffae394c5abbf9deb926f1cc4c6fce44676f641da
+    subject_model_ids: *id001
+evidence:
+  developer_pricing:
+    source: developer_pricing
+    content_digest: sha256:df78b251d5b18fbfd4880ca56351bb1c88f62d710de85c8db653d24952453a7e
+  interactions_supported:
+    source: interactions_supported
+    content_digest: sha256:8933f9dce5c3694b09f73a272e13786fcf8317e25ff7baf869037ba771de355a
+  model_gemini_2_5_flash:
+    source: model_gemini_2_5_flash
+    content_digest: sha256:f1a199c5e4a59b6567743ecd4b26a02a95cdd8bd1f5b1a97926e328746458b65
+  model_gemini_2_5_flash_lite:
+    source: model_gemini_2_5_flash_lite
+    content_digest: sha256:b5a013b5ab4ca3bcf2e47eea3ec3d293e9f9af6bbe62e2537ffe09f441b052e4
+  model_gemini_2_5_pro:
+    source: model_gemini_2_5_pro
+    content_digest: sha256:546e340fb46a1a378235413a17dc9fe35508ce4146c65edc007521054029c9e0
+  model_gemini_3_1_flash_image:
+    source: model_gemini_3_1_flash_image
+    content_digest: sha256:57880128e11b6e9f3017eeb800dac2159c85d38c3d48ab6c93bce83a97e2ab82
+  model_gemini_3_1_flash_lite:
+    source: model_gemini_3_1_flash_lite
+    content_digest: sha256:3ada7b07847a43defcc3fb5c68e460c9256967845a241316e84510f86cace8fd
+  model_gemini_3_1_pro_preview:
+    source: model_gemini_3_1_pro_preview
+    content_digest: sha256:37fda140d566ee32c1017a0e294f9012c891287bae42779b89a11d5129762cb8
+  model_gemini_3_5_flash:
+    source: model_gemini_3_5_flash
+    content_digest: sha256:7c0f39d99f7a0f30dd95c7902a2b008b32b71a2176cbe963e0b14d58d9ccc643
+  model_gemini_3_flash_preview:
+    source: model_gemini_3_flash_preview
+    content_digest: sha256:cc9160686215e90a856d5ac100c98da55ca5702add120d92acb88901fbfce6ae
+  model_gemini_3_pro_image:
+    source: model_gemini_3_pro_image
+    content_digest: sha256:26957affc199ca888da0e97b7b90b4cbeef4dad6ae5e1f1ce5c9c7f02d12c1ae
+  product_implementation:
+    source: product_implementation
+    content_digest: sha256:9894db3145b35b84916a2f6a2a26bcf9c417f4fa1b572d6333e6977c5c7cfd61
+  product_tests:
+    source: product_tests
+    content_digest: sha256:40dff60b8ae85afe50518b6c86c297c7edb7e9b384dc4299503c5ed6ffe9169c
+  thinking_controls:
+    source: thinking_controls
+    content_digest: sha256:94f414c6982dfdda33ce753ffae394c5abbf9deb926f1cc4c6fce44676f641da
+provider_claims:
   gemini-3.5-flash:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: &developer_source_refs [models, interactions, function_calling, pricing]
-        lifecycle: stable
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: true
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search, google_maps]
-          input: [{up_to_tokens: null, price_per_million: 1.50}]
-          output: [{up_to_tokens: null, price_per_million: 9.00}]
-      enterprise: &enterprise_unverified
-        availability: unverified
-        reason: "No credential-backed Enterprise Interactions model and capability evidence is recorded."
-
-  gemini-3.1-flash-lite:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: stable
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search]
-          input: [{up_to_tokens: null, price_per_million: 0.25}]
-          output: [{up_to_tokens: null, price_per_million: 1.50}]
-      enterprise: *enterprise_unverified
-
-  gemini-3.1-flash-lite-preview:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: preview
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search]
-          input: [{up_to_tokens: null, price_per_million: 0.25}]
-          output: [{up_to_tokens: null, price_per_million: 1.50}]
-      enterprise: *enterprise_unverified
-
-  gemini-3.1-flash-image-preview:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: preview
-        limits: {input_tokens: 131072, output_tokens: 32768}
-        content: {inputs: [text, image, document], outputs: [text, image]}
-        interactions:
-          store: true
-          response_format: false
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: false
-          tools: {google_search: true, google_maps: false, code_execution: false, url_context: false, file_search: false}
-        pricing:
-          free_tier: false
-          excluded_features: []
-          input: [{up_to_tokens: null, price_per_million: 0.25}]
-          output: [{up_to_tokens: null, price_per_million: 1.50}]
-          image_output: [{up_to_tokens: null, price_per_million: 60.00}]
-      enterprise: *enterprise_unverified
-
-  gemini-3-flash-preview:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: preview
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search]
-          input: [{up_to_tokens: null, price_per_million: 0.50}]
-          output: [{up_to_tokens: null, price_per_million: 3.00}]
-      enterprise: *enterprise_unverified
-
+    model_id: gemini-3.5-flash
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: stable
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      - document
+      outputs:
+      - text
+    thinking: &id002
+      supported: true
+      control: known
+      levels:
+      - minimal
+      - low
+      - medium
+      - high
+      summaries: true
+    pricing:
+      free_tier: true
+      excluded_features:
+      - google_search
+      - google_maps
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.5
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.5
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.5
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.5
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.15
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.15
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.15
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.15
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 9.0
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_3_5_flash
+      thinking: thinking_controls
+      pricing: developer_pricing
   gemini-3.1-pro-preview:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: preview
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: false
-          excluded_features: []
-          input:
-            - {up_to_tokens: 200000, price_per_million: 2.00}
-            - {up_to_tokens: null, price_per_million: 4.00}
-          output:
-            - {up_to_tokens: 200000, price_per_million: 12.00}
-            - {up_to_tokens: null, price_per_million: 18.00}
-      enterprise: *enterprise_unverified
-
-  gemini-3-pro-image-preview:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: preview
-        limits: {input_tokens: 65536, output_tokens: 32768}
-        content: {inputs: [text, image, document], outputs: [text, image]}
-        interactions:
-          store: true
-          response_format: false
-          thinking: {supported: true, levels: [low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: false
-          tools: {google_search: true, google_maps: false, code_execution: false, url_context: false, file_search: false}
-        pricing:
-          free_tier: false
-          excluded_features: []
-          input: [{up_to_tokens: null, price_per_million: 2.00}]
-          output: [{up_to_tokens: null, price_per_million: 12.00}]
-          image_output: [{up_to_tokens: null, price_per_million: 120.00}]
-      enterprise: *enterprise_unverified
-
+    model_id: gemini-3.1-pro-preview
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: preview
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      - document
+      outputs:
+      - text
+    thinking: &id003
+      supported: true
+      control: known
+      levels:
+      - low
+      - medium
+      - high
+      summaries: true
+    pricing:
+      free_tier: false
+      excluded_features:
+      - google_search
+      - google_maps
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 2.0
+          - up_to_prompt_tokens: null
+            price_per_million: 4.0
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 2.0
+          - up_to_prompt_tokens: null
+            price_per_million: 4.0
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 2.0
+          - up_to_prompt_tokens: null
+            price_per_million: 4.0
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 2.0
+          - up_to_prompt_tokens: null
+            price_per_million: 4.0
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.2
+          - up_to_prompt_tokens: null
+            price_per_million: 0.4
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.2
+          - up_to_prompt_tokens: null
+            price_per_million: 0.4
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.2
+          - up_to_prompt_tokens: null
+            price_per_million: 0.4
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.2
+          - up_to_prompt_tokens: null
+            price_per_million: 0.4
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 12.0
+          - up_to_prompt_tokens: null
+            price_per_million: 18.0
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_3_1_pro_preview
+      thinking: thinking_controls
+      pricing: developer_pricing
+  gemini-3.1-flash-lite:
+    model_id: gemini-3.1-flash-lite
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: stable
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      - document
+      outputs:
+      - text
+    thinking: &id004
+      supported: false
+      control: unknown
+      levels: []
+      summaries: false
+    pricing:
+      free_tier: true
+      excluded_features:
+      - google_search
+      - google_maps
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.5
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.025
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.025
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.025
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.05
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.5
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_3_1_flash_lite
+      thinking: thinking_controls
+      pricing: developer_pricing
+  gemini-3-flash-preview:
+    model_id: gemini-3-flash-preview
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: preview
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      - document
+      outputs:
+      - text
+    thinking: &id005
+      supported: true
+      control: known
+      levels:
+      - minimal
+      - low
+      - medium
+      - high
+      summaries: true
+    pricing:
+      free_tier: true
+      excluded_features:
+      - google_search
+      - google_maps
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.5
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.5
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.5
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.0
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.05
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.05
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.05
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.1
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 3.0
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_3_flash_preview
+      thinking: thinking_controls
+      pricing: developer_pricing
   gemini-2.5-pro:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: stable
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [low, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search, google_maps]
-          input:
-            - {up_to_tokens: 200000, price_per_million: 1.25}
-            - {up_to_tokens: null, price_per_million: 2.50}
-          output:
-            - {up_to_tokens: 200000, price_per_million: 10.00}
-            - {up_to_tokens: null, price_per_million: 15.00}
-      enterprise: *enterprise_unverified
-
+    model_id: gemini-2.5-pro
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: stable
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      - document
+      outputs:
+      - text
+    thinking: &id006
+      supported: true
+      control: known
+      levels:
+      - low
+      - medium
+      - high
+      summaries: true
+    pricing:
+      free_tier: true
+      excluded_features: []
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 1.25
+          - up_to_prompt_tokens: null
+            price_per_million: 2.5
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 1.25
+          - up_to_prompt_tokens: null
+            price_per_million: 2.5
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 1.25
+          - up_to_prompt_tokens: null
+            price_per_million: 2.5
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 1.25
+          - up_to_prompt_tokens: null
+            price_per_million: 2.5
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.125
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.125
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.125
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 0.125
+          - up_to_prompt_tokens: null
+            price_per_million: 0.25
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: 200000
+            price_per_million: 10.0
+          - up_to_prompt_tokens: null
+            price_per_million: 15.0
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_2_5_pro
+      thinking: thinking_controls
+      pricing: developer_pricing
   gemini-2.5-flash:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: stable
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: true, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search, google_maps]
-          input: [{up_to_tokens: null, price_per_million: 0.30}]
-          output: [{up_to_tokens: null, price_per_million: 2.50}]
-      enterprise: *enterprise_unverified
-
-  gemini-2.5-flash-image:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: stable
-        limits: {input_tokens: 32768, output_tokens: 32768}
-        content: {inputs: [text, image], outputs: [text, image]}
-        interactions:
-          store: true
-          response_format: false
-          thinking: {supported: false, levels: [], summaries: false}
-          custom_function_calling: false
-          files: true
-          external_urls: false
-          tools: {google_search: false, google_maps: false, code_execution: false, url_context: false, file_search: false}
-        pricing:
-          free_tier: false
-          excluded_features: []
-          input: [{up_to_tokens: null, price_per_million: 0.30}]
-          output: [{up_to_tokens: null, price_per_million: 2.50}]
-          image_output: [{up_to_tokens: null, price_per_million: 30.00}]
-      enterprise: *enterprise_unverified
-
+    model_id: gemini-2.5-flash
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: stable
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      outputs:
+      - text
+    thinking: &id007
+      supported: true
+      control: known
+      levels:
+      - low
+      - medium
+      - high
+      summaries: true
+    pricing:
+      free_tier: true
+      excluded_features: []
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.3
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.3
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.3
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 1.0
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.03
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.03
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.03
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.1
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 2.5
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_2_5_flash
+      thinking: thinking_controls
+      pricing: developer_pricing
   gemini-2.5-flash-lite:
-    services:
-      developer:
-        availability: supported
-        verified_at: "2026-07-14"
-        source_refs: *developer_source_refs
-        lifecycle: stable
-        limits: {input_tokens: 1048576, output_tokens: 65536}
-        content: {inputs: [text, image, video, audio, document], outputs: [text]}
-        interactions:
-          store: true
-          response_format: true
-          thinking: {supported: true, levels: [minimal, low, medium, high], summaries: true}
-          custom_function_calling: false
-          files: true
-          external_urls: true
-          tools: {google_search: true, google_maps: false, code_execution: true, url_context: true, file_search: false}
-        pricing:
-          free_tier: true
-          excluded_features: [google_search]
-          input: [{up_to_tokens: null, price_per_million: 0.10}]
-          output: [{up_to_tokens: null, price_per_million: 0.40}]
-      enterprise: *enterprise_unverified
+    model_id: gemini-2.5-flash-lite
+    availability: supported
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: true
+      code_execution: true
+      url_context: true
+      file_search: true
+    lifecycle: stable
+    limits:
+      input_tokens: 1048576
+      output_tokens: 65536
+    content:
+      inputs:
+      - text
+      - image
+      - video
+      - audio
+      - document
+      outputs:
+      - text
+    thinking: &id008
+      supported: true
+      control: known
+      levels:
+      - low
+      - medium
+      - high
+      summaries: true
+    pricing:
+      free_tier: true
+      excluded_features: []
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.1
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.1
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.1
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.3
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.01
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.01
+        video:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.01
+        audio:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.03
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.4
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_2_5_flash_lite
+      thinking: thinking_controls
+      pricing: developer_pricing
+  gemini-3-pro-image:
+    model_id: gemini-3-pro-image
+    availability: supported
+    capabilities:
+      function_calling: false
+      structured_outputs: true
+      thinking: true
+      google_search: true
+      google_maps: false
+      code_execution: false
+      url_context: false
+      file_search: false
+    lifecycle: stable
+    limits:
+      input_tokens: 65536
+      output_tokens: 32768
+    content:
+      inputs:
+      - text
+      - image
+      outputs:
+      - text
+      - image
+    thinking: &id009
+      supported: false
+      control: unknown
+      levels: []
+      summaries: false
+    pricing:
+      free_tier: false
+      excluded_features:
+      - google_search
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 2.0
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 2.0
+      cached_input:
+        text:
+          state: unpriced
+          reason: Cached-input pricing is not published for this model.
+        image:
+          state: unpriced
+          reason: Cached-input pricing is not published for this model.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 12.0
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 120.0
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_3_pro_image
+      thinking: thinking_controls
+      pricing: developer_pricing
+  gemini-3.1-flash-image:
+    model_id: gemini-3.1-flash-image
+    availability: supported
+    capabilities:
+      function_calling: false
+      structured_outputs: false
+      thinking: true
+      google_search: true
+      google_maps: false
+      code_execution: false
+      url_context: false
+      file_search: false
+    lifecycle: stable
+    limits:
+      input_tokens: 131072
+      output_tokens: 32768
+    content:
+      inputs:
+      - text
+      - image
+      - document
+      outputs:
+      - text
+      - image
+    thinking: &id010
+      supported: false
+      control: unknown
+      levels: []
+      summaries: false
+    pricing:
+      free_tier: false
+      excluded_features:
+      - google_search
+      threshold_basis: total_input_tokens_including_cached
+      input:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.5
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 0.5
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      cached_input:
+        text:
+          state: unpriced
+          reason: Cached-input pricing is not published for this model.
+        image:
+          state: unpriced
+          reason: Cached-input pricing is not published for this model.
+        document:
+          state: unpriced
+          reason: Exact document-token pricing is not published; cost remains unknown.
+      output:
+        text:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 3.0
+        image:
+          state: priced
+          tiers:
+          - up_to_prompt_tokens: null
+            price_per_million: 60.0
+    evidence:
+      availability: interactions_supported
+      properties: model_gemini_3_1_flash_image
+      thinking: thinking_controls
+      pricing: developer_pricing
+product_authorizations:
+  gemini-3.5-flash:
+    model_id: gemini-3.5-flash
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id002
+      custom_function_calling: true
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: true
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-3.1-pro-preview:
+    model_id: gemini-3.1-pro-preview
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id003
+      custom_function_calling: false
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: true
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-3.1-flash-lite:
+    model_id: gemini-3.1-flash-lite
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id004
+      custom_function_calling: false
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: false
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-3-flash-preview:
+    model_id: gemini-3-flash-preview
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id005
+      custom_function_calling: false
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: false
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-2.5-pro:
+    model_id: gemini-2.5-pro
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id006
+      custom_function_calling: false
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: true
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-2.5-flash:
+    model_id: gemini-2.5-flash
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id007
+      custom_function_calling: false
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: true
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-2.5-flash-lite:
+    model_id: gemini-2.5-flash-lite
+    discovery: allow
+    interactions:
+      store: true
+      response_format: true
+      thinking: *id008
+      custom_function_calling: false
+      files: true
+      external_urls: true
+      tools:
+        google_search: true
+        google_maps: false
+        code_execution: true
+        url_context: true
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-3-pro-image:
+    model_id: gemini-3-pro-image
+    discovery: allow
+    interactions:
+      store: true
+      response_format: false
+      thinking: *id009
+      custom_function_calling: false
+      files: true
+      external_urls: false
+      tools:
+        google_search: true
+        google_maps: false
+        code_execution: false
+        url_context: false
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests
+  gemini-3.1-flash-image:
+    model_id: gemini-3.1-flash-image
+    discovery: allow
+    interactions:
+      store: true
+      response_format: false
+      thinking: *id010
+      custom_function_calling: false
+      files: true
+      external_urls: false
+      tools:
+        google_search: true
+        google_maps: false
+        code_execution: false
+        url_context: false
+        file_search: false
+    evidence:
+    - product_implementation
+    - product_tests

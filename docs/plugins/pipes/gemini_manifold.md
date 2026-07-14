@@ -11,7 +11,7 @@ Authoritative references: [Interactions overview](https://ai.google.dev/gemini-a
 
 ## Required coordinated components
 
-Install pipe 3.0.0 with companion 3.0.0 and catalog protocol 2 from the same
+Install pipe 3.0.0 with companion 3.0.0 and catalog protocol 3 from the same
 `gemini-suite/v3.0.0` manifest. The pipe rejects a missing/wrong companion version and a missing or
 wrong catalog protocol. The Reason and Maps filters have breaking 2.0.0 feature keys; the old
 Vertex AI toggle is replaced by the Enterprise toggle.
@@ -23,7 +23,7 @@ https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.
 ```
 
 That prospective URL works only after the tag exists. Do not enable the release before the tag
-and catalog are reachable. An override must be immutable, reviewable, schema 2, and compatible
+and catalog are reachable. An override must be immutable, reviewable, schema 3, and compatible
 with both 3.0 components; mutable branch URLs are unsupported.
 
 ## Service support
@@ -52,6 +52,9 @@ nodes cannot contain capabilities or pricing. Supported request construction
 includes multimodal user content, Open WebUI files, YouTube URLs, PDFs, system instructions, JSON
 schema response format, and reasoning summaries. The Interactions API does not support custom safety
 configuration, so the suite exposes no valve, metadata field, request option, or payload key for it.
+Automatic function calling (AFC), explicit cached-content input, Batch API configuration, and video
+metadata are likewise outside this Interactions product contract and are rejected before provider
+access. Custom Open WebUI functions use the explicit bounded loop described below, never SDK AFC.
 
 Requestable server tools are Google Search, URL Context, Google Maps, and code execution. The
 reducer also recognizes file-search results, but no bundled service policy enables file-search
@@ -62,7 +65,9 @@ API call.
 
 Custom Open WebUI functions are deliberately narrower:
 
-- They require effective `store=true`; unary Open WebUI requests use unary Interaction rounds and
+- With effective `store=true`, rounds continue through the same-scope interaction ID. With
+  `store=false`, every round sends the complete validated signed Step ledger plus ordered function
+  results and never sends `previous_interaction_id`. Unary requests use unary Interaction rounds;
   streaming requests use SSE rounds with indexed `arguments_delta` assembly.
 - Only authorized request-local callables with object JSON schemas are exposed.
 - Direct frontend tools are rejected.
@@ -75,15 +80,26 @@ Custom Open WebUI functions are deliberately narrower:
 
 ## Continuation, storage, and privacy
 
-`STORE_INTERACTIONS` controls provider-side storage. Effective storage is monotonic: either the
-administrator or user can opt out, while a user cannot override an administrator opt-out.
-Temporary/local chats and background task requests always send `store=false`.
+`STORE_INTERACTIONS` controls future provider-side Interaction storage. Effective storage is
+monotonic: either the administrator or user can opt out, while a user cannot override an
+administrator opt-out. The pipe explicitly sends `store` on every request; temporary/local chats
+and Open WebUI task requests always send `store=false`. It never requests provider background
+execution. Per Google's [Interactions overview](https://ai.google.dev/gemini-api/docs/interactions-overview)
+(checked 2026-07-14), the provider default is `store=true`; stored Interactions are retained for
+55 days on paid projects and one day on free projects. Separately, the paid-project
+[AI Studio log setting](https://ai.google.dev/gemini-api/docs/logs-datasets) defaults to 55 days
+and offers 7, 14, 28, or 55 days; saved datasets do not expire with that log window. The valves
+permit or prevent future Interaction storage; they do not configure either retention setting or
+erase an existing object.
 
 For a persisted, unedited branch with matching endpoint identity, model, and stored completed
 Interaction, the next request may use `previous_interaction_id`. Both the parent and continuation
 request use `store=true`, as required by the service. When effective storage is false, the pipe
-uses exact signed replay instead of a previous ID. If Google returns not-found on the first
-continuation request, the pipe retries once with the exact local replay input.
+uses exact signed replay instead of a previous ID, including custom-function rounds in temporary,
+task and privacy-opt-out requests. `store=false` cannot be combined with provider background
+execution and cannot create an ID usable by a later `previous_interaction_id` request. If Google
+returns not-found for an expired or deleted previous ID on the first continuation request, the
+pipe retries once with the exact local replay input and current request configuration.
 
 Every assistant message also receives one local `gemini_interaction` envelope containing exact
 step payloads, status, usage, visible-content digest, grounding protocol, and endpoint-scope
@@ -97,8 +113,27 @@ exact only for supported 2.11 step/content variants. Unknown variants fail close
 not transactional across Open WebUI workers: duplicate suppression is process-local, and a crash
 between provider completion and local persistence can require regeneration.
 
-Deleting an Open WebUI chat does not invoke provider deletion. Google retention/account controls
-remain authoritative for stored Interactions and Files API objects.
+Changing model or service never reuses the prior Interaction ID. Local replay checks every prior
+model-output modality against the selected target's catalogued input modalities and fails before
+the provider request if any are incompatible. A provider Files URI is never replayed across a
+different endpoint identity. Local Open WebUI media references are reloaded through the Open WebUI
+Files API only after an owner-filtered lookup for the authenticated requesting user. Missing,
+foreign, or transplanted file IDs fail before storage access or a Gemini request; administrator
+role does not bypass this ownership rule. Do not transplant envelopes or file IDs between users,
+chats, or backups.
+
+Deleting an Open WebUI chat does not invoke provider deletion, and this pipe cannot promise
+provider erasure because Open WebUI exposes no portable chat-deletion callback to installed
+functions. A safe future integration could only best-effort delete a known ID created in the
+matching active endpoint scope; it must never accept an arbitrary or transplanted envelope ID.
+Provider deletion would not delete the local envelope, backups, or Files API objects. Those have
+independent lifecycles.
+
+`store=false` is not a general zero-data-retention promise. Google's
+[zero-data-retention documentation](https://ai.google.dev/gemini-api/docs/zdr) states that Search-
+and Maps-grounded data can be retained for 30 days. Files API objects have an independent lifecycle
+until explicit deletion or provider expiry. Disable incompatible tools and `USE_FILES_API`, and
+manage local Open WebUI records/backups, when those lifecycles are unsuitable.
 
 ## Reasoning, statuses, and failures
 

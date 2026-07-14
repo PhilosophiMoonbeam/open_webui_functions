@@ -9,7 +9,7 @@ is `gemini-suite/v3.0.0`.
 
 - Pipe and companion frontmatter/constants are 3.0.0 and the pipe requires companion 3.0.0.
 - `google-genai` is exactly 2.11.0 in plugin metadata, `pyproject.toml`, and `uv.lock`.
-- The grounding-envelope protocol is 1 and the model-catalog protocol is 2.
+- The grounding-envelope protocol is 1 and the model-catalog protocol is 3.
 - The companion catalog URL is the immutable suite-tag URL, never `master`.
 - Reason 2.0.0 emits `reasoning`; Maps 2.0.0 emits `google_maps`.
 - The Paid, URL Context, and Enterprise toggles are present in the same bundle.
@@ -41,8 +41,21 @@ creating/pushing the coordinated tag. It never publishes the GitHub draft or Com
 
 `plugins/pipes/gemini_models.yaml` is fail-closed policy, not a discovery cache. Every model and
 service/capability claim needs current authoritative evidence and a new immutable catalog/release
-hash. An override must use HTTP(S), schema 2, and immutable reviewed content. Mutable branch URLs,
+hash. An override must use HTTP(S), schema 3, and immutable reviewed content. Mutable branch URLs,
 uncatalogued models, and `unverified` services are denied.
+
+The dated, machine-readable provenance trust root for catalog protocol 3 is
+[`gemini-model-provenance-v1.yaml`](gemini-model-provenance-v1.yaml). It keeps exact Interactions
+availability, model properties, thinking controls, pricing, and product authorization as separate
+claims. The release manifest includes its byte digest, and the catalog repeats that digest so a
+catalog cannot be substituted independently of its reviewed evidence.
+
+The companion rejects duplicate and merge keys before YAML parsing, validates freshness and every
+evidence reference, and publishes one atomic app-state envelope containing the full validated
+catalog plus its canonical JSON digest. The Pipe independently revalidates the complete envelope
+and recomputes the digest before routing. Missing, expired, unknown, mismatched, or contradictory
+claims fail closed. Pricing is explicit per input/output modality and cached state; unknown document,
+tool-use, or cache prices remain visibly unpriced rather than being inferred as text or zero.
 
 The 3.0 companion URL is prospective until the coordinated tag is pushed. Before exposing traffic,
 verify that the raw tagged URL returns the manifest-hashed catalog. If staging requires an override,
@@ -93,4 +106,13 @@ continuation chain.
 Disable all Gemini functions and restore the prior complete suite backup. Never downgrade only the
 pipe or companion. Restore any prior catalog override with that suite, re-enable the old components,
 and start a new chat/branch if a v3 signed replay envelope cannot be consumed. Provider-stored
-Interactions are not deleted by rollback or local chat deletion.
+Interactions are not deleted by rollback or local chat deletion: installed functions receive no
+portable Open WebUI chat-deletion callback. Deletion would require a known ID created in the same
+endpoint scope and would not remove local envelopes/backups or Files API objects. As documented in
+Google's [Interactions overview](https://ai.google.dev/gemini-api/docs/interactions-overview)
+(checked 2026-07-14), paid stored Interaction objects currently retain for 55 days, free objects
+retain for one day, and `store=false` cannot use background execution or later previous-ID
+continuation. The separate paid-project [AI Studio log setting](https://ai.google.dev/gemini-api/docs/logs-datasets)
+offers 7, 14, 28, or 55 days and does not expire saved datasets. Google's
+[zero-data-retention documentation](https://ai.google.dev/gemini-api/docs/zdr) also records 30-day
+Search/Maps exceptions and an independent Files lifecycle until deletion or expiry.

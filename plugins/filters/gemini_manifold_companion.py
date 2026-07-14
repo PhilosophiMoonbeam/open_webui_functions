@@ -24,6 +24,7 @@ import sys
 import time
 import urllib.request
 from collections.abc import Awaitable, Callable
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 import aiohttp
@@ -44,7 +45,8 @@ if TYPE_CHECKING:
 log = logger.bind(auditable=False)
 
 DEFAULT_MODEL_CONFIG_PATH = "https://raw.githubusercontent.com/suurt8ll/open_webui_functions/gemini-suite/v3.0.0/plugins/pipes/gemini_models.yaml"
-MODEL_CATALOG_SCHEMA_VERSION = 2
+MODEL_CATALOG_SCHEMA_VERSION = 3
+MODEL_CATALOG_PROVENANCE_SHA256 = "9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"
 GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 
 # Default timeout for URL resolution
@@ -56,8 +58,91 @@ class ModelCatalogError(ValueError):
     """Raised when the remote model policy is unavailable or incompatible."""
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate keys and merge-key expansion."""
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if any(key.tag == "tag:yaml.org,2002:merge" for key, _ in node.value):
+            raise ModelCatalogError("YAML merge keys are forbidden in the model catalog")
+        super().flatten_mapping(node)
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ModelCatalogError(f"duplicate YAML key is forbidden: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 class _CatalogModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+CatalogContentKind = Literal["text", "image", "video", "audio", "document"]
+CatalogEvidenceKind = Literal[
+    "provider_interactions_availability",
+    "provider_interactions_feature",
+    "provider_model_lifecycle",
+    "provider_interactions_thinking",
+    "provider_developer_pricing",
+    "provider_lifecycle_changelog",
+    "provider_interactions_input_transport",
+    "provider_model_properties",
+    "repository_implementation",
+    "repository_test_evidence",
+]
+
+
+class CatalogFreshness(_CatalogModel):
+    freshness_days: int = Field(gt=0)
+    retrieved_at: date
+    expires_after: date
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "CatalogFreshness":
+        if self.expires_after != self.retrieved_at + timedelta(days=self.freshness_days):
+            raise ValueError("catalog expiry must equal retrieved_at plus freshness_days")
+        if self.retrieved_at > date.today():
+            raise ValueError("catalog retrieval date must not be in the future")
+        if date.today() > self.expires_after:
+            raise ValueError("catalog evidence is expired")
+        return self
+
+
+class CatalogSource(_CatalogModel):
+    kind: CatalogEvidenceKind
+    url: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+    published_last_updated: date | None
+    retrieved_at: date
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    subject_model_ids: frozenset[str] = Field(default_factory=frozenset)
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "CatalogSource":
+        if self.retrieved_at > date.today():
+            raise ValueError("source retrieval date must not be in the future")
+        if self.published_last_updated is not None:
+            if self.published_last_updated > self.retrieved_at:
+                raise ValueError("source publication date must not follow retrieval")
+        return self
+
+
+class CatalogEvidence(_CatalogModel):
+    source: str = Field(min_length=1)
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class CatalogLimits(_CatalogModel):
@@ -66,13 +151,14 @@ class CatalogLimits(_CatalogModel):
 
 
 class CatalogContent(_CatalogModel):
-    inputs: set[Literal["text", "image", "video", "audio", "document"]]
-    outputs: set[Literal["text", "image", "video", "audio", "document"]]
+    inputs: frozenset[CatalogContentKind]
+    outputs: frozenset[CatalogContentKind]
 
 
 class CatalogThinking(_CatalogModel):
     supported: bool
-    levels: set[Literal["minimal", "low", "medium", "high"]]
+    control: Literal["known", "unknown"]
+    levels: frozenset[Literal["minimal", "low", "medium", "high"]]
     summaries: bool
 
     @model_validator(mode="after")
@@ -81,6 +167,8 @@ class CatalogThinking(_CatalogModel):
             raise ValueError("thinking levels must be present exactly when thinking is supported")
         if self.summaries and not self.supported:
             raise ValueError("thinking summaries require thinking support")
+        if (self.control == "known") != self.supported:
+            raise ValueError("known thinking control must match supported controls")
         return self
 
 
@@ -103,36 +191,55 @@ class CatalogInteractions(_CatalogModel):
 
 
 class CatalogPriceTier(_CatalogModel):
-    up_to_tokens: int | None = Field(default=None, gt=0)
+    up_to_prompt_tokens: int | None = Field(default=None, gt=0)
     price_per_million: float = Field(ge=0)
+
+
+class CatalogPricedRate(_CatalogModel):
+    state: Literal["priced"]
+    tiers: tuple[CatalogPriceTier, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_tiers(self) -> "CatalogPricedRate":
+        thresholds = [tier.up_to_prompt_tokens for tier in self.tiers]
+        if thresholds[-1] is not None:
+            raise ValueError("priced rate must end with an unbounded tier")
+        bounded = [threshold for threshold in thresholds[:-1] if threshold is not None]
+        if len(bounded) != len(thresholds) - 1 or bounded != sorted(set(bounded)):
+            raise ValueError("pricing thresholds must be unique and ascending")
+        return self
+
+
+class CatalogUnpricedRate(_CatalogModel):
+    state: Literal["unpriced"]
+    reason: str = Field(min_length=1)
+
+
+CatalogRate = Annotated[
+    CatalogPricedRate | CatalogUnpricedRate,
+    Field(discriminator="state"),
+]
 
 
 class CatalogPricing(_CatalogModel):
     free_tier: bool
-    excluded_features: set[Literal["google_search", "google_maps"]]
-    input: list[CatalogPriceTier] = Field(min_length=1)
-    output: list[CatalogPriceTier] = Field(min_length=1)
-    image_output: list[CatalogPriceTier] | None = None
+    excluded_features: frozenset[Literal["google_search", "google_maps"]]
+    threshold_basis: Literal["total_input_tokens_including_cached"]
+    input: dict[CatalogContentKind, CatalogRate]
+    cached_input: dict[CatalogContentKind, CatalogRate]
+    output: dict[CatalogContentKind, CatalogRate]
 
     @model_validator(mode="after")
-    def validate_tiers(self) -> "CatalogPricing":
-        for name in ("input", "output", "image_output"):
-            tiers = getattr(self, name)
-            if tiers is None:
-                continue
-            thresholds = [tier.up_to_tokens for tier in tiers]
-            if thresholds[-1] is not None:
-                raise ValueError(f"{name} pricing must end with an unbounded tier")
-            bounded = [threshold for threshold in thresholds[:-1] if threshold is not None]
-            if len(bounded) != len(thresholds) - 1 or bounded != sorted(set(bounded)):
-                raise ValueError(f"{name} pricing thresholds must be unique and ascending")
+    def validate_modalities(self) -> "CatalogPricing":
+        if not self.input or not self.output:
+            raise ValueError("pricing must declare input and output modalities")
+        if set(self.cached_input) != set(self.input):
+            raise ValueError("cached pricing must cover every input modality")
         return self
 
 
 class CatalogSupportedService(_CatalogModel):
     availability: Literal["supported"]
-    verified_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    source_refs: set[str] = Field(min_length=1)
     lifecycle: Literal["stable", "preview"]
     limits: CatalogLimits
     content: CatalogContent
@@ -141,9 +248,10 @@ class CatalogSupportedService(_CatalogModel):
 
     @model_validator(mode="after")
     def validate_capability_dependencies(self) -> "CatalogSupportedService":
-        image_output = "image" in self.content.outputs
-        if image_output != (self.pricing.image_output is not None):
-            raise ValueError("image output requires image-output pricing, and vice versa")
+        if set(self.content.inputs) != set(self.pricing.input):
+            raise ValueError("input pricing must exactly cover authorized input modalities")
+        if set(self.content.outputs) != set(self.pricing.output):
+            raise ValueError("output pricing must exactly cover authorized output modalities")
         if self.interactions.external_urls and not self.interactions.tools.url_context:
             raise ValueError("external URL input requires the URL-context tool")
         return self
@@ -178,34 +286,190 @@ class CatalogModel(_CatalogModel):
         return self
 
 
-class CatalogSources(_CatalogModel):
-    developer: dict[str, str]
-    enterprise: dict[str, str]
+class CatalogClaimEvidence(_CatalogModel):
+    availability: str
+    properties: str
+    thinking: str
+    pricing: str
+
+
+class CatalogProviderCapabilities(_CatalogModel):
+    function_calling: bool
+    structured_outputs: bool
+    thinking: bool
+    google_search: bool
+    google_maps: bool
+    code_execution: bool
+    url_context: bool
+    file_search: bool
+
+
+class CatalogProviderClaim(_CatalogModel):
+    model_id: str
+    availability: Literal["supported"]
+    lifecycle: Literal["stable", "preview"]
+    limits: CatalogLimits
+    content: CatalogContent
+    capabilities: CatalogProviderCapabilities
+    thinking: CatalogThinking
+    pricing: CatalogPricing
+    evidence: CatalogClaimEvidence
+
+
+class CatalogProductAuthorization(_CatalogModel):
+    model_id: str
+    discovery: Literal["allow"]
+    interactions: CatalogInteractions
+    evidence: tuple[str, ...] = Field(min_length=1)
 
 
 class ModelCatalog(_CatalogModel):
-    schema_version: Literal[2]
-    sources: CatalogSources
-    models: dict[str, CatalogModel] = Field(min_length=1)
+    schema_version: Literal[3]
+    provenance_sha256: Literal["9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"]
+    freshness: CatalogFreshness
+    sources: dict[str, CatalogSource] = Field(min_length=1)
+    evidence: dict[str, CatalogEvidence] = Field(min_length=1)
+    provider_claims: dict[str, CatalogProviderClaim] = Field(min_length=1)
+    product_authorizations: dict[str, CatalogProductAuthorization] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_model_ids(self) -> "ModelCatalog":
-        invalid = [model_id for model_id in self.models if not model_id.startswith("gemini-")]
+    def validate_claims(self) -> "ModelCatalog":
+        if set(self.provider_claims) != set(self.product_authorizations):
+            raise ValueError("provider claims and product authorizations must have identical IDs")
+        invalid = [
+            model_id for model_id in self.provider_claims if not model_id.startswith("gemini-")
+        ]
         if invalid:
             raise ValueError(f"invalid Gemini model ids: {invalid}")
-        for model_id, model in self.models.items():
-            for service_name in ("developer", "enterprise"):
-                service = getattr(model.services, service_name)
-                if not isinstance(service, CatalogSupportedService):
-                    continue
-                available_refs = getattr(self.sources, service_name)
-                missing_refs = sorted(service.source_refs - available_refs.keys())
-                if missing_refs:
-                    raise ValueError(
-                        f"model '{model_id}' {service_name} policy references unknown sources: "
-                        f"{missing_refs}"
-                    )
+        expected_kinds: dict[str, CatalogEvidenceKind] = {
+            "availability": "provider_interactions_availability",
+            "properties": "provider_model_properties",
+            "thinking": "provider_interactions_thinking",
+            "pricing": "provider_developer_pricing",
+        }
+        for evidence_id, evidence in self.evidence.items():
+            source = self.sources.get(evidence.source)
+            if source is None:
+                raise ValueError(f"evidence '{evidence_id}' references an unknown source")
+            if evidence.content_digest != source.content_digest:
+                raise ValueError(f"evidence '{evidence_id}' digest mismatch")
+            if source.retrieved_at < self.freshness.retrieved_at:
+                raise ValueError(f"evidence '{evidence_id}' is stale")
+        for model_id, claim in self.provider_claims.items():
+            authorization = self.product_authorizations[model_id]
+            if claim.model_id != model_id or authorization.model_id != model_id:
+                raise ValueError("catalog keys and exact claim model IDs must match")
+            for field_name, expected_kind in expected_kinds.items():
+                evidence_id = getattr(claim.evidence, field_name)
+                evidence = self.evidence.get(evidence_id)
+                if evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown evidence")
+                source = self.sources[evidence.source]
+                if source.kind != expected_kind:
+                    raise ValueError(f"model '{model_id}' has wrong evidence kind for {field_name}")
+                if source.subject_model_ids and model_id not in source.subject_model_ids:
+                    raise ValueError(f"model '{model_id}' evidence has an exact-ID mismatch")
+            for evidence_id in authorization.evidence:
+                evidence = self.evidence.get(evidence_id)
+                if evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown product evidence")
+                if self.sources[evidence.source].kind not in {
+                    "repository_implementation",
+                    "repository_test_evidence",
+                }:
+                    raise ValueError(f"model '{model_id}' product evidence has wrong kind")
+            if authorization.interactions.thinking != claim.thinking:
+                raise ValueError("provider thinking and product authorization contradict")
+            tools = authorization.interactions.tools
+            capabilities = claim.capabilities
+            if claim.thinking.supported and not capabilities.thinking:
+                raise ValueError("thinking controls exceed provider capability")
+            if authorization.interactions.response_format and not capabilities.structured_outputs:
+                raise ValueError("product response format exceeds provider capability")
+            if (
+                authorization.interactions.custom_function_calling
+                and not capabilities.function_calling
+            ):
+                raise ValueError("product function calling exceeds provider capability")
+            for tool_name in (
+                "google_search",
+                "google_maps",
+                "code_execution",
+                "url_context",
+                "file_search",
+            ):
+                if getattr(tools, tool_name) and not getattr(capabilities, tool_name):
+                    raise ValueError(f"product {tool_name} exceeds provider capability")
+            if tools.file_search:
+                raise ValueError("file_search is not product-authorized")
+            if authorization.interactions.external_urls and not tools.url_context:
+                raise ValueError("external URL input requires URL context")
+            if authorization.interactions.files and not claim.content.inputs:
+                raise ValueError("files require an authorized input modality")
         return self
+
+    def runtime_models(self) -> dict[str, CatalogModel]:
+        unavailable = CatalogUnavailableService(
+            availability="unverified",
+            reason="No credential-backed Enterprise Interactions model and capability evidence is recorded.",
+        )
+        return {
+            model_id: CatalogModel(
+                services=CatalogServices(
+                    developer=CatalogSupportedService(
+                        availability="supported",
+                        lifecycle=claim.lifecycle,
+                        limits=claim.limits,
+                        content=claim.content,
+                        interactions=self.product_authorizations[model_id].interactions,
+                        pricing=claim.pricing,
+                    ),
+                    enterprise=unavailable,
+                )
+            )
+            for model_id, claim in self.provider_claims.items()
+        }
+
+
+def _canonicalize_catalog(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _canonicalize_catalog(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonicalize_catalog(item) for item in value), key=repr)
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_catalog(item) for item in value]
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def canonical_catalog_bytes(catalog: ModelCatalog) -> bytes:
+    normalized = _canonicalize_catalog(catalog.model_dump(mode="python", exclude_none=False))
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class CatalogAppStateEnvelope(_CatalogModel):
+    schema_version: Literal[3]
+    canonical_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    payload: ModelCatalog
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> "CatalogAppStateEnvelope":
+        expected = "sha256:" + hashlib.sha256(canonical_catalog_bytes(self.payload)).hexdigest()
+        if self.canonical_digest != expected:
+            raise ValueError("catalog canonical digest mismatch")
+        return self
+
+    @classmethod
+    def from_catalog(cls, catalog: ModelCatalog) -> "CatalogAppStateEnvelope":
+        digest = "sha256:" + hashlib.sha256(canonical_catalog_bytes(catalog)).hexdigest()
+        return cls(schema_version=3, canonical_digest=digest, payload=catalog)
 
 
 class GroundingTextBlock(_CatalogModel):
@@ -338,7 +602,7 @@ class EventEmitter:
                 except asyncio.CancelledError:
                     log.warning("Open WebUI event callback was cancelled; dropping the event.")
                 except Exception:
-                    log.exception("Error in EventEmitter background worker")
+                    log.error("Error in EventEmitter background worker")
 
             queue.task_done()
 
@@ -546,10 +810,16 @@ class Filter:
 
         # Load and store model configuration in app state
         log.debug("Loading model configuration...")
-        model_config = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
-        app_state._state["gemini_model_config"] = model_config
-        app_state._state["gemini_model_catalog_schema_version"] = MODEL_CATALOG_SCHEMA_VERSION
-        log.debug(f"Stored model config in app state with {len(model_config)} model(s).")
+        catalog_envelope = self._load_model_config(self.valves.MODEL_CONFIG_PATH)
+        if date.today() > catalog_envelope.payload.freshness.expires_after:
+            raise ModelCatalogError("Gemini model catalog evidence is expired")
+        app_state._state["gemini_model_catalog"] = catalog_envelope.model_dump(
+            mode="json", exclude_none=False
+        )
+        log.debug(
+            "Stored the atomic model-catalog envelope in app state with "
+            f"{len(catalog_envelope.payload.provider_claims)} model(s)."
+        )
 
         # Detect log level change inside self.valves
         if self.log_level != self.valves.LOG_LEVEL:
@@ -674,8 +944,8 @@ class Filter:
             if envelope.sources:
                 emitter.emit_status("This response was grounded with a Google tool", done=True)
             return body
-        except ValidationError as exc:
-            log.error(f"Invalid Gemini grounding envelope: {exc}")
+        except ValidationError:
+            log.error("Invalid Gemini grounding envelope.")
             emitter.emit_toast("Stored grounding metadata is invalid and was ignored.", "warning")
             return body
         finally:
@@ -817,22 +1087,22 @@ class Filter:
                     timeout=timeout,
                 ) as response:
                     final_url = str(response.url)
-                    log.debug(f"Resolved URL '{url}' to '{final_url}' after {attempt} retries")
+                    log.debug(f"Resolved a grounding URL after {attempt} retries.")
                     return final_url, True
-            except (TimeoutError, aiohttp.ClientError) as e:
+            except (TimeoutError, aiohttp.ClientError):
                 if attempt == max_retries:
                     log.error(
-                        f"Failed to resolve URL '{url}' after {max_retries + 1} attempts: {e}"
+                        f"Failed to resolve a grounding URL after {max_retries + 1} attempts."
                     )
                     return url, False
                 else:
                     delay = min(base_delay * (2**attempt), 10.0)
                     log.warning(
-                        f"Retry {attempt + 1}/{max_retries + 1} for URL '{url}': {e}. Waiting {delay:.1f}s..."
+                        f"Grounding URL retry {attempt + 1}/{max_retries + 1}; waiting {delay:.1f}s."
                     )
                     await asyncio.sleep(delay)
-            except Exception as e:
-                log.error(f"Unexpected error resolving URL '{url}': {e}")
+            except Exception:
+                log.error("Unexpected grounding URL resolution failure.")
                 return url, False
         return url, False
 
@@ -885,7 +1155,7 @@ class Filter:
 
     @staticmethod
     @functools.lru_cache(maxsize=1)
-    def _load_model_config(config_path: str) -> dict[str, dict[str, Any]]:
+    def _load_model_config(config_path: str) -> CatalogAppStateEnvelope:
         """Loads the model configuration from a URL.
 
         Uses LRU cache to avoid reloading the same configuration repeatedly.
@@ -896,29 +1166,22 @@ class Filter:
 
         try:
             if not (config_path.startswith("http://") or config_path.startswith("https://")):
-                raise ModelCatalogError(
-                    f"MODEL_CONFIG_PATH must be an HTTP(S) URL, got: {config_path}"
-                )
+                raise ModelCatalogError("MODEL_CONFIG_PATH must be an HTTP(S) URL.")
 
-            log.debug(f"Loading model configuration from: {config_path}")
+            log.debug("Loading the configured Gemini model catalog.")
             with urllib.request.urlopen(config_path, timeout=10) as response:
-                raw_config = yaml.safe_load(response.read())
+                raw_config = yaml.load(response.read(), Loader=_UniqueKeyLoader)
             catalog = ModelCatalog.model_validate(raw_config)
-            config = {
-                model_id: model.model_dump(mode="json")
-                for model_id, model in catalog.models.items()
-            }
+            envelope = CatalogAppStateEnvelope.from_catalog(catalog)
             log.success(
                 f"Loaded Gemini model catalog protocol {catalog.schema_version} "
-                f"with {len(config)} model(s)."
+                f"with {len(catalog.provider_claims)} model(s)."
             )
-            return config
+            return envelope
         except ModelCatalogError:
             raise
-        except Exception as e:
-            raise ModelCatalogError(
-                f"Gemini model catalog is unavailable or invalid at {config_path}: {e}"
-            ) from e
+        except Exception:
+            raise ModelCatalogError("Gemini model catalog is unavailable or invalid.") from None
 
     # endregion 1.3 Configuration loading
 
@@ -964,7 +1227,7 @@ class Filter:
         }
         path = capability_paths.get(capability)
         if path is None:
-            log.warning(f"Unknown catalog capability '{capability}' denied for '{model_id}'.")
+            log.warning("An unknown catalog capability was denied.")
             return False
         value: object = service_policy.get("interactions", {})
         for key in path:
@@ -973,7 +1236,7 @@ class Filter:
             value = value.get(key, False)
         result = value is True
 
-        log.debug(f"Model '{model_id}' capability '{capability}' check: {result}")
+        log.debug("Completed a catalog capability check.")
         return result
 
     # endregion 1.5 Model capability checks
@@ -1005,7 +1268,7 @@ class Filter:
             chat_control_params[key] = body[key]
 
         if custom_param_keys:
-            log.debug(f"Found and preserved custom chat control parameters: {custom_param_keys}")
+            log.debug("Found and preserved custom chat control parameters.")
 
         return chat_control_params
 
@@ -1199,10 +1462,10 @@ class Filter:
                     # Prepend with newline for readability
                     serialized_data_json = "\n" + json_string
 
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except Exception as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
+            except (TypeError, ValueError):
+                serialized_data_json = " - {Serialization Error}"
+            except Exception:
+                serialized_data_json = " - {Processing Error}"
 
         # Add the final JSON string (or error message) back into the record
         record["extra"]["_plugin_serialized_data"] = serialized_data_json

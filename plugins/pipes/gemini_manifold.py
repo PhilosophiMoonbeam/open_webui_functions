@@ -17,20 +17,19 @@ VERSION = "3.0.0"
 # Older versions might still work, but backward compatibility is not guaranteed
 # during the development of this personal use plugin.
 RECOMMENDED_COMPANION_VERSION = "3.0.0"
-MODEL_CATALOG_SCHEMA_VERSION = 2
+MODEL_CATALOG_SCHEMA_VERSION = 3
+MODEL_CATALOG_PROVENANCE_SHA256 = "9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"
 GROUNDING_ENVELOPE_PROTOCOL_VERSION = 1
 CATALOG_MODEL_IDS = frozenset(
     {
         "gemini-3.5-flash",
         "gemini-3.1-flash-lite",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3.1-flash-image-preview",
         "gemini-3-flash-preview",
         "gemini-3.1-pro-preview",
-        "gemini-3-pro-image-preview",
+        "gemini-3-pro-image",
+        "gemini-3.1-flash-image",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
-        "gemini-2.5-flash-image",
         "gemini-2.5-flash-lite",
     }
 )
@@ -50,7 +49,6 @@ ENTERPRISE_CATALOG_MODEL_IDS: frozenset[str] = frozenset()
 import asyncio
 import base64
 import copy
-import difflib
 import fnmatch
 import hashlib
 import io
@@ -67,7 +65,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from functools import cache
 from pathlib import Path
@@ -111,7 +109,6 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
-    RootModel,
     TypeAdapter,
     ValidationError,
     field_validator,
@@ -170,7 +167,7 @@ class PipeEventEmitter:
                     except asyncio.CancelledError:
                         log.warning("Open WebUI event callback was cancelled; dropping the event.")
                     except Exception:
-                        log.exception("Open WebUI event callback failed; dropping the event.")
+                        log.error("Open WebUI event callback failed; dropping the event.")
             finally:
                 self._queue.task_done()
 
@@ -614,19 +611,19 @@ class InteractionReducer:
         if isinstance(event, interaction_types.UnknownInteractionSSEEvent):
             raise InteractionExecutionError(
                 GenerationFailureKind.INTERACTION_ERROR,
-                f"Unknown Interaction event: {event.raw}",
+                "The provider returned an unknown Interaction event.",
             )
         if isinstance(event, interaction_types.InteractionCreatedEvent):
             return self._consume_interaction_header(event.interaction)
         if isinstance(event, interaction_types.InteractionStatusUpdate):
             return self._transition(str(event.status))
         if isinstance(event, interaction_types.ErrorEvent):
-            detail = (
-                event.error.message if event.error and event.error.message else "Interaction error"
-            )
             self.state.status = "failed"
             self.state.terminal = True
-            raise InteractionExecutionError(GenerationFailureKind.INTERACTION_ERROR, detail)
+            raise InteractionExecutionError(
+                GenerationFailureKind.INTERACTION_ERROR,
+                "The provider returned an Interaction error event.",
+            )
         if isinstance(event, interaction_types.StepStart):
             if event.index in self._step_payloads:
                 existing = self._step_payloads[event.index]
@@ -740,12 +737,13 @@ class InteractionReducer:
 
     def _emit_snapshot(self, index: int, step: InteractionStep) -> list[ReducerEmission]:
         if isinstance(step, interaction_types.UnknownStep):
-            raise self._protocol_error(f"Unknown Interaction step: {step.raw}")
+            raise self._protocol_error("The provider returned an unknown Interaction step.")
         emissions: list[ReducerEmission] = []
         if isinstance(step, interaction_types.ModelOutputStep):
             if step.error and step.error.message:
                 raise InteractionExecutionError(
-                    GenerationFailureKind.MODEL_OUTPUT_STATUS, step.error.message
+                    GenerationFailureKind.MODEL_OUTPUT_STATUS,
+                    "The provider returned a model-output error.",
                 )
             for content_index, content in enumerate(step.content or []):
                 emissions.extend(self._emit_content(index, content_index, content, "content"))
@@ -805,7 +803,7 @@ class InteractionReducer:
         channel: Literal["content", "reasoning"],
     ) -> list[ReducerEmission]:
         if isinstance(content, interaction_types.UnknownContent):
-            raise self._protocol_error(f"Unknown Interaction content: {content.raw}")
+            raise self._protocol_error("The provider returned unknown Interaction content.")
         if isinstance(content, interaction_types.TextContent):
             key = (step_index, f"{channel}:{content_index}")
             emitted = self._emitted_text.get(key, "")
@@ -825,7 +823,7 @@ class InteractionReducer:
         self, index: int, delta: interaction_types.StepDeltaData
     ) -> list[ReducerEmission]:
         if isinstance(delta, interaction_types.UnknownStepDeltaData):
-            raise self._protocol_error(f"Unknown Interaction delta: {delta.raw}")
+            raise self._protocol_error("The provider returned an unknown Interaction delta.")
         if isinstance(delta, interaction_types.TextDelta):
             channel: Literal["content", "reasoning"] = (
                 "reasoning" if self._step_types[index] == "thought" else "content"
@@ -955,13 +953,11 @@ class InteractionReducer:
                     if query not in envelope.queries:
                         envelope.queries.append(query)
                 if record.is_error:
-                    envelope.tool_errors.append(
-                        f"{record.tool} result for {record.call_id or f'step {step_index}'} failed"
-                    )
+                    envelope.tool_errors.append("A Gemini grounding tool returned an error.")
                 if record.tool == "url_context":
                     for status in record.statuses:
                         if status not in {"success"}:
-                            envelope.tool_errors.append(f"URL context returned status {status}")
+                            envelope.tool_errors.append("Gemini URL context could not open a URL.")
                 for place in record.places:
                     if place.id not in source_indexes:
                         source_indexes[place.id] = len(envelope.sources)
@@ -1238,7 +1234,7 @@ CatalogExcludedFeature = Literal["google_search", "google_maps"]
 
 
 class _PipeCatalogModel(BaseModel):
-    """Strict immutable protocol-2 record received through Open WebUI app state."""
+    """Strict immutable protocol-3 record received through Open WebUI app state."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -1255,6 +1251,7 @@ class CatalogContent(_PipeCatalogModel):
 
 class CatalogThinking(_PipeCatalogModel):
     supported: bool
+    control: Literal["known", "unknown"]
     levels: frozenset[CatalogThinkingLevel]
     summaries: bool
 
@@ -1264,6 +1261,8 @@ class CatalogThinking(_PipeCatalogModel):
             raise ValueError("thinking levels must be present exactly when thinking is supported")
         if self.summaries and not self.supported:
             raise ValueError("thinking summaries require thinking support")
+        if (self.control == "known") != self.supported:
+            raise ValueError("known thinking control must match supported controls")
         return self
 
 
@@ -1286,40 +1285,55 @@ class CatalogInteractions(_PipeCatalogModel):
 
 
 class CatalogPriceTier(_PipeCatalogModel):
-    up_to_tokens: int | None = Field(default=None, gt=0)
+    up_to_prompt_tokens: int | None = Field(default=None, gt=0)
     price_per_million: float = Field(ge=0)
+
+
+class CatalogPricedRate(_PipeCatalogModel):
+    state: Literal["priced"]
+    tiers: tuple[CatalogPriceTier, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_tiers(self) -> "CatalogPricedRate":
+        thresholds = [tier.up_to_prompt_tokens for tier in self.tiers]
+        if thresholds[-1] is not None:
+            raise ValueError("priced rate must end with an unbounded tier")
+        bounded = [threshold for threshold in thresholds[:-1] if threshold is not None]
+        if len(bounded) != len(thresholds) - 1 or bounded != sorted(set(bounded)):
+            raise ValueError("pricing thresholds must be unique and ascending")
+        return self
+
+
+class CatalogUnpricedRate(_PipeCatalogModel):
+    state: Literal["unpriced"]
+    reason: str = Field(min_length=1)
+
+
+CatalogRate = Annotated[
+    CatalogPricedRate | CatalogUnpricedRate,
+    Field(discriminator="state"),
+]
 
 
 class CatalogPricing(_PipeCatalogModel):
     free_tier: bool
     excluded_features: frozenset[CatalogExcludedFeature]
-    input: tuple[CatalogPriceTier, ...] = Field(min_length=1)
-    output: tuple[CatalogPriceTier, ...] = Field(min_length=1)
-    image_output: tuple[CatalogPriceTier, ...] | None = None
+    threshold_basis: Literal["total_input_tokens_including_cached"]
+    input: dict[CatalogContentKind, CatalogRate]
+    cached_input: dict[CatalogContentKind, CatalogRate]
+    output: dict[CatalogContentKind, CatalogRate]
 
     @model_validator(mode="after")
-    def validate_tiers(self) -> "CatalogPricing":
-        tier_groups: tuple[tuple[str, tuple[CatalogPriceTier, ...] | None], ...] = (
-            ("input", self.input),
-            ("output", self.output),
-            ("image_output", self.image_output),
-        )
-        for name, tiers in tier_groups:
-            if tiers is None:
-                continue
-            thresholds = [tier.up_to_tokens for tier in tiers]
-            if thresholds[-1] is not None:
-                raise ValueError(f"{name} pricing must end with an unbounded tier")
-            bounded = [threshold for threshold in thresholds[:-1] if threshold is not None]
-            if len(bounded) != len(thresholds) - 1 or bounded != sorted(set(bounded)):
-                raise ValueError(f"{name} pricing thresholds must be unique and ascending")
+    def validate_modalities(self) -> "CatalogPricing":
+        if not self.input or not self.output:
+            raise ValueError("pricing must declare input and output modalities")
+        if set(self.cached_input) != set(self.input):
+            raise ValueError("cached pricing must cover every input modality")
         return self
 
 
 class CatalogSupportedService(_PipeCatalogModel):
     availability: Literal["supported"]
-    verified_at: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
-    source_refs: frozenset[str] = Field(min_length=1)
     lifecycle: Literal["stable", "preview"]
     limits: CatalogLimits
     content: CatalogContent
@@ -1328,9 +1342,10 @@ class CatalogSupportedService(_PipeCatalogModel):
 
     @model_validator(mode="after")
     def validate_capability_dependencies(self) -> "CatalogSupportedService":
-        image_output = "image" in self.content.outputs
-        if image_output != (self.pricing.image_output is not None):
-            raise ValueError("image output requires image-output pricing, and vice versa")
+        if set(self.content.inputs) != set(self.pricing.input):
+            raise ValueError("input pricing must exactly cover authorized input modalities")
+        if set(self.content.outputs) != set(self.pricing.output):
+            raise ValueError("output pricing must exactly cover authorized output modalities")
         if self.interactions.external_urls and not self.interactions.tools.url_context:
             raise ValueError("external URL input requires the URL-context tool")
         return self
@@ -1368,14 +1383,240 @@ class CatalogModel(_PipeCatalogModel):
         return self
 
 
-class AppStateModelCatalog(RootModel[dict[str, CatalogModel]]):
-    """Validated Pipe-side view of the companion's protocol-2 model mapping."""
+class CatalogFreshness(_PipeCatalogModel):
+    freshness_days: int = Field(gt=0)
+    retrieved_at: date
+    expires_after: date
 
     @model_validator(mode="after")
-    def validate_model_ids(self) -> "AppStateModelCatalog":
-        invalid = [model_id for model_id in self.root if not model_id.startswith("gemini-")]
+    def validate_window(self) -> "CatalogFreshness":
+        if self.expires_after != self.retrieved_at + timedelta(days=self.freshness_days):
+            raise ValueError("catalog expiry must equal retrieved_at plus freshness_days")
+        if self.retrieved_at > date.today():
+            raise ValueError("catalog retrieval date must not be in the future")
+        if date.today() > self.expires_after:
+            raise ValueError("catalog evidence is expired")
+        return self
+
+
+CatalogEvidenceKind = Literal[
+    "provider_interactions_availability",
+    "provider_interactions_feature",
+    "provider_model_lifecycle",
+    "provider_interactions_thinking",
+    "provider_developer_pricing",
+    "provider_lifecycle_changelog",
+    "provider_interactions_input_transport",
+    "provider_model_properties",
+    "repository_implementation",
+    "repository_test_evidence",
+]
+
+
+class CatalogSource(_PipeCatalogModel):
+    kind: CatalogEvidenceKind
+    url: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+    published_last_updated: date | None
+    retrieved_at: date
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    subject_model_ids: frozenset[str] = Field(default_factory=frozenset)
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "CatalogSource":
+        if self.retrieved_at > date.today():
+            raise ValueError("source retrieval date must not be in the future")
+        if self.published_last_updated is not None:
+            if self.published_last_updated > self.retrieved_at:
+                raise ValueError("source publication date must not follow retrieval")
+        return self
+
+
+class CatalogEvidence(_PipeCatalogModel):
+    source: str = Field(min_length=1)
+    content_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+
+class CatalogClaimEvidence(_PipeCatalogModel):
+    availability: str
+    properties: str
+    thinking: str
+    pricing: str
+
+
+class CatalogProviderCapabilities(_PipeCatalogModel):
+    function_calling: bool
+    structured_outputs: bool
+    thinking: bool
+    google_search: bool
+    google_maps: bool
+    code_execution: bool
+    url_context: bool
+    file_search: bool
+
+
+class CatalogProviderClaim(_PipeCatalogModel):
+    model_id: str
+    availability: Literal["supported"]
+    lifecycle: Literal["stable", "preview"]
+    limits: CatalogLimits
+    content: CatalogContent
+    capabilities: CatalogProviderCapabilities
+    thinking: CatalogThinking
+    pricing: CatalogPricing
+    evidence: CatalogClaimEvidence
+
+
+class CatalogProductAuthorization(_PipeCatalogModel):
+    model_id: str
+    discovery: Literal["allow"]
+    interactions: CatalogInteractions
+    evidence: tuple[str, ...] = Field(min_length=1)
+
+
+class AppStateModelCatalog(_PipeCatalogModel):
+    schema_version: Literal[3]
+    provenance_sha256: Literal["9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"]
+    freshness: CatalogFreshness
+    sources: dict[str, CatalogSource] = Field(min_length=1)
+    evidence: dict[str, CatalogEvidence] = Field(min_length=1)
+    provider_claims: dict[str, CatalogProviderClaim] = Field(min_length=1)
+    product_authorizations: dict[str, CatalogProductAuthorization] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_claims(self) -> "AppStateModelCatalog":
+        if set(self.provider_claims) != set(self.product_authorizations):
+            raise ValueError("provider claims and product authorizations must have identical IDs")
+        invalid = [
+            model_id for model_id in self.provider_claims if not model_id.startswith("gemini-")
+        ]
         if invalid:
             raise ValueError(f"invalid Gemini model ids: {invalid}")
+        expected_kinds: dict[str, CatalogEvidenceKind] = {
+            "availability": "provider_interactions_availability",
+            "properties": "provider_model_properties",
+            "thinking": "provider_interactions_thinking",
+            "pricing": "provider_developer_pricing",
+        }
+        for evidence_id, evidence in self.evidence.items():
+            source = self.sources.get(evidence.source)
+            if source is None:
+                raise ValueError(f"evidence '{evidence_id}' references an unknown source")
+            if evidence.content_digest != source.content_digest:
+                raise ValueError(f"evidence '{evidence_id}' digest mismatch")
+            if source.retrieved_at < self.freshness.retrieved_at:
+                raise ValueError(f"evidence '{evidence_id}' is stale")
+        for model_id, claim in self.provider_claims.items():
+            authorization = self.product_authorizations.get(model_id)
+            if authorization is None:
+                raise ValueError("missing product authorization")
+            if claim.model_id != model_id or authorization.model_id != model_id:
+                raise ValueError("catalog keys and exact claim model IDs must match")
+            for field_name, expected_kind in expected_kinds.items():
+                evidence_id = getattr(claim.evidence, field_name)
+                evidence = self.evidence.get(evidence_id)
+                if evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown evidence")
+                source = self.sources[evidence.source]
+                if source.kind != expected_kind:
+                    raise ValueError(f"model '{model_id}' has wrong evidence kind for {field_name}")
+                if source.subject_model_ids and model_id not in source.subject_model_ids:
+                    raise ValueError(f"model '{model_id}' evidence has an exact-ID mismatch")
+            for evidence_id in authorization.evidence:
+                evidence = self.evidence.get(evidence_id)
+                if evidence is None:
+                    raise ValueError(f"model '{model_id}' references unknown product evidence")
+                if self.sources[evidence.source].kind not in {
+                    "repository_implementation",
+                    "repository_test_evidence",
+                }:
+                    raise ValueError(f"model '{model_id}' product evidence has wrong kind")
+            if authorization.interactions.thinking != claim.thinking:
+                raise ValueError("provider thinking and product authorization contradict")
+            if authorization.interactions.tools.file_search:
+                raise ValueError("file_search is not product-authorized")
+            tools = authorization.interactions.tools
+            capabilities = claim.capabilities
+            if claim.thinking.supported and not capabilities.thinking:
+                raise ValueError("thinking controls exceed provider capability")
+            if authorization.interactions.response_format and not capabilities.structured_outputs:
+                raise ValueError("product response format exceeds provider capability")
+            if (
+                authorization.interactions.custom_function_calling
+                and not capabilities.function_calling
+            ):
+                raise ValueError("product function calling exceeds provider capability")
+            for tool_name in (
+                "google_search",
+                "google_maps",
+                "code_execution",
+                "url_context",
+                "file_search",
+            ):
+                if getattr(tools, tool_name) and not getattr(capabilities, tool_name):
+                    raise ValueError(f"product {tool_name} exceeds provider capability")
+            if authorization.interactions.external_urls and not tools.url_context:
+                raise ValueError("external URL input requires URL context")
+            if authorization.interactions.files and not claim.content.inputs:
+                raise ValueError("files require an authorized input modality")
+        return self
+
+    def runtime_models(self) -> dict[str, CatalogModel]:
+        unavailable = CatalogUnavailableService(
+            availability="unverified",
+            reason="No credential-backed Enterprise Interactions model and capability evidence is recorded.",
+        )
+        return {
+            model_id: CatalogModel(
+                services=CatalogServices(
+                    developer=CatalogSupportedService(
+                        availability="supported",
+                        lifecycle=claim.lifecycle,
+                        limits=claim.limits,
+                        content=claim.content,
+                        interactions=self.product_authorizations[model_id].interactions,
+                        pricing=claim.pricing,
+                    ),
+                    enterprise=unavailable,
+                )
+            )
+            for model_id, claim in self.provider_claims.items()
+        }
+
+
+def _canonicalize_catalog(value: object) -> object:
+    if isinstance(value, dict):
+        return {str(key): _canonicalize_catalog(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonicalize_catalog(item) for item in value), key=repr)
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_catalog(item) for item in value]
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def canonical_catalog_bytes(catalog: AppStateModelCatalog) -> bytes:
+    normalized = _canonicalize_catalog(catalog.model_dump(mode="python", exclude_none=False))
+    return json.dumps(
+        normalized,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+class CatalogAppStateEnvelope(_PipeCatalogModel):
+    schema_version: Literal[3]
+    canonical_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    payload: AppStateModelCatalog
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> "CatalogAppStateEnvelope":
+        expected = "sha256:" + hashlib.sha256(canonical_catalog_bytes(self.payload)).hexdigest()
+        if self.canonical_digest != expected:
+            raise ValueError("catalog canonical digest mismatch")
         return self
 
 
@@ -1436,6 +1677,18 @@ class ContentBuildError(Exception):
 
 class ForeignEndpointReplayError(ValueError):
     """Raised when persisted provider media belongs to another endpoint identity."""
+
+    pass
+
+
+class IncompatibleReplayModalityError(ValueError):
+    """Raised when a target model cannot accept a persisted output modality."""
+
+    pass
+
+
+class LocalFileAccessError(Exception):
+    """Raised when an Open WebUI file is not owned by the requesting user."""
 
     pass
 
@@ -1553,8 +1806,8 @@ class GeminiPDFProcessor:
     def _open_pdf(pikepdf: Any, file_bytes: bytes) -> Any:
         try:
             return pikepdf.open(io.BytesIO(file_bytes))
-        except Exception as e:
-            raise PDFProcessingError(f"Could not open PDF for processing: {e}") from e
+        except Exception:
+            raise PDFProcessingError("Could not open PDF for processing.") from None
 
     def _count_pages(self, pikepdf: Any, file_bytes: bytes) -> int:
         with self._open_pdf(pikepdf, file_bytes) as pdf:
@@ -1564,8 +1817,8 @@ class GeminiPDFProcessor:
     def _open_pdf_path(pikepdf: Any, file_path: str) -> Any:
         try:
             return pikepdf.open(file_path)
-        except Exception as e:
-            raise PDFProcessingError(f"Could not open PDF for processing: {e}") from e
+        except Exception:
+            raise PDFProcessingError("Could not open PDF for processing.") from None
 
     def _count_pages_from_path(self, pikepdf: Any, file_path: str) -> int:
         with self._open_pdf_path(pikepdf, file_path) as pdf:
@@ -1940,8 +2193,7 @@ class FilesAPIManager:
         file_cache_key = self._get_file_cache_key(content_hash)
         cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
-            log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
-            log.debug(f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately.")
+            log.debug("File cache hit; returning the active file.")
             return cached_file
 
         # On cache miss, acquire a lock specific to this file's content to prevent race conditions.
@@ -1949,10 +2201,7 @@ class FilesAPIManager:
         lock_key = self._get_lock_key(content_hash)
         lock = self.upload_locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked():
-            log.debug(
-                f"Lock for key {lock_key} is held by another task. "
-                f"This call will now wait for the lock to be released."
-            )
+            log.debug("A file upload for this cache entry is already active; waiting.")
 
         async with lock:
             # Step 2.5: Double-Checked Locking
@@ -1960,30 +2209,22 @@ class FilesAPIManager:
             # completed the upload while we were waiting for the lock.
             cached_file = await self.file_cache.get(file_cache_key)
             if cached_file:
-                log.debug(
-                    f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
-                )
+                log.debug("File cache hit after acquiring the upload lock.")
                 return cached_file
 
             # Step 3: The Warm/Cold Path (On Cache Miss)
             # The file ID (name after "files/") must be <= 40 chars.
             # "owui-" (5) + hash (16) + "-" (1) + hash (16) = 38 chars.
             deterministic_name = f"files/owui-{self.api_key_hash}-{content_hash}"
-            log.debug(
-                f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
-            )
+            log.debug("File cache miss; attempting stateless recovery.")
 
             try:
                 # Attempt to get the file (Warm Path)
                 file = await self.client.aio.files.get(name=deterministic_name)
                 if not file.name:
-                    raise FilesAPIError(
-                        f"Stateless recovery for {deterministic_name} returned a file without a name."
-                    )
+                    raise FilesAPIError("Gemini Files API recovery returned an invalid file.")
 
-                log.debug(
-                    f"Stateless recovery successful for {deterministic_name}. File exists on server."
-                )
+                log.debug("Stateless file recovery succeeded.")
                 active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
                 ttl_seconds = self._calculate_ttl(active_file.expiration_time)
@@ -1996,9 +2237,7 @@ class FilesAPIManager:
                 # We treat 403 as the "not found" signal for our warm path and
                 # include 404 for forward compatibility.
                 if e.code == 403 or e.code == 404:
-                    log.info(
-                        f"File {deterministic_name} not found on server (received {e.code}). Proceeding to upload."
-                    )
+                    log.info(f"File was not found on the server (status={e.code}); uploading.")
                     # Proceed to upload (Cold Path)
                     return await self._upload_and_process_file(
                         content_hash,
@@ -2009,27 +2248,19 @@ class FilesAPIManager:
                         status_queue,
                     )
                 else:
-                    log.exception(
-                        f"An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}."
-                    )
+                    log.error(f"File recovery was rejected (status={e.code}).")
                     self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
                         "error",
                     )
-                    raise FilesAPIError(
-                        f"Failed to check file status for {deterministic_name}: {e}"
-                    ) from e
-            except Exception as e:
-                log.exception(
-                    f"An unexpected error occurred during stateless recovery for {deterministic_name}."
-                )
+                    raise FilesAPIError("Gemini Files API recovery failed.") from None
+            except Exception:
+                log.error("Unexpected stateless file-recovery failure.")
                 self.event_emitter.emit_toast(
                     "Unexpected error retrieving a file. Please try again.",
                     "error",
                 )
-                raise FilesAPIError(
-                    f"Failed to check file status for {deterministic_name}: {e}"
-                ) from e
+                raise FilesAPIError("Gemini Files API recovery failed.") from None
             finally:
                 # Clean up the lock from the dictionary once processing is complete
                 # for this hash, preventing memory growth over time.
@@ -2051,13 +2282,11 @@ class FilesAPIManager:
             # an OWUI file ID to its content hash is constant.
             cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
             if cached_hash:
-                log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
+                log.trace("Open WebUI file hash cache hit.")
                 return cached_hash
 
         # If not in cache or if file is anonymous, compute the fast hash.
-        log.trace(
-            f"Hash cache MISS for OWUI ID {owui_file_id if owui_file_id else 'N/A'}. Computing hash."
-        )
+        log.trace("Open WebUI file hash cache miss; computing content hash.")
         content_hash = xxhash.xxh64(file_bytes).hexdigest()
 
         # If there was an ID, store the newly computed hash for next time.
@@ -2078,41 +2307,29 @@ class FilesAPIManager:
         file_cache_key = self._get_file_cache_key(content_hash)
         cached_file: types.File | None = await self.file_cache.get(file_cache_key)
         if cached_file:
-            log_id = f"OWUI ID: {owui_file_id}" if owui_file_id else "anonymous file"
-            log.debug(f"Cache HIT for file hash {content_hash} ({log_id}). Returning immediately.")
+            log.debug("File cache hit; returning the active file.")
             return cached_file
 
         lock_key = self._get_lock_key(content_hash)
         lock = self.upload_locks.setdefault(lock_key, asyncio.Lock())
         if lock.locked():
-            log.debug(
-                f"Lock for key {lock_key} is held by another task. "
-                f"This call will now wait for the lock to be released."
-            )
+            log.debug("A file upload for this cache entry is already active; waiting.")
 
         async with lock:
             cached_file = await self.file_cache.get(file_cache_key)
             if cached_file:
-                log.debug(
-                    f"Cache HIT for file hash {content_hash} after acquiring lock. Returning."
-                )
+                log.debug("File cache hit after acquiring the upload lock.")
                 return cached_file
 
             deterministic_name = f"files/owui-{self.api_key_hash}-{content_hash}"
-            log.debug(
-                f"Cache MISS for hash {content_hash}. Attempting stateless recovery with GET: {deterministic_name}"
-            )
+            log.debug("File cache miss; attempting stateless recovery.")
 
             try:
                 file = await self.client.aio.files.get(name=deterministic_name)
                 if not file.name:
-                    raise FilesAPIError(
-                        f"Stateless recovery for {deterministic_name} returned a file without a name."
-                    )
+                    raise FilesAPIError("Gemini Files API recovery returned an invalid file.")
 
-                log.debug(
-                    f"Stateless recovery successful for {deterministic_name}. File exists on server."
-                )
+                log.debug("Stateless file recovery succeeded.")
                 active_file = await self._poll_for_active_state(file.name, owui_file_id)
 
                 ttl_seconds = self._calculate_ttl(active_file.expiration_time)
@@ -2121,9 +2338,7 @@ class FilesAPIManager:
                 return active_file
             except genai_errors.ClientError as e:
                 if e.code == 403 or e.code == 404:
-                    log.info(
-                        f"File {deterministic_name} not found on server (received {e.code}). Proceeding to upload."
-                    )
+                    log.info(f"File was not found on the server (status={e.code}); uploading.")
                     return await self._upload_and_process_file_from_path(
                         content_hash,
                         file_path,
@@ -2133,27 +2348,19 @@ class FilesAPIManager:
                         status_queue,
                     )
                 else:
-                    log.exception(
-                        f"An unhandled client error (code: {e.code}) occurred during stateless recovery for {deterministic_name}."
-                    )
+                    log.error(f"File recovery was rejected (status={e.code}).")
                     self.event_emitter.emit_toast(
                         f"API error for file: {e.code}. Please check permissions.",
                         "error",
                     )
-                    raise FilesAPIError(
-                        f"Failed to check file status for {deterministic_name}: {e}"
-                    ) from e
-            except Exception as e:
-                log.exception(
-                    f"An unexpected error occurred during stateless recovery for {deterministic_name}."
-                )
+                    raise FilesAPIError("Gemini Files API recovery failed.") from None
+            except Exception:
+                log.error("Unexpected stateless file-recovery failure.")
                 self.event_emitter.emit_toast(
                     "Unexpected error retrieving a file. Please try again.",
                     "error",
                 )
-                raise FilesAPIError(
-                    f"Failed to check file status for {deterministic_name}: {e}"
-                ) from e
+                raise FilesAPIError("Gemini Files API recovery failed.") from None
             finally:
                 if lock_key in self.upload_locks:
                     del self.upload_locks[lock_key]
@@ -2162,12 +2369,10 @@ class FilesAPIManager:
         if owui_file_id:
             cached_hash: str | None = await self.id_hash_cache.get(owui_file_id)
             if cached_hash:
-                log.trace(f"Hash cache HIT for OWUI ID {owui_file_id}.")
+                log.trace("Open WebUI file hash cache hit.")
                 return cached_hash
 
-        log.trace(
-            f"Hash cache MISS for OWUI ID {owui_file_id if owui_file_id else 'N/A'}. Computing hash from path."
-        )
+        log.trace("Open WebUI file hash cache miss; hashing local content.")
         content_hash = await asyncio.to_thread(self._hash_file_path, file_path)
 
         if owui_file_id:
@@ -2204,7 +2409,7 @@ class FilesAPIManager:
         ttl_seconds = self._calculate_ttl(active_file.expiration_time)
         file_cache_key = self._get_file_cache_key(content_hash)
         await self.file_cache.set(file_cache_key, active_file, ttl=ttl_seconds)
-        log.debug(f"Cached file object for hash {content_hash} with TTL: {ttl_seconds}s.")
+        log.debug(f"Cached an active file with TTL {ttl_seconds}s.")
 
     async def _recover_after_upload_conflict(
         self,
@@ -2223,15 +2428,12 @@ class FilesAPIManager:
         conflict as an idempotent success path by fetching the existing object,
         allowing a short retry window for service-side consistency.
         """
-        log.info(f"Upload conflict for {deterministic_name}; attempting to reuse existing file.")
-        last_error: Exception | None = None
+        log.info("File upload conflict detected; attempting idempotent recovery.")
         for attempt in range(1, attempts + 1):
             try:
                 file = await self.client.aio.files.get(name=deterministic_name)
                 if not file.name:
-                    raise FilesAPIError(
-                        f"Conflict recovery for {deterministic_name} returned a file without a name."
-                    )
+                    raise FilesAPIError("Gemini Files API recovery returned an invalid file.")
 
                 if file.state == types.FileState.ACTIVE:
                     active_file = file
@@ -2242,19 +2444,13 @@ class FilesAPIManager:
                 return active_file
             except FilesAPIError:
                 raise
-            except Exception as e:
-                last_error = e
+            except Exception:
                 if attempt == attempts:
                     break
-                log.debug(
-                    f"Conflict recovery GET for {deterministic_name} failed "
-                    f"on attempt {attempt}/{attempts}; retrying."
-                )
+                log.debug(f"File conflict recovery attempt {attempt}/{attempts} failed; retrying.")
                 await asyncio.sleep(retry_delay)
 
-        raise FilesAPIError(
-            f"Upload conflict recovery failed for {deterministic_name}: {last_error}"
-        ) from last_error
+        raise FilesAPIError("Gemini Files API conflict recovery failed.") from None
 
     async def _upload_and_process_file(
         self,
@@ -2271,31 +2467,27 @@ class FilesAPIManager:
         if status_queue:
             await status_queue.put(("REGISTER_UPLOAD",))
 
-        log.info(f"Starting upload for {deterministic_name}...")
+        log.info("Starting a Gemini Files API upload.")
 
         try:
             file_io = io.BytesIO(file_bytes)
             upload_config = types.UploadFileConfig(name=deterministic_name, mime_type=mime_type)
             uploaded_file = await self.client.aio.files.upload(file=file_io, config=upload_config)
             if not uploaded_file.name:
-                raise FilesAPIError(
-                    f"File upload for {deterministic_name} did not return a file name."
-                )
+                raise FilesAPIError("Gemini Files API upload returned an invalid file.")
 
-            log.debug(f"{uploaded_file.name} uploaded.")
+            log.debug("File upload completed.")
             log.trace("Uploaded file details omitted from logs.")
 
             # Check if the file is already active. If so, we can skip polling.
             if uploaded_file.state == types.FileState.ACTIVE:
-                log.debug(f"File {uploaded_file.name} is already ACTIVE. Skipping poll.")
+                log.debug("Uploaded file is already ACTIVE; skipping polling.")
                 active_file = uploaded_file
             else:
                 # If not active, proceed with the original polling logic.
-                log.debug(
-                    f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
-                )
+                log.debug("Uploaded file requires ACTIVE-state polling.")
                 active_file = await self._poll_for_active_state(uploaded_file.name, owui_file_id)
-                log.debug(f"File {active_file.name} is now ACTIVE.")
+                log.debug("Uploaded file is now ACTIVE.")
 
             await self._cache_active_file(content_hash, active_file)
 
@@ -2305,19 +2497,19 @@ class FilesAPIManager:
                 return await self._recover_after_upload_conflict(
                     content_hash, deterministic_name, owui_file_id
                 )
-            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            log.error("File upload or processing failed.")
             self.event_emitter.emit_toast(
                 "Upload failed for a file. Please check connection and try again.",
                 "error",
             )
-            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
-        except Exception as e:
-            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            raise FilesAPIError("Gemini Files API upload failed.") from None
+        except Exception:
+            log.error("File upload or processing failed.")
             self.event_emitter.emit_toast(
                 "Upload failed for a file. Please check connection and try again.",
                 "error",
             )
-            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+            raise FilesAPIError("Gemini Files API upload failed.") from None
         finally:
             # Report completion (success or failure) to the status manager.
             # This ensures the progress counter always advances.
@@ -2338,7 +2530,7 @@ class FilesAPIManager:
         if status_queue:
             await status_queue.put(("REGISTER_UPLOAD",))
 
-        log.info(f"Starting upload for {deterministic_name} from local path...")
+        log.info("Starting a Gemini Files API upload from local storage.")
 
         try:
             upload_config = types.UploadFileConfig(name=deterministic_name, mime_type=mime_type)
@@ -2347,22 +2539,18 @@ class FilesAPIManager:
                     file=file_io, config=upload_config
                 )
             if not uploaded_file.name:
-                raise FilesAPIError(
-                    f"File upload for {deterministic_name} did not return a file name."
-                )
+                raise FilesAPIError("Gemini Files API upload returned an invalid file.")
 
-            log.debug(f"{uploaded_file.name} uploaded.")
+            log.debug("File upload completed.")
             log.trace("Uploaded file details omitted from logs.")
 
             if uploaded_file.state == types.FileState.ACTIVE:
-                log.debug(f"File {uploaded_file.name} is already ACTIVE. Skipping poll.")
+                log.debug("Uploaded file is already ACTIVE; skipping polling.")
                 active_file = uploaded_file
             else:
-                log.debug(
-                    f"{uploaded_file.name} uploaded with state {uploaded_file.state}. Polling for ACTIVE state."
-                )
+                log.debug("Uploaded file requires ACTIVE-state polling.")
                 active_file = await self._poll_for_active_state(uploaded_file.name, owui_file_id)
-                log.debug(f"File {active_file.name} is now ACTIVE.")
+                log.debug("Uploaded file is now ACTIVE.")
 
             await self._cache_active_file(content_hash, active_file)
 
@@ -2372,19 +2560,19 @@ class FilesAPIManager:
                 return await self._recover_after_upload_conflict(
                     content_hash, deterministic_name, owui_file_id
                 )
-            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            log.error("File upload or processing failed.")
             self.event_emitter.emit_toast(
                 "Upload failed for a file. Please check connection and try again.",
                 "error",
             )
-            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
-        except Exception as e:
-            log.exception(f"File upload or processing failed for {deterministic_name}.")
+            raise FilesAPIError("Gemini Files API upload failed.") from None
+        except Exception:
+            log.error("File upload or processing failed.")
             self.event_emitter.emit_toast(
                 "Upload failed for a file. Please check connection and try again.",
                 "error",
             )
-            raise FilesAPIError(f"Upload failed for {deterministic_name}: {e}") from e
+            raise FilesAPIError("Gemini Files API upload failed.") from None
         finally:
             if status_queue:
                 await status_queue.put(("COMPLETE_UPLOAD",))
@@ -2401,30 +2589,20 @@ class FilesAPIManager:
         while time.monotonic() < end_time:
             try:
                 file = await self.client.aio.files.get(name=file_name)
-            except Exception as e:
-                raise FilesAPIError(
-                    f"Polling failed: Could not get status for {file_name}. Reason: {e}"
-                ) from e
+            except Exception:
+                raise FilesAPIError("Gemini Files API status polling failed.") from None
 
             if file.state == types.FileState.ACTIVE:
                 return file
             if file.state == types.FileState.FAILED:
-                log_id = f"'{owui_file_id}'" if owui_file_id else "an uploaded file"
-                error_message = f"File processing failed on server for {file_name}."
-                toast_message = f"Google could not process {log_id}."
-                if file.error:
-                    reason = f"Reason: {file.error.message} (Code: {file.error.code})"
-                    error_message += f" {reason}"
-                    toast_message += f" Reason: {file.error.message}"
-
-                self.event_emitter.emit_toast(toast_message, "error")
-                raise FilesAPIError(error_message)
+                self.event_emitter.emit_toast("Gemini could not process an uploaded file.", "error")
+                raise FilesAPIError("Gemini could not process an uploaded file.")
 
             state_name = file.state.name if file.state else "UNKNOWN"
-            log.trace(f"File {file_name} is still {state_name}. Waiting {poll_interval}s...")
+            log.trace(f"Uploaded file state is {state_name}; waiting before polling again.")
             await asyncio.sleep(poll_interval)
 
-        raise FilesAPIError(f"File {file_name} did not become ACTIVE within {timeout} seconds.")
+        raise FilesAPIError("Uploaded file did not become ACTIVE before the timeout.")
 
 
 class PDFMitigationManager:
@@ -2493,12 +2671,12 @@ class PDFMitigationManager:
         if cached_result:
             return cached_result
 
-        log.debug(f"PDF mitigation cache MISS for source hash {original_hash}.")
+        log.debug("PDF mitigation cache miss.")
         lock = self.locks.setdefault(original_hash, asyncio.Lock())
         async with lock:
             cached_result = await self._get_cached_result(original_hash)
             if cached_result:
-                log.debug(f"PDF mitigation cache HIT for source hash {original_hash} after lock.")
+                log.debug("PDF mitigation cache hit after acquiring the processing lock.")
                 return cached_result
 
             cache_key = self._cache_key(original_hash)
@@ -2523,10 +2701,7 @@ class PDFMitigationManager:
                     result,
                     ttl=GEMINI_PDF_MITIGATION_CACHE_TTL_SECONDS,
                 )
-                log.debug(
-                    f"Cached PDF mitigation result for source hash {original_hash} "
-                    f"with {len(result.parts)} processed PDF(s)."
-                )
+                log.debug(f"Cached a PDF mitigation result with {len(result.parts)} part(s).")
             elif cache_dir.exists():
                 shutil.rmtree(cache_dir)
 
@@ -2535,7 +2710,7 @@ class PDFMitigationManager:
     async def _get_cached_result(self, original_hash: str) -> PreparedPDFResult | None:
         cached_result = await self.cache.get(self._cache_key(original_hash))
         if self._cached_result_is_valid(cached_result):
-            log.debug(f"PDF mitigation cache HIT for source hash {original_hash}.")
+            log.debug("PDF mitigation cache hit.")
             return cached_result
         return None
 
@@ -2574,7 +2749,7 @@ class PDFMitigationManager:
                 ):
                     path.unlink()
             except Exception:
-                log.exception(f"Could not clean stale PDF mitigation cache path {path}.")
+                log.error("Could not clean a stale PDF mitigation cache entry.")
 
     @staticmethod
     def _write_temp_source(original_hash: str, file_bytes: bytes) -> str:
@@ -2596,7 +2771,7 @@ class PDFMitigationManager:
         except FileNotFoundError:
             pass
         except Exception:
-            log.exception(f"Could not remove temporary PDF source {source_path}.")
+            log.error("Could not remove a temporary PDF source.")
 
 
 class GeminiContentBuilder:
@@ -2614,6 +2789,7 @@ class GeminiContentBuilder:
         service_policy: CatalogSupportedService,
     ):
         self.messages_body = messages_body
+        self.requesting_user_id = user_data["id"]
         self.upload_documents = (metadata_body.get("features", {}) or {}).get(
             "upload_documents", False
         )
@@ -2937,10 +3113,7 @@ class GeminiContentBuilder:
                     should_include = is_image or (self.upload_documents and not self.is_task)
 
                     if not should_include:
-                        log.debug(
-                            f"Skipping {content_type} '{file.get('id')}' "
-                            f"(is_task={self.is_task}, upload_documents={self.upload_documents})"
-                        )
+                        log.debug("Skipping a database attachment under the active upload policy.")
                         continue
 
                     # We always use the internal API endpoint to fetch file content from the DB.
@@ -3011,6 +3184,22 @@ class GeminiContentBuilder:
         if self._contains_unknown_variant(payloads):
             raise ValueError("Stored Interaction history contains an unknown step or content type.")
 
+        unsupported_modalities = sorted(
+            {
+                str(content.type)
+                for step in validated
+                if isinstance(step, interaction_types.ModelOutputStep)
+                for content in step.content or []
+                if str(content.type) not in self.allowed_input_content
+            }
+        )
+        if unsupported_modalities:
+            modalities = ", ".join(unsupported_modalities)
+            raise IncompatibleReplayModalityError(
+                "Stored Interaction history contains output modalities that the selected "
+                f"model cannot accept as input: {modalities}."
+            )
+
         has_scoped_uri = self._contains_nonlocal_uri(payloads)
         current_scope = self.files_api_manager.endpoint_identity.scope
         if has_scoped_uri and stored_endpoint_scope != current_scope:
@@ -3057,11 +3246,9 @@ class GeminiContentBuilder:
             and media_type in {"image", "audio", "video", "document"}
         ):
             file_id = uri.split("/")[4]
-            file_bytes, mime_type = await self._get_file_data(file_id)
+            file_bytes, mime_type = await self._get_file_data(file_id, self.requesting_user_id)
             if not file_bytes or not mime_type:
-                raise ValueError(
-                    f"Could not retrieve content for file_id '{file_id}' from assistant history."
-                )
+                raise ValueError("Could not retrieve assistant-history file content.")
             restored.pop("uri", None)
             restored["data"] = self._encode_data(file_bytes)
             restored["mime_type"] = mime_type
@@ -3129,26 +3316,19 @@ class GeminiContentBuilder:
                     )
                 except ForeignEndpointReplayError as exc:
                     raise ContentBuildError(str(exc)) from exc
+                except IncompatibleReplayModalityError as exc:
+                    raise ContentBuildError(str(exc)) from exc
                 except (pydantic_core.ValidationError, TypeError, ValueError):
-                    log.exception(
+                    log.error(
                         f"Failed to reconstruct Interaction steps for message {i}. "
                         "Falling back to text processing."
                     )
             else:
                 # A meaningful edit was detected after accounting for whitespace.
-                diff = difflib.unified_diff(
-                    envelope.visible_content.strip().splitlines(keepends=True),
-                    current_content.strip().splitlines(keepends=True),
-                    fromfile="original_content_stripped",
-                    tofile="current_content_stripped",
-                )
-                diff_str = "".join(diff)
-
                 log.warning(
                     f"An edit was detected in assistant message at index {i}. The message will be "
                     "reconstructed from the current edited text, and the original high-fidelity data "
-                    "from the database will be ignored for this turn.\n"
-                    f"--- Diff (on stripped content) ---\n{diff_str}"
+                    "from the database will be ignored for this turn."
                 )
                 self.event_emitter.emit_toast(
                     f"An edit was detected in assistant message #{i + 1}. "
@@ -3252,7 +3432,7 @@ class GeminiContentBuilder:
                 log.info("Processing a local API file URI.")
                 file_id = uri.split("/")[4]
                 owui_file_id = file_id
-                source = await self._get_file_source(file_id)
+                source = await self._get_file_source(file_id, self.requesting_user_id)
                 if source:
                     file_bytes = source.file_bytes
                     file_path = source.file_path
@@ -3263,7 +3443,7 @@ class GeminiContentBuilder:
                 content = self._interaction_content_from_youtube_uri(uri)
                 return [content] if content else []
             else:
-                warn_msg = f"Unsupported URI: '{uri[:64]}...' Links must be to YouTube or a supported file type."
+                warn_msg = "Unsupported URI. Links must be to YouTube or a supported file type."
                 log.warning(warn_msg)
                 self.event_emitter.emit_toast(warn_msg, "warning")
                 return []
@@ -3286,22 +3466,26 @@ class GeminiContentBuilder:
                         except FileNotFoundError:
                             pass
                         except Exception:
-                            log.exception(f"Could not remove temporary file {file_path}.")
+                            log.error("Could not remove a temporary request file.")
 
             return []  # Return empty if bytes/mime_type could not be determined
 
-        except FilesAPIError as e:
-            error_msg = f"Files API failed for URI '{uri[:64]}...': {e}"
+        except LocalFileAccessError as exc:
+            error_msg = "Open WebUI file access was denied."
+            log.warning(error_msg)
+            raise ContentBuildError(error_msg) from exc
+        except FilesAPIError:
+            error_msg = "Gemini Files API processing failed for an attachment."
             log.error(error_msg)
             self.event_emitter.emit_toast(error_msg, "error")
             return []
-        except PDFProcessingError as e:
-            error_msg = f"PDF processing failed for URI '{uri[:64]}...': {e}"
+        except PDFProcessingError:
+            error_msg = "PDF processing failed for an attachment."
             log.error(error_msg)
             self.event_emitter.emit_toast(error_msg, "error")
-            raise ContentBuildError(error_msg) from e
+            raise ContentBuildError(error_msg) from None
         except Exception:
-            log.exception("Error processing a URI; value omitted from logs.")
+            log.error("Unexpected attachment processing failure.")
             return []
 
     async def _create_interaction_contents_from_file_data(
@@ -3678,7 +3862,7 @@ class GeminiContentBuilder:
         return restored_text
 
     @staticmethod
-    async def _get_file_source(file_id: str) -> LocalFileSource | None:
+    async def _get_file_source(file_id: str, user_id: str) -> LocalFileSource | None:
         """
         Retrieves file metadata and resolves it through Open WebUI storage.
 
@@ -3686,36 +3870,26 @@ class GeminiContentBuilder:
         Storage.get_file() just like the Files API content route, so local, S3,
         GCS, and Azure storage all resolve to a readable local path.
         """
-        if not file_id:
-            log.warning("file_id is empty. Cannot continue.")
-            return None
+        if not file_id or not user_id:
+            raise LocalFileAccessError("Open WebUI file access was denied.")
 
         try:
-            file_model = await Files.get_file_by_id(file_id)
-        except Exception as e:
-            log.exception(
-                f"An unexpected error occurred during database call for file_id {file_id}: {e}"
-            )
-            return None
+            file_model = await Files.get_file_by_id_and_user_id(id=file_id, user_id=user_id)
+        except Exception as exc:
+            log.error("An unexpected file-metadata database lookup failure occurred.")
+            raise LocalFileAccessError("Open WebUI file access was denied.") from exc
 
         if file_model is None:
-            log.warning(f"File {file_id} not found in the backend's database.")
-            return None
+            raise LocalFileAccessError("Open WebUI file access was denied.")
 
         if not (file_path := file_model.path):
-            log.warning(
-                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
-            )
+            log.warning("A requested file lacks a storage path. Cannot continue.")
             return None
         if file_model.meta is None:
-            log.warning(
-                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
-            )
+            log.warning("A requested file lacks required metadata. Cannot continue.")
             return None
         if not (content_type := file_model.meta.get("content_type")):
-            log.warning(
-                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
-            )
+            log.warning("A requested file lacks a content type. Cannot continue.")
             return None
 
         resolved_path = await GeminiContentBuilder._resolve_owui_storage_path(file_path)
@@ -3726,7 +3900,7 @@ class GeminiContentBuilder:
                 mime_type=content_type,
             )
 
-        log.warning(f"File {file_path} not found on disk.")
+        log.warning("A requested file could not be resolved from storage.")
         return LocalFileSource(file_bytes=None, file_path=None, mime_type=content_type)
 
     @staticmethod
@@ -3737,7 +3911,7 @@ class GeminiContentBuilder:
         try:
             resolved_path = await asyncio.to_thread(Storage.get_file, file_path)
         except Exception:
-            log.exception(f"Open WebUI storage failed to resolve file path: {file_path}")
+            log.error("Open WebUI storage failed to resolve a requested file.")
             return None
 
         if resolved_path and os.path.exists(resolved_path):
@@ -3745,49 +3919,37 @@ class GeminiContentBuilder:
         return None
 
     @staticmethod
-    async def _get_file_data(file_id: str) -> tuple[bytes | None, str | None]:
+    async def _get_file_data(file_id: str, user_id: str) -> tuple[bytes | None, str | None]:
         """
         Asynchronously retrieves file metadata from the database and its content.
         """
         # TODO: Emit toasts on unexpected conditions.
-        if not file_id:
-            log.warning("file_id is empty. Cannot continue.")
-            return None, None
+        if not file_id or not user_id:
+            raise LocalFileAccessError("Open WebUI file access was denied.")
 
         # Await the async database call directly.
         try:
-            file_model = await Files.get_file_by_id(file_id)
-        except Exception as e:
-            log.exception(
-                f"An unexpected error occurred during database call for file_id {file_id}: {e}"
-            )
-            return None, None
+            file_model = await Files.get_file_by_id_and_user_id(id=file_id, user_id=user_id)
+        except Exception as exc:
+            log.error("An unexpected file-metadata database lookup failure occurred.")
+            raise LocalFileAccessError("Open WebUI file access was denied.") from exc
 
         if file_model is None:
-            # The get_file_by_id method already handles and logs the specific exception,
-            # so we just need to handle the None return value.
-            log.warning(f"File {file_id} not found in the backend's database.")
-            return None, None
+            raise LocalFileAccessError("Open WebUI file access was denied.")
 
         if not (file_path := file_model.path):
-            log.warning(
-                f"File {file_id} was found in the database but it lacks `path` field. Cannot Continue."
-            )
+            log.warning("A requested file lacks a storage path. Cannot continue.")
             return None, None
         if file_model.meta is None:
-            log.warning(
-                f"File {file_path} was found in the database but it lacks `meta` field. Cannot continue."
-            )
+            log.warning("A requested file lacks required metadata. Cannot continue.")
             return None, None
         if not (content_type := file_model.meta.get("content_type")):
-            log.warning(
-                f"File {file_path} was found in the database but it lacks `meta.content_type` field. Cannot continue."
-            )
+            log.warning("A requested file lacks a content type. Cannot continue.")
             return None, None
 
         resolved_path = await GeminiContentBuilder._resolve_owui_storage_path(file_path)
         if not resolved_path:
-            log.warning(f"File {file_path} could not be resolved through Open WebUI storage.")
+            log.warning("A requested file could not be resolved through Open WebUI storage.")
             return None, content_type
 
         try:
@@ -3795,10 +3957,10 @@ class GeminiContentBuilder:
                 file_data = await file.read()
             return file_data, content_type
         except FileNotFoundError:
-            log.exception(f"File {resolved_path} not found on disk.")
+            log.error("A resolved file was not found on disk.")
             return None, content_type
         except Exception:
-            log.exception(f"Error processing file {resolved_path}")
+            log.error("A resolved file could not be read.")
             return None, content_type
 
     @staticmethod
@@ -3869,11 +4031,10 @@ class Pipe:
                     raise ValueError("Latitude must be between -90 and 90.")
                 if not (-180 <= lon <= 180):
                     raise ValueError("Longitude must be between -180 and 180.")
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError):
                 raise ValueError(
-                    f"Invalid format for MAPS_GROUNDING_COORDINATES: '{v}'. "
-                    f"Expected 'latitude,longitude' (e.g., '40.7128,-74.0060'). Original error: {e}"
-                ) from e
+                    "Invalid MAPS_GROUNDING_COORDINATES; expected 'latitude,longitude'."
+                ) from None
         return v
 
     class Valves(BaseModel):
@@ -3965,7 +4126,7 @@ class Pipe:
         )
         STORE_INTERACTIONS: bool = Field(
             default=True,
-            description="Allow persisted chats to store requests and responses with Google for server-side continuation. Temporary chats and tasks always disable storage. Users may opt out, but cannot override an administrator opt-out.",
+            description="Explicitly store persisted-chat Interactions with Google for server-side continuation. Interaction retention is currently 55 days for paid projects and 1 day for free projects. The separate paid-project AI Studio log-retention setting offers 7, 14, 28, or 55 days. Temporary chats and tasks always use store=false. Disabling storage prevents background execution and previous-ID continuation and forces signed full-ledger replay; it does not erase earlier provider or local data.",
         )
         USE_FILES_API: bool = Field(
             default=True,
@@ -4003,7 +4164,7 @@ class Pipe:
         )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] = Field(
             default="1K",
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            description="""Resolution for supported image-output models.
             Default value is 1K.""",
         )
         IMAGE_ASPECT_RATIO: Literal[
@@ -4019,7 +4180,7 @@ class Pipe:
             "21:9",
         ] = Field(
             default="16:9",
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            description="""Aspect ratio for supported image-output models.
             Default value is 16:9.""",
         )
 
@@ -4115,7 +4276,7 @@ class Pipe:
         )
         STORE_INTERACTIONS: bool | None | Literal[""] = Field(
             default=None,
-            description="Opt out of Google server-side Interaction storage. False forces local full-ledger replay; True is effective only when the administrator also permits storage.",
+            description="Opt out of future Google Interaction storage. False prevents background execution and previous-ID continuation and forces signed full-ledger replay. True is effective only when the administrator permits storage. Interaction retention is currently 55 days for paid projects and 1 day for free projects; the separate paid-project AI Studio log setting offers 7, 14, 28, or 55 days. This does not erase earlier provider or local data.",
         )
         USE_FILES_API: bool | None | Literal[""] = Field(
             default=None,
@@ -4142,7 +4303,7 @@ class Pipe:
         )
         IMAGE_RESOLUTION: Literal["1K", "2K", "4K"] | None | Literal[""] = Field(
             default=None,
-            description="""Resolution for image generation (Gemini 3 Pro Image only).
+            description="""Resolution for supported image-output models.
             Default value is None (use the admin's setting). Possible values: 1K, 2K, 4K""",
         )
         IMAGE_ASPECT_RATIO: (
@@ -4162,7 +4323,7 @@ class Pipe:
             | Literal[""]
         ) = Field(
             default=None,
-            description="""Aspect ratio for image generation (Gemini 3 Pro Image and 2.5 Flash Image).
+            description="""Aspect ratio for supported image-output models.
             Default value is None (use the admin's setting). Possible values: 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9""",
         )
 
@@ -4232,21 +4393,15 @@ class Pipe:
 
         # Retrieve model configuration from app state
         app_state: State = __request__.app.state
-        raw_model_config = app_state._state.get("gemini_model_config")
-        if raw_model_config is None:
+        raw_catalog_envelope = app_state._state.get("gemini_model_catalog")
+        if raw_catalog_envelope is None:
             error_msg = (
-                "FATAL: Gemini model configuration not found in app state. "
+                "FATAL: Gemini model catalog envelope not found in app state. "
                 "Please ensure the Gemini Manifold Companion filter is installed and enabled."
             )
             raise ValueError(error_msg)
-        catalog_version = app_state._state.get("gemini_model_catalog_schema_version")
-        if catalog_version != MODEL_CATALOG_SCHEMA_VERSION:
-            raise ValueError(
-                "FATAL: incompatible Gemini model catalog protocol: "
-                f"expected {MODEL_CATALOG_SCHEMA_VERSION}, received {catalog_version!r}. "
-                "Update and enable the matching Gemini Manifold Companion filter."
-            )
-        model_config = self._validate_app_state_catalog(raw_model_config).root
+        catalog_envelope = self._validate_app_state_catalog(raw_catalog_envelope)
+        model_config = catalog_envelope.payload.runtime_models()
 
         merged_custom_params = self._resolve_custom_params(body, __metadata__)
         __metadata__["merged_custom_params"] = merged_custom_params
@@ -4296,9 +4451,7 @@ class Pipe:
             features=features,
         )
 
-        log.debug(
-            f"Chat ID: {__metadata__.get('chat_id')}, Message ID: {__metadata__.get('message_id')}"
-        )
+        log.debug("Gemini request routing completed for the current message.")
 
         event_emitter = PipeEventEmitter(__event_emitter__)
 
@@ -4386,15 +4539,15 @@ class Pipe:
 
                 if should_retry:
                     reason = failure.kind.value.replace("_", " ")
-                    log.warning(f"Free Tier {reason} (Error: {e}). Switching to Paid API...")
+                    log.warning(f"Free Tier {reason}; switching to the next approved tier.")
                     event_emitter.emit_status(
                         f"Free Tier {reason}, switching to Paid API...", done=False
                     )
                     continue
 
                 # If we can't retry, re-raise the error to stop execution
-                error_msg = f"Gemini request failed before a model response could be generated: {e}"
-                log.exception(f"Error during request execution (Tier: {tier}): {e}")
+                error_msg = failure.detail
+                log.error(f"Gemini request failed (tier={tier}, kind={failure.kind.value}).")
                 event_emitter.emit_status("Request failed", done=True)
                 event_emitter.emit_toast(error_msg, "error")
                 if body.get("stream", False):
@@ -4546,14 +4699,14 @@ class Pipe:
             binding = GenAIClientBinding(client=client, identity=identity)
             Pipe._cached_client_bindings.append(binding)
             return binding
-        except Exception as e:
-            raise GenaiApiError(f"{api} Genai client initialization failed: {e}") from e
+        except Exception:
+            raise GenaiApiError(f"{api} client initialization failed.") from None
 
     def _get_user_client(self, valves: "Pipe.Valves", user_email: str) -> GenAIClientBinding:
         user_whitelist = valves.AUTH_WHITELIST.split(",") if valves.AUTH_WHITELIST else []
         log.debug(
-            f"User whitelist: {user_whitelist}, user email: {user_email}, "
-            f"USER_MUST_PROVIDE_AUTH_CONFIG: {valves.USER_MUST_PROVIDE_AUTH_CONFIG}"
+            "Resolving Gemini authentication policy "
+            f"(user_auth_required={valves.USER_MUST_PROVIDE_AUTH_CONFIG})."
         )
         if valves.USER_MUST_PROVIDE_AUTH_CONFIG and user_email not in user_whitelist:
             if not valves.GEMINI_FREE_API_KEY and not valves.GEMINI_PAID_API_KEY:
@@ -4565,10 +4718,10 @@ class Pipe:
         try:
             client_args = self._prepare_client_args(valves)
             binding = self._get_or_create_genai_client(*client_args)
-        except GenaiApiError as e:
-            error_msg = f"Failed to initialize genai client for user {user_email}: {e}"
+        except GenaiApiError:
+            error_msg = "Failed to initialize the configured Gemini client."
             # FIXME: include correct traceback.
-            raise ValueError(error_msg) from e
+            raise ValueError(error_msg) from None
         return binding
 
     @staticmethod
@@ -4682,15 +4835,10 @@ class Pipe:
                 gemini_models_list = await self._fetch_models_from_client_internal(
                     gemini_binding.client, "Gemini Developer API"
                 )
-            except GenaiApiError as e:
-                log.warning(
-                    f"Failed to initialize or retrieve models from Gemini Developer API: {e}"
-                )
-            except Exception as e:
-                log.warning(
-                    f"An unexpected error occurred with Gemini Developer API models: {e}",
-                    exc_info=True,
-                )
+            except GenaiApiError:
+                log.warning("Failed to initialize or retrieve Developer API models.")
+            except Exception:
+                log.warning("An unexpected Developer API model-discovery failure occurred.")
 
             # 2. Fetch from Gemini Enterprise
             try:
@@ -4703,13 +4851,10 @@ class Pipe:
                 enterprise_models_list = await self._fetch_models_from_client_internal(
                     enterprise_binding.client, "Gemini Enterprise"
                 )
-            except GenaiApiError as e:
-                log.warning(f"Failed to initialize or retrieve models from Gemini Enterprise: {e}")
-            except Exception as e:
-                log.warning(
-                    f"An unexpected error occurred with Gemini Enterprise models: {e}",
-                    exc_info=True,
-                )
+            except GenaiApiError:
+                log.warning("Failed to initialize or retrieve Enterprise models.")
+            except Exception:
+                log.warning("An unexpected Enterprise model-discovery failure occurred.")
 
             # 3. Combine and de-duplicate
             # Prioritize models from Gemini Developer API in case of ID collision
@@ -4719,38 +4864,26 @@ class Pipe:
                 if model.name:
                     model_id = self._strip_api_prefix(model.name)
                     if model_id not in DEVELOPER_CATALOG_MODEL_IDS:
-                        log.info(
-                            f"Hiding Developer API model '{model_id}'; its Developer "
-                            "Interactions policy is not supported in the catalog."
-                        )
+                        log.info("Hiding an uncatalogued Developer API model.")
                         continue
                     if model_id and model_id not in combined_models_dict:
                         combined_models_dict[model_id] = model
                 else:
-                    log.trace(
-                        f"Gemini model without a name encountered: {model.display_name or 'N/A'}"
-                    )
+                    log.trace("Skipping a Developer API model without a usable name.")
 
             for model in enterprise_models_list:
                 if model.name:
                     model_id = self._strip_api_prefix(model.name)
                     if model_id not in ENTERPRISE_CATALOG_MODEL_IDS:
-                        log.info(
-                            f"Hiding Enterprise model '{model_id}'; its Enterprise "
-                            "Interactions policy is not supported in the catalog."
-                        )
+                        log.info("Hiding an unverified Enterprise model.")
                         continue
                     if model_id:
                         if model_id not in combined_models_dict:
                             combined_models_dict[model_id] = model
                         else:
-                            log.info(
-                                f"Duplicate model ID '{model_id}' from Gemini Enterprise already sourced from Gemini API. Keeping Gemini API version."
-                            )
+                            log.info("Keeping the Developer API entry for a duplicate model ID.")
                 else:
-                    log.trace(
-                        f"Gemini Enterprise model without a name encountered: {model.display_name or 'N/A'}"
-                    )
+                    log.trace("Skipping an Enterprise model without a usable name.")
 
             all_raw_models = list(combined_models_dict.values())
 
@@ -4799,16 +4932,13 @@ class Pipe:
                         f"No models retrieved from {client_source_name}. This could be due to an API error, network issue, or no models being available."
                     )
 
-            except GenaiApiError as e:
-                raise GenaiApiError(f"Failed to get models from {client_source_name}: {e}") from e
-            except Exception as e:
-                log.error(
-                    f"An unexpected error occurred while configuring client or fetching models from {client_source_name}: {e}",
-                    exc_info=True,
-                )
+            except GenaiApiError:
                 raise GenaiApiError(
-                    f"An unexpected error occurred while retrieving models from {client_source_name}: {e}"
-                ) from e
+                    f"Failed to retrieve models from {client_source_name}."
+                ) from None
+            except Exception:
+                log.error("An unexpected model-discovery failure occurred.")
+                raise GenaiApiError("An unexpected model-discovery failure occurred.") from None
 
         # --- Common processing for all_raw_models ---
 
@@ -4821,9 +4951,7 @@ class Pipe:
         generative_models: list[types.Model] = []
         for model in all_raw_models:
             if model.name is None:
-                log.trace(
-                    f"Skipping model with no name during generative filter: {model.display_name or 'N/A'}"
-                )
+                log.trace("Skipping a discovered model without a usable name.")
                 continue
             # Model.supported_actions describes legacy RPCs and does not establish
             # Interactions support. The validated catalog is the capability authority.
@@ -4848,16 +4976,11 @@ class Pipe:
             stripped_name = self._strip_api_prefix(model.name)
 
             if not stripped_name:
-                log.warning(
-                    f"Model '{model.name}' (display: {model.display_name}) resulted in an empty ID after stripping. Skipping."
-                )
+                log.warning("Skipping a discovered model with an empty normalized ID.")
                 continue
 
             if stripped_name not in catalog_model_ids:
-                log.info(
-                    f"Hiding uncatalogued model '{stripped_name}'; Interactions capabilities "
-                    "are denied until the versioned catalog is audited and updated."
-                )
+                log.info("Hiding an uncatalogued model returned by discovery.")
                 continue
 
             passes_whitelist = not whitelist_str or match_patterns(stripped_name, whitelist_str)
@@ -4867,14 +4990,12 @@ class Pipe:
                 filtered_models_data.append(
                     {
                         "id": stripped_name,
-                        "name": model.display_name or stripped_name,
-                        "description": model.description,
+                        "name": stripped_name,
+                        "description": "Catalog-validated Gemini model.",
                     }
                 )
             else:
-                log.trace(
-                    f"Model ID '{stripped_name}' filtered out by whitelist/blacklist. Whitelist match: {passes_whitelist}, Blacklist pass: {passes_blacklist}"
-                )
+                log.trace("A catalogued model was excluded by the configured model filters.")
 
         log.info(
             f"Filtered {len(generative_models)} generative models down to {len(filtered_models_data)} models based on white/blacklists."
@@ -4894,8 +5015,8 @@ class Pipe:
             log.info(f"Retrieved {len(models)} models from {source_name}.")
             log.trace(f"Model details returned by {source_name} are omitted from logs.")
             return models
-        except Exception as e:
-            log.error(f"Retrieving models from {source_name} failed: {e}")
+        except Exception:
+            log.error(f"Retrieving models from {source_name} failed.")
             # Return empty list; caller decides if this is fatal for the whole operation.
             return []
 
@@ -4987,10 +5108,10 @@ class Pipe:
         return canonical_model_name
 
     @staticmethod
-    def _validate_app_state_catalog(raw_catalog: object) -> AppStateModelCatalog:
-        """Validate the companion-owned mapping before any request policy is selected."""
+    def _validate_app_state_catalog(raw_catalog: object) -> CatalogAppStateEnvelope:
+        """Revalidate the companion envelope and digest before request routing."""
         try:
-            return AppStateModelCatalog.model_validate(raw_catalog)
+            return CatalogAppStateEnvelope.model_validate(raw_catalog)
         except ValidationError as exc:
             raise ValueError(
                 "FATAL: Gemini model configuration in app state does not satisfy "
@@ -5018,6 +5139,26 @@ class Pipe:
         interaction_policy = selected_service.policy.interactions
         limits_policy = selected_service.policy.limits
         features = self._resolve_gemini_features(__metadata__)
+
+        unsupported_fields = (
+            "automatic_function_calling",
+            "automatic_function_calling_config",
+            "cached_content",
+            "batch",
+            "batch_api",
+            "batch_config",
+            "video_metadata",
+        )
+        raw_body = cast(dict[str, object], body)
+        provided_unsupported = [
+            field for field in unsupported_fields if raw_body.get(field) is not None
+        ]
+        if provided_unsupported:
+            raise ValueError(
+                "Unsupported Gemini Interactions request fields: "
+                + ", ".join(provided_unsupported)
+                + "."
+            )
 
         if body.get("top_k") is not None:
             raise ValueError("'top_k' is not supported by the Gemini Interactions API.")
@@ -5145,10 +5286,9 @@ class Pipe:
         *,
         model_id: str,
         interactions_policy: CatalogInteractions,
-        is_task: bool,
     ) -> dict[str, OpenWebUITool]:
         """Validate only executable tools already authorized by Open WebUI."""
-        if not raw_tools or is_task:
+        if not raw_tools:
             return {}
         if not interactions_policy.custom_function_calling:
             raise ValueError(f"Model '{model_id}' is not approved for custom function calling.")
@@ -5315,6 +5455,64 @@ class Pipe:
         records[call.id] = ToolCallRecord(fingerprint=fingerprint, result=result)
         return result
 
+    @staticmethod
+    def _validate_stateless_function_replay(
+        replay_root: list[interaction_types.StepParam],
+    ) -> list[interaction_types.StepParam]:
+        """Validate and normalize a complete stateless history before any tool can run."""
+        if not replay_root:
+            raise ValueError(
+                "Stateless custom function calling requires a non-empty canonical Step ledger."
+            )
+        try:
+            validated = TypeAdapter(list[interaction_types.Step]).validate_python(replay_root)
+        except ValidationError as exc:
+            raise ValueError(
+                "Stateless custom function calling received a malformed canonical Step ledger."
+            ) from exc
+        payloads = [
+            cast(
+                interaction_types.StepParam,
+                step.model_dump(mode="json", exclude_none=True),
+            )
+            for step in validated
+        ]
+        if GeminiContentBuilder._contains_unknown_variant(payloads):
+            raise ValueError(
+                "Stateless custom function calling cannot replay an unknown Step variant."
+            )
+        if not isinstance(validated[-1], interaction_types.UserInputStep):
+            raise ValueError(
+                "Stateless custom function replay must end with the current user_input Step."
+            )
+
+        pending_calls: dict[str, str] = {}
+        completed_calls: set[str] = set()
+        for step in validated:
+            if isinstance(step, interaction_types.FunctionCallStep):
+                if (
+                    not step.id
+                    or not step.name
+                    or step.id in pending_calls
+                    or step.id in completed_calls
+                ):
+                    raise ValueError(
+                        "Stateless custom function replay contains a malformed or duplicate call."
+                    )
+                pending_calls[step.id] = step.name
+            elif isinstance(step, interaction_types.FunctionResultStep):
+                expected_name = pending_calls.pop(step.call_id, None)
+                if expected_name is None or (step.name and step.name != expected_name):
+                    raise ValueError(
+                        "Stateless custom function replay contains an orphan or conflicting result."
+                    )
+                completed_calls.add(step.call_id)
+        if pending_calls:
+            raise ValueError(
+                "Stateless custom function replay contains an incomplete function call."
+            )
+        return copy.deepcopy(replay_root)
+
     async def _run_custom_function_loop(
         self,
         *,
@@ -5325,13 +5523,31 @@ class Pipe:
         stream: bool = False,
     ) -> tuple[list[ReducerEmission], InteractionReduction]:
         """Run custom functions without exposing provider tool-call deltas to Open WebUI."""
-        if common_request.get("store") is not True:
-            raise ValueError("Custom function calling requires store=true continuation.")
+        store = common_request.get("store")
+        if not isinstance(store, bool):
+            raise ValueError("Custom function calling requires an explicit boolean store policy.")
         records: dict[str, ToolCallRecord] = {}
         total_calls = 0
         ledger: list[dict[str, JsonValue]] = []
+        stateless_replay: list[interaction_types.StepParam] | None = None
         total_usage = NormalizedInteractionUsage()
         request_payload = dict(common_request)
+        if not store:
+            replay_root = root_replay_input
+            if replay_root is None:
+                candidate = common_request.get("input")
+                replay_root = (
+                    cast(list[interaction_types.StepParam], candidate)
+                    if isinstance(candidate, list)
+                    else None
+                )
+            if replay_root is None:
+                raise ValueError(
+                    "Stateless custom function calling requires a non-empty canonical Step ledger."
+                )
+            stateless_replay = self._validate_stateless_function_replay(replay_root)
+            request_payload["input"] = copy.deepcopy(stateless_replay)
+            request_payload.pop("previous_interaction_id", None)
 
         for _round_index in range(GEMINI_TOOL_MAX_ROUNDS):
             try:
@@ -5385,10 +5601,10 @@ class Pipe:
                     GenerationFailureKind.INTERACTION_STATUS,
                     f"Interaction returned function calls with status {reduction.status}.",
                 )
-            if not reduction.interaction_id:
+            if stateless_replay is None and not reduction.interaction_id:
                 raise InteractionExecutionError(
                     GenerationFailureKind.INTERACTION_ERROR,
-                    "Function-calling interaction did not return an interaction ID.",
+                    "Stored function-calling interaction did not return an interaction ID.",
                 )
             if any(not call.id or not call.name for call in calls):
                 raise InteractionExecutionError(
@@ -5432,11 +5648,25 @@ class Pipe:
                 for result in results
             ]
             ledger.extend(cast(list[dict[str, JsonValue]], copy.deepcopy(result_payloads)))
-            request_payload = {
-                **common_request,
-                "input": result_payloads,
-                "previous_interaction_id": reduction.interaction_id,
-            }
+            if stateless_replay is not None:
+                stateless_replay.extend(
+                    cast(
+                        list[interaction_types.StepParam],
+                        copy.deepcopy(reduction.steps),
+                    )
+                )
+                stateless_replay.extend(copy.deepcopy(result_payloads))
+                request_payload = {
+                    **common_request,
+                    "input": copy.deepcopy(stateless_replay),
+                }
+                request_payload.pop("previous_interaction_id", None)
+            else:
+                request_payload = {
+                    **common_request,
+                    "input": result_payloads,
+                    "previous_interaction_id": reduction.interaction_id,
+                }
 
         raise InteractionExecutionError(
             GenerationFailureKind.INTERACTION_ERROR,
@@ -5488,7 +5718,7 @@ class Pipe:
                 if not can_resume:
                     raise InteractionExecutionError(
                         GenerationFailureKind.INTERACTION_ERROR,
-                        f"Function-calling Interaction stream interrupted and could not resume: {exc}",
+                        "Function-calling Interaction stream was interrupted and could not resume.",
                     ) from exc
                 reconnects += 1
                 current_stream = await interactions.get(
@@ -5674,7 +5904,6 @@ class Pipe:
             __tools__,
             model_id=model_id,
             interactions_policy=selected_service.policy.interactions,
-            is_task=bool(__metadata__.get("task")),
         )
         request_options = await self._build_interaction_request_options(
             body,
@@ -5706,7 +5935,7 @@ class Pipe:
         is_image_model = self._is_image_model(selected_service.policy)
         if (is_image_model or "gemma" in model_id) and request_options.system_instruction:
             request_options.system_instruction = None
-            log.warning(f"Model '{model_id}' does not support system prompts. Removing.")
+            log.warning("Removing an unsupported system prompt from the request.")
 
         model = cast(interaction_types.Model, model_id)
         common_request = {
@@ -5847,12 +6076,12 @@ class Pipe:
         # Check Search
         is_search_requested = features.google_search
         if is_search_requested and "google_search" in excluded_features:
-            log.info(f"Free Tier ineligible: Search requested but excluded for {model_id}.")
+            log.info("Free Tier is ineligible because Search was requested.")
             return False
 
         # Check Maps
         if features.google_maps and "google_maps" in excluded_features:
-            log.info(f"Free Tier ineligible: Maps requested but excluded for {model_id}.")
+            log.info("Free Tier is ineligible because Maps was requested.")
             return False
 
         return True
@@ -5896,13 +6125,10 @@ class Pipe:
                 if not can_resume:
                     raise InteractionExecutionError(
                         GenerationFailureKind.INTERACTION_ERROR,
-                        f"Interaction stream interrupted and could not resume: {exc}",
+                        "Interaction stream was interrupted and could not resume.",
                     ) from exc
                 reconnects += 1
-                log.warning(
-                    f"Interaction stream interrupted; resuming attempt {reconnects}/2 "
-                    f"from event {reducer.state.last_event_id}."
-                )
+                log.warning(f"Interaction stream interrupted; resuming attempt {reconnects}/2.")
                 current_stream = await interactions.get(
                     cast(str, reducer.state.interaction_id),
                     stream=True,
@@ -5986,11 +6212,11 @@ class Pipe:
                 image_url = await self._upload_image(
                     base64.b64decode(data, validate=True), mime_type, metadata, app
                 )
-            except ValueError as exc:
+            except ValueError:
                 raise InteractionExecutionError(
                     GenerationFailureKind.INTERACTION_ERROR,
-                    f"Generated image contained invalid base64 data: {exc}",
-                ) from exc
+                    "Generated image contained invalid base64 data.",
+                ) from None
         markdown = (
             f"![Generated Image]({image_url})"
             if image_url
@@ -6056,7 +6282,7 @@ class Pipe:
                         )
                         self._remember_completed_message(key)
                     except Exception:
-                        log.exception("Failed to persist gemini_interaction envelope.")
+                        log.error("Failed to persist the Gemini Interaction envelope.")
         event_emitter.emit_status("Response finished", done=True, is_successful_finish=True)
         yield "data: [DONE]"
 
@@ -6100,38 +6326,82 @@ class Pipe:
         start_time: float,
     ) -> dict[str, object]:
         token_details = usage.model_dump(mode="json")
-        cost_details: dict[str, float] = {
+        cost_details: dict[str, object] = {
             "input_cost": 0.0,
             "cache_cost": 0.0,
             "output_cost": 0.0,
             "image_output_cost": 0.0,
+            "known_cost": 0.0,
             "total_cost": 0.0,
+            "is_complete": True,
+            "unpriced_tokens": 0,
         }
         if metadata.get("is_paid_api", True):
             pricing = selected_service.policy.pricing
-            input_tokens = max(usage.input_tokens - usage.cached_tokens, 0)
-            image_output_tokens = 0
-            for item in usage.output_by_modality:
-                modality = item.get("modality")
-                tokens = item.get("tokens")
-                if (
-                    str(modality).lower() == "image"
-                    and isinstance(tokens, int)
-                    and not isinstance(tokens, bool)
-                ):
-                    image_output_tokens += tokens
-            text_output_tokens = max(usage.output_tokens - image_output_tokens, 0)
-            output_tokens = text_output_tokens + usage.thought_tokens
-            input_cost = self._calculate_cost(input_tokens, pricing.input)
-            output_cost = self._calculate_cost(output_tokens, pricing.output)
-            image_output_cost = self._calculate_cost(
-                image_output_tokens, pricing.image_output or ()
+            prompt_tokens = usage.input_tokens
+            input_modalities = self._usage_modalities(usage.input_by_modality)
+            cached_modalities = self._usage_modalities(usage.cached_by_modality)
+            output_modalities = self._usage_modalities(usage.output_by_modality)
+            unknown_tokens = usage.tool_use_tokens
+
+            input_cost, input_unknown = self._price_modalities(
+                aggregate_tokens=usage.input_tokens,
+                modality_tokens=input_modalities,
+                cached_tokens=cached_modalities,
+                rates=pricing.input,
+                prompt_tokens=prompt_tokens,
             )
+            cache_cost, cache_unknown = self._price_modalities(
+                aggregate_tokens=usage.cached_tokens,
+                modality_tokens=cached_modalities,
+                cached_tokens={},
+                rates=pricing.cached_input,
+                prompt_tokens=prompt_tokens,
+            )
+            image_output_tokens = output_modalities.pop("image", 0)
+            accounted_output = sum(output_modalities.values()) + image_output_tokens
+            if accounted_output > usage.output_tokens:
+                unknown_tokens += accounted_output
+                output_modalities = {}
+                image_output_tokens = 0
+            else:
+                output_modalities["text"] = (
+                    output_modalities.get("text", 0)
+                    + usage.output_tokens
+                    - accounted_output
+                    + usage.thought_tokens
+                )
+            output_cost, output_unknown = self._price_modalities(
+                aggregate_tokens=usage.output_tokens + usage.thought_tokens - image_output_tokens,
+                modality_tokens=output_modalities,
+                cached_tokens={},
+                rates=pricing.output,
+                prompt_tokens=prompt_tokens,
+            )
+            image_output_cost = self._calculate_cost(
+                image_output_tokens,
+                prompt_tokens,
+                pricing.output.get("image"),
+            )
+            image_unknown = image_output_tokens if image_output_cost is None else 0
+            known_cost = sum(
+                cost
+                for cost in (input_cost, cache_cost, output_cost, image_output_cost)
+                if cost is not None
+            )
+            unknown_tokens += input_unknown + cache_unknown + output_unknown + image_unknown
+            complete = unknown_tokens == 0
             cost_details.update(
-                input_cost=round(input_cost, 6),
-                output_cost=round(output_cost, 6),
-                image_output_cost=round(image_output_cost, 6),
-                total_cost=round(input_cost + output_cost + image_output_cost, 6),
+                input_cost=None if input_cost is None else round(input_cost, 6),
+                cache_cost=None if cache_cost is None else round(cache_cost, 6),
+                output_cost=None if output_cost is None else round(output_cost, 6),
+                image_output_cost=(
+                    None if image_output_cost is None else round(image_output_cost, 6)
+                ),
+                known_cost=round(known_cost, 6),
+                total_cost=round(known_cost, 6) if complete else None,
+                is_complete=complete,
+                unpriced_tokens=unknown_tokens,
             )
         payload: dict[str, object] = {
             "input_tokens": usage.input_tokens,
@@ -6142,11 +6412,14 @@ class Pipe:
         }
         previous_tokens = metadata.get("cumulative_tokens")
         previous_cost = metadata.get("cumulative_cost")
-        if isinstance(previous_tokens, int) and isinstance(previous_cost, (int, float)):
+        total_cost = cost_details["total_cost"]
+        if (
+            isinstance(previous_tokens, int)
+            and isinstance(previous_cost, (int, float))
+            and isinstance(total_cost, (int, float))
+        ):
             payload["cumulative_token_count"] = previous_tokens + usage.total_tokens
-            payload["cumulative_total_cost"] = round(
-                float(previous_cost) + cost_details["total_cost"], 6
-            )
+            payload["cumulative_total_cost"] = round(float(previous_cost) + total_cost, 6)
         return payload
 
     @staticmethod
@@ -6192,42 +6465,69 @@ class Pipe:
                 ),
             )
         except Exception:
-            log.exception("Could not persist a generated Interaction image.")
+            log.error("Could not persist a generated Interaction image.")
             return None
         if not file_item:
             return None
         return str(app.url_path_for("get_file_content_by_id", id=file_item.id))
 
     @staticmethod
-    def _calculate_cost(token_count: int, pricing_tiers: tuple[CatalogPriceTier, ...]) -> float:
-        """
-        Calculates cost based on tiered pricing structure (in USD)
-        """
-        if not pricing_tiers or token_count <= 0:
-            return 0.0
+    def _usage_modalities(items: list[dict[str, JsonValue]]) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for item in items:
+            modality = item.get("modality")
+            tokens = item.get("tokens")
+            if not isinstance(modality, str):
+                continue
+            if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+                continue
+            key = modality.lower()
+            result[key] = result.get(key, 0) + tokens
+        return result
 
-        total_cost = 0.0
-        remaining_tokens = token_count
-
-        for tier in pricing_tiers:
-            price_per_million = tier.price_per_million
-            tier_limit = tier.up_to_tokens  # None means unlimited
-
-            if tier_limit is None:
-                # Last tier with no limit - use all remaining tokens
-                tokens_in_tier = remaining_tokens
+    @classmethod
+    def _price_modalities(
+        cls,
+        *,
+        aggregate_tokens: int,
+        modality_tokens: dict[str, int],
+        cached_tokens: dict[str, int],
+        rates: dict[CatalogContentKind, CatalogRate],
+        prompt_tokens: int,
+    ) -> tuple[float | None, int]:
+        if aggregate_tokens <= 0:
+            return 0.0, 0
+        if not modality_tokens or sum(modality_tokens.values()) != aggregate_tokens:
+            return None, aggregate_tokens
+        total = 0.0
+        unknown = 0
+        for modality, tokens in modality_tokens.items():
+            billable_tokens = tokens - cached_tokens.get(modality, 0)
+            if billable_tokens < 0:
+                return None, aggregate_tokens
+            rate = rates.get(cast(CatalogContentKind, modality))
+            cost = cls._calculate_cost(billable_tokens, prompt_tokens, rate)
+            if cost is None:
+                unknown += billable_tokens
             else:
-                # Limited tier - use up to the tier limit
-                tokens_in_tier = min(remaining_tokens, tier_limit)
+                total += cost
+        return (None if unknown == aggregate_tokens else total), unknown
 
-            tier_cost = (tokens_in_tier / 1_000_000) * price_per_million
-            total_cost += tier_cost
-            remaining_tokens -= tokens_in_tier
-
-            if remaining_tokens <= 0:
-                break
-
-        return total_cost
+    @staticmethod
+    def _calculate_cost(
+        token_count: int,
+        prompt_tokens: int,
+        rate: CatalogRate | None,
+    ) -> float | None:
+        """Select one whole-prompt rate and apply it to all tokens in the bucket."""
+        if token_count <= 0:
+            return 0.0
+        if not isinstance(rate, CatalogPricedRate):
+            return None
+        for tier in rate.tiers:
+            if tier.up_to_prompt_tokens is None or prompt_tokens <= tier.up_to_prompt_tokens:
+                return (token_count / 1_000_000) * tier.price_per_million
+        return None
 
     # endregion 2.5 Post-processing
 
@@ -6372,10 +6672,10 @@ class Pipe:
                     # Prepend with newline for readability
                     serialized_data_json = "\n" + json_string
 
-            except (TypeError, ValueError) as e:  # Catch specific serialization errors
-                serialized_data_json = f" - {{Serialization Error: {e}}}"
-            except Exception as e:  # Catch any other unexpected errors during processing
-                serialized_data_json = f" - {{Processing Error: {e}}}"
+            except (TypeError, ValueError):
+                serialized_data_json = " - {Serialization Error}"
+            except Exception:
+                serialized_data_json = " - {Processing Error}"
 
         # Add the final JSON string (or error message) back into the record
         record["extra"]["_plugin_serialized_data"] = serialized_data_json
@@ -6494,22 +6794,46 @@ class Pipe:
     def _classify_generation_failure(error: Exception) -> GenerationFailure:
         """Classify failures without parsing mutable human-readable messages."""
         if isinstance(error, InteractionExecutionError):
-            return GenerationFailure(error.kind, False, str(error))
+            return GenerationFailure(
+                error.kind,
+                False,
+                "Gemini could not complete the Interaction request.",
+            )
         if isinstance(error, httpx.TimeoutException | httpx.TransportError):
-            return GenerationFailure(GenerationFailureKind.TRANSPORT, True, str(error))
+            return GenerationFailure(
+                GenerationFailureKind.TRANSPORT,
+                True,
+                "Gemini is temporarily unreachable. Please try again.",
+            )
         if isinstance(error, genai_errors.ClientError):
             if error.code == 429:
-                return GenerationFailure(GenerationFailureKind.RATE_LIMIT, True, str(error))
+                return GenerationFailure(
+                    GenerationFailureKind.RATE_LIMIT,
+                    True,
+                    "Gemini rate-limited the request. Please try again.",
+                )
             if error.code in {401, 403}:
-                return GenerationFailure(GenerationFailureKind.PERMISSION, False, str(error))
-            return GenerationFailure(GenerationFailureKind.INVALID_REQUEST, False, str(error))
+                return GenerationFailure(
+                    GenerationFailureKind.PERMISSION,
+                    False,
+                    "Gemini rejected the configured credentials or permissions.",
+                )
+            return GenerationFailure(
+                GenerationFailureKind.INVALID_REQUEST,
+                False,
+                "Gemini rejected the request configuration.",
+            )
         if isinstance(error, genai_errors.ServerError):
             return GenerationFailure(
                 GenerationFailureKind.UNAVAILABLE,
                 error.code in {500, 502, 503, 504},
-                str(error),
+                "Gemini is temporarily unavailable. Please try again.",
             )
-        return GenerationFailure(GenerationFailureKind.UNKNOWN, False, str(error))
+        return GenerationFailure(
+            GenerationFailureKind.UNKNOWN,
+            False,
+            "Gemini request failed unexpectedly.",
+        )
 
     async def _determine_execution_order(
         self,
@@ -6621,14 +6945,14 @@ class Pipe:
                                 execution_order = ["paid"]
                             else:
                                 log.warning(
-                                    f"Model '{model_id}' is ineligible for free tier and no paid keys found."
+                                    "The selected model is ineligible for the free tier and no paid key is configured."
                                 )
                     elif can_use_enterprise:
                         execution_order = ["enterprise"]
                     elif has_paid_key:
                         execution_order = ["paid"]
 
-        log.debug(f"Routing strategy for {model_id} ({routing_strategy}): {execution_order}")
+        log.debug("Resolved the request routing strategy.")
         return execution_order
 
     def _resolve_custom_params(self, body: "Body", __metadata__: "Metadata") -> dict[str, Any]:
@@ -6650,9 +6974,7 @@ class Pipe:
         log.debug(f"Extracted {len(merged_params)} model page parameter(s).")
 
         if __metadata__.get("task"):
-            log.debug(
-                f"Task model detected (task: {__metadata__.get('task')}). Ignoring chat control parameters."
-            )
+            log.debug("Task request detected; ignoring chat control parameters.")
             return merged_params
 
         chat_control_params = __metadata__.get("chat_control_params", {})

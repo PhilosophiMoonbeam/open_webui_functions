@@ -6,7 +6,7 @@ release_policy: coordinated_only
 protocols:
   google_genai: 2.11.0
   grounding_envelope: 1
-  model_catalog: 2
+  model_catalog: 3
 install_order:
   - gemini_manifold_companion
   - gemini_reasoning_toggle
@@ -20,20 +20,26 @@ artifacts:
     role: pipe
     version: 3.0.0
     path: plugins/pipes/gemini_manifold.py
-    sha256: bcf2a6cbb6ef41459b48209eded5bfeea8fe3ab3e7e47a89346a3299dd99b7f4
-    bytes: 290703
+    sha256: 0cca96b0fec7e3da435203fe63e6809f0848c3ca6f6c0246a31ae1fcb6b6e4a2
+    bytes: 304440
   - id: gemini_manifold_companion
     role: companion
     version: 3.0.0
     path: plugins/filters/gemini_manifold_companion.py
-    sha256: a4de56d77128b1a96d8b536e6b3c552aabc787bfbeb7b0655e91afc35fa148ea
-    bytes: 53500
+    sha256: bb424c268c10c788e8c0e76ce40189a69e2f5adc4c19e271fbe09b9b84018439
+    bytes: 64406
   - id: gemini_model_catalog
     role: catalog
-    version: 2
+    version: 3
     path: plugins/pipes/gemini_models.yaml
-    sha256: 06e634f76b084817369adb23c3710b41eb663f3fbf16aea629673595d3b8ff65
-    bytes: 11867
+    sha256: 48fe9536880335f433db4a25ff51b42e205b6e9e72e9360935017c8366ab0bc5
+    bytes: 34319
+  - id: gemini_model_provenance
+    role: provenance
+    version: 1
+    path: docs/development/gemini-model-provenance-v1.yaml
+    sha256: 9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10
+    bytes: 28451
   - id: gemini_reasoning_toggle
     role: toggle
     version: 2.0.0
@@ -62,11 +68,11 @@ artifacts:
     role: toggle
     version: 1.0.0
     path: plugins/filters/gemini_enterprise_toggle.py
-    sha256: 730c604e012bed6b34c860f22a7f5b3dea41a32aa323f779bf8edd6d12feaee0
-    bytes: 3324
+    sha256: f9a44434e57549f83da6e9ecff2bc318eb50c6ee766393f1128127880dc086f9
+    bytes: 916
   - id: gemini_suite_release_notes
     role: release_notes
     version: 3.0.0
     path: release/gemini-suite-v3.0.0.md
-    sha256: 510a7e289e03b328d0516391ef2675b7de12cf362109b6bd72d2ddcb94d3fc64
-    bytes: 3422
+    sha256: d23f35fd399b486ee6abef4a9f46224952697a69af5781b8ba296b773e2534f2
+    bytes: 5480

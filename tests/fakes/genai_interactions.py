@@ -75,6 +75,7 @@ class FakeInteractions:
     outcomes: deque[InteractionResult]
     resume_outcomes: deque[FakeInteractionStream] = field(default_factory=deque)
     requests: list[interactions.CreateModelInteraction] = field(default_factory=list)
+    raw_requests: list[dict[str, object]] = field(default_factory=list)
     gets: list[tuple[str, bool, str | None]] = field(default_factory=list)
 
     def __init__(
@@ -86,9 +87,11 @@ class FakeInteractions:
         self.outcomes = deque(outcomes)
         self.resume_outcomes = deque(resume_outcomes)
         self.requests = []
+        self.raw_requests = []
         self.gets = []
 
     async def create(self, **request: object) -> interactions.Interaction | FakeInteractionStream:
+        self.raw_requests.append(dict(request))
         validated = interactions.CreateModelInteraction.model_validate(request)
         self.requests.append(validated)
         if not self.outcomes:

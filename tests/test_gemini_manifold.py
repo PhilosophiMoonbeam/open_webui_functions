@@ -20,7 +20,15 @@ from google.genai import interactions as interaction_types
 from plugins.filters.gemini_map_grounding_toggle import Filter as MapsToggleFilter
 from plugins.filters.gemini_reasoning_toggle import Filter as ReasoningToggleFilter
 from plugins.filters.gemini_url_context_toggle import Filter as URLContextToggleFilter
-from utils.manifold_types import Body, Event, Metadata, UserData
+from pydantic import ValidationError
+from utils.manifold_types import (
+    AssistantMessage,
+    Body,
+    ChatMessageTD,
+    Event,
+    Metadata,
+    UserData,
+)
 
 # --- Mock problematic Open WebUI modules BEFORE they are imported by your plugin ---
 mock_chats_module = MagicMock()
@@ -50,11 +58,15 @@ sys.modules["open_webui.storage.provider"] = mock_storage_module
 sys.modules["open_webui.utils.misc"] = mock_misc_module
 
 
+import plugins.filters.gemini_manifold_companion as companion_module
 import plugins.pipes.gemini_manifold as gemini_manifold_module
 from plugins.filters.gemini_manifold_companion import (
     DEFAULT_MODEL_CONFIG_PATH,
     EventEmitter,
     ModelCatalogError,
+)
+from plugins.filters.gemini_manifold_companion import (
+    CatalogAppStateEnvelope as CompanionCatalogEnvelope,
 )
 from plugins.filters.gemini_manifold_companion import (
     Filter as CompanionFilter,
@@ -73,8 +85,10 @@ from plugins.pipes.gemini_manifold import (
     AsyncInteractionsBoundary,
     AsyncInteractionStream,
     CatalogInteractions,
+    CatalogPricedRate,
     CatalogSupportedService,
     CatalogUnavailableService,
+    CatalogUnpricedRate,
     ContentBuildError,
     EndpointIdentity,
     FilesAPIError,
@@ -88,6 +102,7 @@ from plugins.pipes.gemini_manifold import (
     InteractionReducer,
     InteractionRequestOptions,
     InteractionsSDKBoundary,
+    LocalFileAccessError,
     LocalFileSource,
     NormalizedInteractionUsage,
     PDFMitigationManager,
@@ -99,6 +114,12 @@ from plugins.pipes.gemini_manifold import (
     PreparedPDFResult,
     SelectedCatalogService,
     genai_errors,
+)
+from plugins.pipes.gemini_manifold import (
+    CatalogAppStateEnvelope as PipeCatalogEnvelope,
+)
+from plugins.pipes.gemini_manifold import (
+    canonical_catalog_bytes as pipe_canonical_catalog_bytes,
 )
 from plugins.pipes.gemini_manifold import (
     types as gemini_types,
@@ -162,36 +183,57 @@ def _server_error(code: int, status: str, message: str) -> genai_errors.ServerEr
 def test_catalogued_model_ids_and_image_policy_default_deny() -> None:
     catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
     raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
-    catalog_models = raw_catalog["models"]
-    validated = AppStateModelCatalog.model_validate(catalog_models)
-    image_policy = validated.root["gemini-2.5-flash-image"].services.developer
+    validated = AppStateModelCatalog.model_validate(raw_catalog)
+    catalog_models = validated.runtime_models()
+    image_policy = catalog_models["gemini-3-pro-image"].services.developer
 
     assert set(catalog_models) == CATALOG_MODEL_IDS
     assert DEVELOPER_CATALOG_MODEL_IDS == CATALOG_MODEL_IDS
     assert ENTERPRISE_CATALOG_MODEL_IDS == frozenset()
     assert isinstance(image_policy, CatalogSupportedService)
     assert Pipe._is_image_model(image_policy) is True
-    assert "gemini-future-unknown" not in validated.root
+    assert "gemini-future-unknown" not in catalog_models
+    for model_id in CATALOG_MODEL_IDS:
+        services = catalog_models[model_id].services
+        assert isinstance(services.developer, CatalogSupportedService)
+        assert services.developer.availability == "supported"
+        assert isinstance(services.enterprise, CatalogUnavailableService)
+        assert services.enterprise.availability == "unverified"
 
 
-def test_pipe_and_companion_protocol_2_catalog_models_round_trip_in_parity() -> None:
-    def canonicalize(value):
-        if isinstance(value, dict):
-            return {key: canonicalize(item) for key, item in sorted(value.items())}
-        if isinstance(value, list):
-            normalized = [canonicalize(item) for item in value]
-            return sorted(normalized, key=repr)
-        return value
-
+def test_pipe_and_companion_protocol_3_catalog_models_round_trip_in_parity() -> None:
     catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
     raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
     companion = CompanionModelCatalog.model_validate(raw_catalog)
-    pipe_models = AppStateModelCatalog.model_validate(raw_catalog["models"])
-    pipe_round_trip = {**raw_catalog, "models": pipe_models.model_dump(mode="json")}
-    reparsed = CompanionModelCatalog.model_validate(pipe_round_trip)
+    pipe_catalog = AppStateModelCatalog.model_validate(raw_catalog)
+    companion_envelope = CompanionCatalogEnvelope.from_catalog(companion)
+    pipe_envelope = PipeCatalogEnvelope.model_validate(
+        companion_envelope.model_dump(mode="json", exclude_none=False)
+    )
 
-    assert canonicalize(reparsed.model_dump(mode="json")) == canonicalize(
-        companion.model_dump(mode="json")
+    assert pipe_canonical_catalog_bytes(pipe_catalog) == companion_module.canonical_catalog_bytes(
+        companion
+    )
+    assert pipe_envelope.canonical_digest == companion_envelope.canonical_digest
+    assert {
+        key: value.model_dump(mode="json") for key, value in pipe_catalog.runtime_models().items()
+    } == {key: value.model_dump(mode="json") for key, value in companion.runtime_models().items()}
+
+
+def test_protocol_3_standalone_models_are_frozen_and_reject_the_same_mutation() -> None:
+    catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+    raw_catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    raw_catalog["provider_claims"]["gemini-2.5-flash"]["capabilities"]["google_search"] = False
+
+    assert CompanionModelCatalog.model_config.get("frozen") is True
+    assert AppStateModelCatalog.model_config.get("frozen") is True
+    with pytest.raises(ValidationError, match="exceeds provider capability"):
+        CompanionModelCatalog.model_validate(raw_catalog)
+    with pytest.raises(ValidationError, match="exceeds provider capability"):
+        AppStateModelCatalog.model_validate(raw_catalog)
+    assert "plugins.pipes" not in Path(companion_module.__file__).read_text(encoding="utf-8")
+    assert "plugins.filters" not in Path(gemini_manifold_module.__file__).read_text(
+        encoding="utf-8"
     )
 
 
@@ -214,27 +256,27 @@ async def test_pipe_rejects_malformed_app_state_catalog_before_routing_or_client
     pipe_instance_fixture,
 ) -> None:
     pipe, _ = pipe_instance_fixture
-    malformed = _catalog_model_entry()
-    developer = cast(dict, cast(dict, malformed["services"])["developer"])
-    cast(dict, developer["interactions"]).pop("tools")
+    catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+    companion = CompanionModelCatalog.model_validate(
+        yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    )
+    malformed = CompanionCatalogEnvelope.from_catalog(companion).model_dump(
+        mode="json", exclude_none=False
+    )
+    malformed["payload"]["product_authorizations"]["gemini-2.5-flash"]["interactions"].pop("tools")
     request = MagicMock()
     request.app = FastAPI()
-    request.app.state._state.update(
-        {
-            "gemini_model_config": {"gemini-test": malformed},
-            "gemini_model_catalog_schema_version": 2,
-        }
-    )
+    request.app.state._state.update({"gemini_model_catalog": malformed})
     determine_order = AsyncMock()
     get_client = MagicMock()
 
     with (
         patch.object(pipe, "_determine_execution_order", determine_order),
         patch.object(pipe, "_get_user_client", get_client),
-        pytest.raises(ValueError, match="catalog protocol 2"),
+        pytest.raises(ValueError, match="catalog protocol 3"),
     ):
         await pipe.pipe(
-            body=cast(Body, {"model": "gemini-test", "messages": []}),
+            body=cast(Body, {"model": "gemini-2.5-flash", "messages": []}),
             __user__=cast(UserData, {"email": "user@example.test"}),
             __request__=request,
             __event_emitter__=None,
@@ -377,7 +419,7 @@ def test_get_user_client_no_auth_provided_raises_error(mock_pipe_valves_data):
         pipe_instance = Pipe()
         pipe_instance.valves = Pipe.Valves(**mock_pipe_valves_data)
 
-        with pytest.raises(ValueError, match="Neither ENTERPRISE_PROJECT nor a Gemini API key"):
+        with pytest.raises(ValueError, match="Failed to initialize the configured Gemini client"):
             pipe_instance._get_user_client(pipe_instance.valves, USER_EMAIL_REGULAR)
 
         MockedGenAIClientConstructor.assert_not_called()
@@ -491,8 +533,6 @@ def _selected_service(
 ) -> SelectedCatalogService:
     payload = {
         "availability": "supported",
-        "verified_at": "2026-07-14",
-        "source_refs": ["models"],
         "lifecycle": "stable",
         "limits": {"input_tokens": 1_048_576, "output_tokens": output_tokens},
         "content": {
@@ -507,6 +547,7 @@ def _selected_service(
             "custom_function_calling": custom_function_calling,
             "thinking": {
                 "supported": True,
+                "control": "known",
                 "levels": ["minimal", "low", "medium", "high"],
                 "summaries": True,
             },
@@ -521,11 +562,42 @@ def _selected_service(
         "pricing": {
             "free_tier": free_tier,
             "excluded_features": [],
-            "input": [{"up_to_tokens": None, "price_per_million": input_price}],
-            "output": [{"up_to_tokens": None, "price_per_million": output_price}],
-            "image_output": (
-                [{"up_to_tokens": None, "price_per_million": image_price}] if image else None
-            ),
+            "threshold_basis": "total_input_tokens_including_cached",
+            "input": {
+                modality: {
+                    "state": "priced",
+                    "tiers": [{"up_to_prompt_tokens": None, "price_per_million": input_price}],
+                }
+                for modality in (inputs or ["text", "image", "video", "audio", "document"])
+            },
+            "cached_input": {
+                modality: {
+                    "state": "priced",
+                    "tiers": [{"up_to_prompt_tokens": None, "price_per_million": input_price / 10}],
+                }
+                for modality in (inputs or ["text", "image", "video", "audio", "document"])
+            },
+            "output": {
+                "text": {
+                    "state": "priced",
+                    "tiers": [{"up_to_prompt_tokens": None, "price_per_million": output_price}],
+                },
+                **(
+                    {
+                        "image": {
+                            "state": "priced",
+                            "tiers": [
+                                {
+                                    "up_to_prompt_tokens": None,
+                                    "price_per_million": image_price,
+                                }
+                            ],
+                        }
+                    }
+                    if image
+                    else {}
+                ),
+            },
         },
     }
     return SelectedCatalogService(
@@ -674,6 +746,126 @@ async def test_interaction_options_reject_legacy_or_unsupported_configuration(
         await pipe._build_interaction_request_options(body, metadata, pipe.valves, policy)
 
 
+@pytest.mark.asyncio
+async def test_installed_catalog_request_options_match_every_developer_policy(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    catalog = Pipe._validate_app_state_catalog(_installed_model_catalog()).payload.runtime_models()
+    feature_keys = {
+        "google_search": "google_search_tool",
+        "code_execution": "google_code_execution",
+        "url_context": "url_context",
+        "google_maps": "google_maps",
+    }
+
+    for model_id, model in catalog.items():
+        developer = model.services.developer
+        assert isinstance(developer, CatalogSupportedService), model_id
+        assert isinstance(model.services.enterprise, CatalogUnavailableService), model_id
+        selected = SelectedCatalogService(
+            model_id=model_id,
+            service="developer",
+            policy=developer,
+        )
+        metadata = cast(Metadata, {"canonical_model_id": model_id, "features": {}})
+        options = await pipe._build_interaction_request_options({}, metadata, pipe.valves, selected)
+        if "image" in developer.content.outputs:
+            assert isinstance(options.response_format, interaction_types.ImageResponseFormat), (
+                model_id
+            )
+        else:
+            assert isinstance(options.response_format, interaction_types.TextResponseFormat), (
+                model_id
+            )
+
+        with pytest.raises(ValueError, match="selected service limit"):
+            await pipe._build_interaction_request_options(
+                {"max_tokens": developer.limits.output_tokens + 1},
+                metadata,
+                pipe.valves,
+                selected,
+            )
+
+        thinking = developer.interactions.thinking
+        if thinking.supported:
+            for level in thinking.levels:
+                reasoning_metadata = cast(
+                    Metadata,
+                    {
+                        "canonical_model_id": model_id,
+                        "features": {"reasoning": True},
+                        "merged_custom_params": {"reasoning_effort": level},
+                    },
+                )
+                reasoning_options = await pipe._build_interaction_request_options(
+                    {}, reasoning_metadata, pipe.valves, selected
+                )
+                assert reasoning_options.generation_config.thinking_level == level, model_id
+            with pytest.raises(ValueError, match="not supported"):
+                await pipe._build_interaction_request_options(
+                    {},
+                    cast(
+                        Metadata,
+                        {
+                            "canonical_model_id": model_id,
+                            "features": {"reasoning": True},
+                            "merged_custom_params": {"reasoning_effort": "future"},
+                        },
+                    ),
+                    pipe.valves,
+                    selected,
+                )
+        else:
+            with pytest.raises(ValueError, match="does not support thinking"):
+                await pipe._build_interaction_request_options(
+                    {},
+                    cast(
+                        Metadata,
+                        {"canonical_model_id": model_id, "features": {"reasoning": True}},
+                    ),
+                    pipe.valves,
+                    selected,
+                )
+
+        for tool_name, feature_key in feature_keys.items():
+            tool_metadata = cast(
+                Metadata,
+                {"canonical_model_id": model_id, "features": {feature_key: True}},
+            )
+            if getattr(developer.interactions.tools, tool_name):
+                tool_options = await pipe._build_interaction_request_options(
+                    {}, tool_metadata, pipe.valves, selected
+                )
+                assert [tool.type for tool in tool_options.tools] == [tool_name], model_id
+            else:
+                with pytest.raises(ValueError, match="does not support requested tools"):
+                    await pipe._build_interaction_request_options(
+                        {}, tool_metadata, pipe.valves, selected
+                    )
+
+        structured_body = cast(
+            Body,
+            {
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "object"}},
+                }
+            },
+        )
+        if developer.interactions.response_format:
+            structured = await pipe._build_interaction_request_options(
+                structured_body, metadata, pipe.valves, selected
+            )
+            assert isinstance(structured.response_format, interaction_types.TextResponseFormat)
+            assert structured.response_format.mime_type == "application/json"
+        else:
+            with pytest.raises(ValueError, match="does not support structured output"):
+                await pipe._build_interaction_request_options(
+                    structured_body, metadata, pipe.valves, selected
+                )
+
+
 def test_endpoint_identity_isolates_model_project_service_and_base_url():
     developer = _developer_identity().for_model("gemini-2.5-flash")
     assert developer.scope == developer.model_copy().scope
@@ -785,7 +977,7 @@ def test_logger_capture_redacts_signed_state_credentials_and_locations(
             False,
         ),
         (
-            _client_error(400, "INVALID_ARGUMENT", "invalid request"),
+            _client_error(400, "INVALID_ARGUMENT", "PUBLIC_PROVIDER_CANARY"),
             GenerationFailureKind.INVALID_REQUEST,
             False,
         ),
@@ -807,6 +999,25 @@ def test_generation_failure_policy_is_typed(error, kind, retryable):
     failure = Pipe._classify_generation_failure(error)
     assert failure.kind is kind
     assert failure.retryable_across_endpoint is retryable
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _client_error(400, "INVALID_ARGUMENT", "PROVIDER_FAILURE_CANARY"),
+        _server_error(503, "UNAVAILABLE", "PROVIDER_FAILURE_CANARY"),
+        httpx.ReadError("PROVIDER_FAILURE_CANARY"),
+        InteractionExecutionError(
+            GenerationFailureKind.INTERACTION_ERROR, "PROVIDER_FAILURE_CANARY"
+        ),
+        RuntimeError("PROVIDER_FAILURE_CANARY"),
+    ],
+)
+def test_generation_failure_user_details_never_contain_provider_text(error: Exception) -> None:
+    failure = Pipe._classify_generation_failure(error)
+
+    assert "PROVIDER_FAILURE_CANARY" not in failure.detail
+    assert failure.detail.startswith("Gemini")
 
 
 def _emitted_text(emissions, kind: str) -> str:
@@ -973,20 +1184,43 @@ def test_interaction_reducer_terminal_failure_statuses_are_not_success(status: s
 
 
 def test_interaction_reducer_error_unknown_event_step_content_and_delta_fail_closed():
-    with pytest.raises(InteractionExecutionError, match="server exploded"):
+    with pytest.raises(InteractionExecutionError, match="Interaction error event") as error_info:
         InteractionReducer().consume_event(
             interaction_types.ErrorEvent(
                 event_id="error",
-                error=interaction_types.Error(code="500", message="server exploded"),
+                error=interaction_types.Error(code="500", message="PROVIDER_EVENT_CANARY"),
             )
         )
+    assert "PROVIDER_EVENT_CANARY" not in str(error_info.value)
 
-    unknown_event = interaction_types.UnknownInteractionSSEEvent(raw={"event_type": "future"})
-    with pytest.raises(InteractionExecutionError, match="Unknown Interaction event"):
+    unknown_canary = "UNKNOWN_PROVIDER_PAYLOAD_CANARY"
+    unknown_event = interaction_types.UnknownInteractionSSEEvent(raw={"event_type": unknown_canary})
+    with pytest.raises(
+        InteractionExecutionError, match="unknown Interaction event"
+    ) as unknown_info:
         InteractionReducer().consume_event(unknown_event)
+    assert unknown_canary not in str(unknown_info.value)
+
+    model_output_canary = "MODEL_OUTPUT_PROVIDER_CANARY"
+    with pytest.raises(InteractionExecutionError, match="model-output error") as model_output_info:
+        InteractionReducer().consume_interaction(
+            interaction_types.Interaction(
+                status="completed",
+                steps=cast(
+                    list[interaction_types.Step],
+                    [
+                        interaction_types.ModelOutputStep(
+                            type="model_output",
+                            error=interaction_types.Status(code=500, message=model_output_canary),
+                        )
+                    ],
+                ),
+            )
+        )
+    assert model_output_canary not in str(model_output_info.value)
 
     unknown_step_reducer = InteractionReducer()
-    with pytest.raises(InteractionExecutionError, match="Unknown Interaction step"):
+    with pytest.raises(InteractionExecutionError, match="unknown Interaction step"):
         unknown_step_reducer.consume_interaction(
             interaction_types.Interaction(
                 status="completed",
@@ -995,7 +1229,7 @@ def test_interaction_reducer_error_unknown_event_step_content_and_delta_fail_clo
         )
 
     unknown_content_reducer = InteractionReducer()
-    with pytest.raises(InteractionExecutionError, match="Unknown Interaction content"):
+    with pytest.raises(InteractionExecutionError, match="unknown Interaction content"):
         unknown_content_reducer.consume_interaction(
             interaction_types.Interaction(
                 status="completed",
@@ -1015,7 +1249,7 @@ def test_interaction_reducer_error_unknown_event_step_content_and_delta_fail_clo
             step=interaction_types.ModelOutputStep(type="model_output", content=[]),
         )
     )
-    with pytest.raises(InteractionExecutionError, match="Unknown Interaction delta"):
+    with pytest.raises(InteractionExecutionError, match="unknown Interaction delta"):
         unknown_delta_reducer.consume_event(
             interaction_types.StepDelta(
                 index=0,
@@ -1092,10 +1326,13 @@ def test_interactions_usage_normalizes_modality_breakdowns():
             True,
             {
                 "input_cost": 0.00008,
-                "cache_cost": 0.0,
+                "cache_cost": 0.000002,
                 "output_cost": 0.00009,
                 "image_output_cost": 0.0003,
-                "total_cost": 0.00047,
+                "known_cost": 0.000472,
+                "total_cost": 0.000472,
+                "is_complete": True,
+                "unpriced_tokens": 0,
             },
         ),
         (
@@ -1103,10 +1340,13 @@ def test_interactions_usage_normalizes_modality_breakdowns():
             False,
             {
                 "input_cost": 0.00008,
-                "cache_cost": 0.0,
+                "cache_cost": 0.000002,
                 "output_cost": 0.00009,
-                "image_output_cost": 0.0,
-                "total_cost": 0.00017,
+                "image_output_cost": None,
+                "known_cost": 0.000172,
+                "total_cost": None,
+                "is_complete": False,
+                "unpriced_tokens": 10,
             },
         ),
         (
@@ -1117,7 +1357,10 @@ def test_interactions_usage_normalizes_modality_breakdowns():
                 "cache_cost": 0.0,
                 "output_cost": 0.0,
                 "image_output_cost": 0.0,
+                "known_cost": 0.0,
                 "total_cost": 0.0,
+                "is_complete": True,
+                "unpriced_tokens": 0,
             },
         ),
     ],
@@ -1127,7 +1370,7 @@ async def test_interactions_usage_costs_image_output_once(
     pipe_instance_fixture,
     is_paid_api: bool,
     include_image_price: bool,
-    expected: dict[str, float],
+    expected: dict[str, object],
 ):
     pipe, _ = pipe_instance_fixture
     selected = _selected_service(image=include_image_price)
@@ -1145,6 +1388,8 @@ async def test_interactions_usage_costs_image_output_once(
         thought_tokens=5,
         cached_tokens=20,
         total_tokens=155,
+        input_by_modality=[{"modality": "text", "tokens": 100}],
+        cached_by_modality=[{"modality": "text", "tokens": 20}],
         output_by_modality=[{"modality": "image", "tokens": 10}],
     )
 
@@ -1162,7 +1407,12 @@ def test_usage_pricing_is_resolved_from_completed_attempt_service(pipe_instance_
         input_price=10.0,
         output_price=20.0,
     )
-    usage = NormalizedInteractionUsage(input_tokens=100, output_tokens=50, total_tokens=150)
+    usage = NormalizedInteractionUsage(
+        input_tokens=100,
+        output_tokens=50,
+        total_tokens=150,
+        input_by_modality=[{"modality": "text", "tokens": 100}],
+    )
 
     developer = pipe._get_interaction_usage_data(
         usage,
@@ -1194,6 +1444,118 @@ def test_usage_pricing_is_resolved_from_completed_attempt_service(pipe_instance_
 
     assert cast(dict, developer["cost_details"])["total_cost"] == 0.0002
     assert cast(dict, enterprise_result["cost_details"])["total_cost"] == 0.002
+
+
+def test_whole_prompt_pricing_selects_one_rate_at_threshold_boundary() -> None:
+    rate = CatalogPricedRate.model_validate(
+        {
+            "state": "priced",
+            "tiers": [
+                {"up_to_prompt_tokens": 200_000, "price_per_million": 2.0},
+                {"up_to_prompt_tokens": None, "price_per_million": 4.0},
+            ],
+        }
+    )
+    unknown = CatalogUnpricedRate(state="unpriced", reason="No exact price is published.")
+
+    assert Pipe._calculate_cost(100_000, 200_000, rate) == 0.2
+    assert Pipe._calculate_cost(100_000, 200_001, rate) == 0.4
+    assert Pipe._calculate_cost(100_000, 200_000, unknown) is None
+
+
+def test_all_catalog_models_account_every_modality_cache_and_unknown_price(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+    catalog = AppStateModelCatalog.model_validate(
+        yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    )
+
+    for model_id, model in catalog.runtime_models().items():
+        policy = model.services.developer
+        assert isinstance(policy, CatalogSupportedService)
+        selected = SelectedCatalogService(
+            model_id=model_id,
+            service="developer",
+            policy=policy,
+        )
+        input_modalities = sorted(policy.content.inputs)
+        output_modalities = sorted(policy.content.outputs)
+        usage = NormalizedInteractionUsage(
+            input_tokens=10 * len(input_modalities),
+            output_tokens=5 * len(output_modalities),
+            cached_tokens=len(input_modalities),
+            total_tokens=15 * len(input_modalities) + 5 * len(output_modalities),
+            input_by_modality=[
+                {"modality": modality, "tokens": 10} for modality in input_modalities
+            ],
+            cached_by_modality=[
+                {"modality": modality, "tokens": 1} for modality in input_modalities
+            ],
+            output_by_modality=[
+                {"modality": modality, "tokens": 5} for modality in output_modalities
+            ],
+        )
+        expected_unknown = sum(
+            9
+            for modality in input_modalities
+            if isinstance(policy.pricing.input[modality], CatalogUnpricedRate)
+        ) + sum(
+            1
+            for modality in input_modalities
+            if isinstance(policy.pricing.cached_input[modality], CatalogUnpricedRate)
+        )
+
+        result = pipe._get_interaction_usage_data(
+            usage,
+            selected,
+            cast(
+                Metadata,
+                {
+                    "canonical_model_id": model_id,
+                    "is_paid_api": True,
+                    "gemini_catalog_service": "developer",
+                },
+            ),
+            0.0,
+        )
+        costs = cast(dict[str, object], result["cost_details"])
+        assert costs["unpriced_tokens"] == expected_unknown, model_id
+        assert costs["is_complete"] is (expected_unknown == 0), model_id
+        assert (costs["total_cost"] is None) is (expected_unknown > 0), model_id
+
+
+def test_tool_use_tokens_remain_explicitly_unpriced(pipe_instance_fixture) -> None:
+    pipe, _ = pipe_instance_fixture
+    usage = NormalizedInteractionUsage(
+        input_tokens=10,
+        output_tokens=5,
+        tool_use_tokens=3,
+        total_tokens=18,
+        input_by_modality=[{"modality": "text", "tokens": 10}],
+        output_by_modality=[{"modality": "text", "tokens": 5}],
+    )
+
+    result = pipe._get_interaction_usage_data(
+        usage,
+        _selected_service(),
+        cast(
+            Metadata,
+            {
+                "canonical_model_id": "gemini-test",
+                "is_paid_api": True,
+                "gemini_catalog_service": "developer",
+            },
+        ),
+        0.0,
+    )
+
+    costs = cast(dict[str, object], result["cost_details"])
+    assert costs["unpriced_tokens"] == 3
+    assert costs["known_cost"] is not None
+    assert costs["total_cost"] is None
+    assert costs["is_complete"] is False
 
 
 def test_interactions_migration_removal_guard():
@@ -1678,6 +2040,40 @@ async def test_companion_resolves_only_known_redirect_sources() -> None:
 
 
 @pytest.mark.asyncio
+async def test_companion_url_and_catalog_failures_redact_sources_and_exceptions() -> None:
+    companion = CompanionFilter()
+    signed_url = "https://private.example/path?token=SIGNED_URL_CANARY"
+    provider_canary = "CATALOG_PROVIDER_CANARY"
+    captured: list[str] = []
+    handler_id = companion_module.log.add(
+        lambda message: captured.append(str(message)), format="{message}"
+    )
+    try:
+        session = MagicMock()
+        session.get.side_effect = RuntimeError(provider_canary)
+        resolved, success = await companion._resolve_url(session, signed_url)
+        assert (resolved, success) == (signed_url, False)
+
+        CompanionFilter._load_model_config.cache_clear()
+        with (
+            patch(
+                "plugins.filters.gemini_manifold_companion.urllib.request.urlopen",
+                side_effect=RuntimeError(provider_canary),
+            ),
+            pytest.raises(ModelCatalogError) as error_info,
+        ):
+            CompanionFilter._load_model_config(signed_url)
+    finally:
+        companion_module.log.remove(handler_id)
+        CompanionFilter._load_model_config.cache_clear()
+
+    observable = "\n".join(captured) + str(error_info.value)
+    assert "SIGNED_URL_CANARY" not in observable
+    assert provider_canary not in observable
+    assert str(error_info.value) == "Gemini model catalog is unavailable or invalid."
+
+
+@pytest.mark.asyncio
 async def test_companion_digest_prevents_duplicate_or_edited_grounding() -> None:
     visible = "cited"
     envelope = {
@@ -1833,7 +2229,6 @@ async def test_interaction_stream_closes_and_emits_done_only_on_completed(
     emitter = MagicMock(spec=EventEmitter)
     emitter.start_time = 0.0
     app = FastAPI()
-    app.state._state["gemini_model_config"] = {}
 
     chunks = [
         chunk
@@ -1855,8 +2250,9 @@ async def test_interaction_stream_closes_and_emits_done_only_on_completed(
 @pytest.mark.asyncio
 async def test_interaction_stream_resumes_same_id_and_event_cursor(pipe_instance_fixture):
     pipe_instance, _ = pipe_instance_fixture
+    cursor_canary = "SIGNED_EVENT_CURSOR_CANARY"
     created = interaction_types.InteractionCreatedEvent(
-        event_id="cursor-1",
+        event_id=cursor_canary,
         interaction=interaction_types.InteractionSseEventInteraction(
             id="interaction-stream", status="in_progress"
         ),
@@ -1868,23 +2264,30 @@ async def test_interaction_stream_resumes_same_id_and_event_cursor(pipe_instance
     emitter = MagicMock(spec=EventEmitter)
     emitter.start_time = 0.0
     app = FastAPI()
-    app.state._state["gemini_model_config"] = {}
 
-    chunks = [
-        chunk
-        async for chunk in pipe_instance._present_interaction_stream(
-            stream=cast(AsyncInteractionStream, first),
-            interactions=cast(AsyncInteractionsBoundary, boundary),
-            app=app,
-            event_emitter=emitter,
-            metadata=cast("Metadata", {}),
-            selected_service=_selected_service(),
-        )
-    ]
+    captured: list[str] = []
+    handler_id = gemini_manifold_module.log.add(
+        lambda message: captured.append(str(message)), format="{message}"
+    )
+    try:
+        chunks = [
+            chunk
+            async for chunk in pipe_instance._present_interaction_stream(
+                stream=cast(AsyncInteractionStream, first),
+                interactions=cast(AsyncInteractionsBoundary, boundary),
+                app=app,
+                event_emitter=emitter,
+                metadata=cast("Metadata", {}),
+                selected_service=_selected_service(),
+            )
+        ]
+    finally:
+        gemini_manifold_module.log.remove(handler_id)
 
     boundary.get.assert_awaited_once_with(
-        "interaction-stream", stream=True, last_event_id="cursor-1"
+        "interaction-stream", stream=True, last_event_id=cursor_canary
     )
+    assert cursor_canary not in "\n".join(captured)
     assert first.closed and resumed.closed
     assert chunks[-1] == "data: [DONE]"
 
@@ -1915,10 +2318,17 @@ async def test_interaction_stream_empty_error_and_cancel_never_emit_done(
         ]
     assert empty.closed
 
+    stream_canary = "STREAM_PROVIDER_ERROR_CANARY"
     failed = _FakeInteractionStream(
-        [interaction_types.ErrorEvent(error=interaction_types.Error(code="500", message="failed"))]
+        [
+            interaction_types.ErrorEvent(
+                error=interaction_types.Error(code="500", message=stream_canary)
+            )
+        ]
     )
-    with pytest.raises(InteractionExecutionError, match="failed"):
+    with pytest.raises(
+        InteractionExecutionError, match="Interaction error event"
+    ) as stream_error_info:
         _ = [
             chunk
             async for chunk in pipe_instance._present_interaction_stream(
@@ -1930,6 +2340,7 @@ async def test_interaction_stream_empty_error_and_cancel_never_emit_done(
                 selected_service=_selected_service(),
             )
         ]
+    assert stream_canary not in str(stream_error_info.value)
     assert failed.closed
 
     cancelled = _FakeInteractionStream([], error=asyncio.CancelledError())
@@ -1971,17 +2382,44 @@ def _authorized_tool(
     }
 
 
+FORBIDDEN_AUTOMATIC_TOOL_REQUEST_FIELDS = {
+    "automatic_function_calling",
+    "automatic_function_calling_config",
+    "cached_content",
+    "batch",
+    "batch_api",
+    "batch_config",
+    "video_metadata",
+}
+
+
+def _assert_explicit_function_requests(raw_requests: list[dict[str, object]]) -> None:
+    def contains_callable(value: object) -> bool:
+        if isinstance(value, dict):
+            return any(contains_callable(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_callable(item) for item in value)
+        return callable(value)
+
+    assert raw_requests
+    for request in raw_requests:
+        assert FORBIDDEN_AUTOMATIC_TOOL_REQUEST_FIELDS.isdisjoint(request)
+        tools = cast(list[dict[str, object]], request["tools"])
+        assert tools
+        assert all(tool.get("type") == "function" for tool in tools)
+        assert not contains_callable(tools)
+
+
 def _function_policy(enabled: bool = True) -> CatalogInteractions:
     return _selected_service(custom_function_calling=enabled).policy.interactions
 
 
-def test_open_webui_tool_registry_uses_authorized_mapping_name_and_task_gating():
+def test_open_webui_tool_registry_uses_authorized_mapping_name():
     function = AsyncMock(return_value={"ok": True})
     registry = Pipe._resolve_open_webui_tools(
         {"catalog_lookup": _authorized_tool(function)},
         model_id="gemini-3.5-flash",
         interactions_policy=_function_policy(),
-        is_task=False,
     )
 
     assert list(registry) == ["catalog_lookup"]
@@ -1991,15 +2429,39 @@ def test_open_webui_tool_registry_uses_authorized_mapping_name_and_task_gating()
         "properties": {"query": {"type": "string"}},
         "required": ["query"],
     }
-    assert (
-        Pipe._resolve_open_webui_tools(
-            {"catalog_lookup": _authorized_tool(function)},
-            model_id="gemini-3.5-flash",
-            interactions_policy=_function_policy(),
-            is_task=True,
-        )
-        == {}
-    )
+
+
+def test_installed_catalog_advertises_only_implemented_tools_and_functions() -> None:
+    catalog = Pipe._validate_app_state_catalog(_installed_model_catalog()).payload.runtime_models()
+    implemented_builtins = {
+        "google_search",
+        "code_execution",
+        "url_context",
+        "google_maps",
+    }
+    custom_function_models: set[str] = set()
+
+    for model_id, model in catalog.items():
+        developer = model.services.developer
+        assert isinstance(developer, CatalogSupportedService), model_id
+        assert isinstance(model.services.enterprise, CatalogUnavailableService), model_id
+        policy = developer.interactions
+        if policy.custom_function_calling:
+            custom_function_models.add(model_id)
+        advertised = {
+            tool_name
+            for tool_name in (
+                "google_search",
+                "code_execution",
+                "url_context",
+                "google_maps",
+            )
+            if getattr(policy.tools, tool_name)
+        }
+        assert advertised <= implemented_builtins, model_id
+        assert policy.tools.file_search is False, model_id
+
+    assert custom_function_models == {"gemini-3.5-flash"}
 
 
 @pytest.mark.parametrize(
@@ -2030,7 +2492,6 @@ def test_open_webui_tool_registry_fails_closed(tools, policy, message):
             tools,
             model_id="gemini-3.5-flash",
             interactions_policy=policy,
-            is_task=False,
         )
 
 
@@ -2070,9 +2531,10 @@ async def test_selected_service_output_limit_is_enforced(pipe_instance_fixture):
 
 
 def test_app_state_catalog_boundary_narrows_supported_and_unavailable_services() -> None:
-    catalog = Pipe._validate_app_state_catalog({"gemini-test": _catalog_model_entry()})
-    developer = catalog.root["gemini-test"].services.developer
-    enterprise = catalog.root["gemini-test"].services.enterprise
+    envelope = Pipe._validate_app_state_catalog(_installed_model_catalog())
+    catalog = envelope.payload.runtime_models()
+    developer = catalog["gemini-2.5-flash"].services.developer
+    enterprise = catalog["gemini-2.5-flash"].services.enterprise
 
     assert isinstance(developer, CatalogSupportedService)
     assert developer.limits.output_tokens == 65_536
@@ -2080,26 +2542,19 @@ def test_app_state_catalog_boundary_narrows_supported_and_unavailable_services()
     assert enterprise.availability == "unverified"
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda entry: cast(dict, cast(dict, entry["services"])["developer"])["interactions"].pop(
-            "tools"
-        ),
-        lambda entry: cast(dict, cast(dict, entry["services"])["enterprise"]).__setitem__(
-            "pricing", {}
-        ),
-        lambda entry: cast(dict, cast(dict, entry["services"])["developer"]).__setitem__(
-            "unexpected", True
-        ),
-    ],
-)
-def test_app_state_catalog_boundary_rejects_malformed_nested_policy(mutate) -> None:
-    entry = _catalog_model_entry()
-    mutate(entry)
+@pytest.mark.parametrize("mutation", ["missing", "extra", "digest"])
+def test_app_state_catalog_boundary_rejects_malformed_nested_policy(mutation: str) -> None:
+    envelope = _installed_model_catalog()
+    interactions = envelope["payload"]["product_authorizations"]["gemini-2.5-flash"]["interactions"]
+    if mutation == "missing":
+        interactions.pop("tools")
+    elif mutation == "extra":
+        interactions["unexpected"] = True
+    else:
+        envelope["canonical_digest"] = "sha256:" + "0" * 64
 
-    with pytest.raises(ValueError, match="catalog protocol 2"):
-        Pipe._validate_app_state_catalog({"gemini-test": entry})
+    with pytest.raises(ValueError, match="catalog protocol 3"):
+        Pipe._validate_app_state_catalog(envelope)
 
 
 def _function_call(call_id: str, arguments: dict | None = None, name: str = "lookup"):
@@ -2198,7 +2653,6 @@ def _tool_registry(function: AsyncMock):
         {"lookup": _authorized_tool(function)},
         model_id="gemini-3.5-flash",
         interactions_policy=_function_policy(),
-        is_task=False,
     )
 
 
@@ -2439,9 +2893,166 @@ async def test_custom_function_duplicate_call_is_idempotent_and_conflict_fails(
 
 
 @pytest.mark.asyncio
-async def test_custom_function_loop_enforces_store_and_round_bounds(
-    pipe_instance_fixture, monkeypatch
+async def test_custom_function_loop_stateless_replays_full_signed_ledger_and_config(
+    pipe_instance_fixture,
 ):
+    pipe, _ = pipe_instance_fixture
+    signature = base64.b64encode(b"opaque-tool-thought").decode("ascii")
+    first = interaction_types.Interaction(
+        id=None,
+        status="requires_action",
+        steps=[
+            interaction_types.ThoughtStep(signature=signature),
+            _function_call("call-1"),
+        ],
+    )
+    boundary = MagicMock()
+    boundary.create = AsyncMock(side_effect=[first, _final_interaction()])
+    root = cast(
+        list[interaction_types.StepParam],
+        [{"type": "user_input", "content": [{"type": "text", "text": "go"}]}],
+    )
+    common_request = {
+        "model": "gemini-3.5-flash",
+        "input": root,
+        "store": False,
+        "previous_interaction_id": "must-not-leak",
+        "system_instruction": "remain exact",
+        "generation_config": {"temperature": 0.25},
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "response_format": {"type": "text", "mime_type": "text/plain"},
+    }
+
+    _emissions, reduction = await pipe._run_custom_function_loop(
+        interactions=cast(AsyncInteractionsBoundary, boundary),
+        common_request=common_request,
+        registry=_tool_registry(AsyncMock(return_value={"ok": True})),
+        root_replay_input=root,
+    )
+
+    assert reduction.status == "completed"
+    assert boundary.create.await_count == 2
+    first_request, second_request = [call.kwargs for call in boundary.create.await_args_list]
+    for request in (first_request, second_request):
+        assert request["store"] is False
+        assert "previous_interaction_id" not in request
+        assert request["system_instruction"] == "remain exact"
+        assert request["generation_config"] == {"temperature": 0.25}
+        assert request["tools"] == common_request["tools"]
+        assert request["response_format"] == common_request["response_format"]
+    assert [step["type"] for step in second_request["input"]] == [
+        "user_input",
+        "thought",
+        "function_call",
+        "function_result",
+    ]
+    assert second_request["input"][1]["signature"] == signature
+    assert second_request["input"][2]["id"] == "call-1"
+    assert second_request["input"][3]["call_id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_custom_function_loop_stateless_sse_replay_is_cumulative_across_rounds(
+    pipe_instance_fixture,
+):
+    pipe, _ = pipe_instance_fixture
+    streams = [
+        _tool_stream("round-1", _function_call("call-1")),
+        _tool_stream("round-2", _function_call("call-2")),
+        _final_stream(),
+    ]
+    boundary = FakeInteractions(streams)
+    root = cast(
+        list[interaction_types.StepParam],
+        [{"type": "user_input", "content": [{"type": "text", "text": "go"}]}],
+    )
+
+    _emissions, reduction = await pipe._run_custom_function_loop(
+        interactions=cast(AsyncInteractionsBoundary, boundary),
+        common_request={"model": "gemini-3.5-flash", "input": root, "store": False},
+        registry=_tool_registry(AsyncMock(return_value="ok")),
+        root_replay_input=root,
+        stream=True,
+    )
+
+    assert reduction.status == "completed"
+    assert [len(cast(list, request.input)) for request in boundary.requests] == [1, 3, 5]
+    assert all(request.previous_interaction_id is None for request in boundary.requests)
+    assert all(request.store is False and request.stream is True for request in boundary.requests)
+    assert all(stream.close_count == 1 for stream in streams)
+    boundary.assert_exhausted()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("root", "message"),
+    [
+        (
+            [{"type": "function_call", "id": "orphan", "name": "lookup", "arguments": {}}],
+            "end with",
+        ),
+        (
+            [
+                {"type": "function_call", "id": "orphan", "name": "lookup", "arguments": {}},
+                {"type": "user_input", "content": [{"type": "text", "text": "go"}]},
+            ],
+            "incomplete",
+        ),
+        (
+            [
+                {
+                    "type": "function_result",
+                    "call_id": "missing-call",
+                    "name": "lookup",
+                    "result": "no call",
+                },
+                {"type": "user_input", "content": [{"type": "text", "text": "go"}]},
+            ],
+            "orphan",
+        ),
+        (
+            [
+                {"type": "function_call", "id": "same", "name": "lookup", "arguments": {}},
+                {
+                    "type": "function_result",
+                    "call_id": "same",
+                    "name": "lookup",
+                    "result": "done",
+                },
+                {"type": "function_call", "id": "same", "name": "lookup", "arguments": {}},
+                {
+                    "type": "function_result",
+                    "call_id": "same",
+                    "name": "lookup",
+                    "result": "again",
+                },
+                {"type": "user_input", "content": [{"type": "text", "text": "go"}]},
+            ],
+            "duplicate",
+        ),
+        ([{"type": "new_future_step"}], "unknown"),
+    ],
+)
+async def test_custom_function_loop_rejects_invalid_stateless_root_before_provider_or_tool(
+    pipe_instance_fixture, root, message
+):
+    pipe, _ = pipe_instance_fixture
+    boundary = MagicMock()
+    boundary.create = AsyncMock()
+    function = AsyncMock(return_value="must not run")
+    with pytest.raises(ValueError, match=message):
+        await pipe._run_custom_function_loop(
+            interactions=cast(AsyncInteractionsBoundary, boundary),
+            common_request={"model": "gemini-3.5-flash", "input": root, "store": False},
+            registry=_tool_registry(function),
+            root_replay_input=cast(list[interaction_types.StepParam], root),
+        )
+    boundary.create.assert_not_awaited()
+    function.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_custom_function_loop_enforces_round_bounds(pipe_instance_fixture, monkeypatch):
     pipe, _ = pipe_instance_fixture
     function = AsyncMock(return_value="again")
     registry = _tool_registry(function)
@@ -2452,13 +3063,6 @@ async def test_custom_function_loop_enforces_store_and_round_bounds(
             _tool_interaction("two", _function_call("two")),
         ]
     )
-    with pytest.raises(ValueError, match="store=true"):
-        await pipe._run_custom_function_loop(
-            interactions=cast(AsyncInteractionsBoundary, boundary),
-            common_request={"model": "gemini-3.5-flash", "input": "go", "store": False},
-            registry=registry,
-        )
-
     monkeypatch.setattr(gemini_manifold_module, "GEMINI_TOOL_MAX_ROUNDS", 2)
     with pytest.raises(InteractionExecutionError, match="2-round"):
         await pipe._run_custom_function_loop(
@@ -2683,6 +3287,36 @@ def test_continuation_edit_privacy_and_non_gemini_parent_force_replay(
     assert not edited.select_continuation(
         full_input, store=True, endpoint_scope="scope", model_id="gemini-3.5-flash"
     ).used_server_state
+
+
+@pytest.mark.asyncio
+async def test_edit_detection_never_logs_prompt_or_output_text(pipe_instance_fixture) -> None:
+    pipe, _ = pipe_instance_fixture
+    canary = "EDITED_CONVERSATION_CANARY"
+    builder = _continuation_builder(pipe, parent_content=canary)
+    assert builder.messages_db is not None
+    message_db = builder.messages_db[1]
+    event_emitter = cast(MagicMock, builder.event_emitter)
+    builder._interaction_contents_from_text = AsyncMock(
+        return_value=[interaction_types.TextContentParam(type="text", text=canary)]
+    )
+    captured: list[str] = []
+    handler_id = gemini_manifold_module.log.add(
+        lambda message: captured.append(str(message)), format="{message}"
+    )
+    try:
+        await builder._process_assistant_message(
+            1,
+            cast("AssistantMessage", {"role": "assistant", "content": canary}),
+            cast("ChatMessageTD", message_db),
+            None,
+            asyncio.Queue(),
+        )
+    finally:
+        gemini_manifold_module.log.remove(handler_id)
+
+    assert canary not in "\n".join(captured)
+    assert canary not in str(event_emitter.emit_toast.call_args_list)
 
 
 @pytest.mark.parametrize(
@@ -3308,7 +3942,7 @@ async def test_paid_api_toggle_selects_correct_key(
     Pipe._get_or_create_genai_client.cache_clear()
 
     # Provide both the model ID and the canonical ID required by the new pipe logic
-    model_id = "gemini-pro"
+    model_id = "gemini-2.5-flash"
     __metadata__ = {"model": {"id": model_id}, "canonical_model_id": model_id}
 
     # Ensure both keys are present in the initial valves
@@ -3317,10 +3951,7 @@ async def test_paid_api_toggle_selects_correct_key(
 
     # Mock the request app state which is now required early in pipe()
     mock_request = MagicMock()
-    mock_request.app.state._state = {
-        "gemini_model_config": {model_id: _catalog_model_entry()},
-        "gemini_model_catalog_schema_version": 2,
-    }
+    mock_request.app.state._state = {"gemini_model_catalog": _installed_model_catalog()}
 
     def mock_toggle_side_effect(filter_id, metadata):
         if filter_id == "gemini_paid_api":
@@ -3402,19 +4033,77 @@ async def test_developer_discovery_uses_catalog_not_legacy_supported_actions(
 ) -> None:
     pipe, _ = pipe_instance_fixture
     await _clear_model_discovery_cache(pipe)
+    display_canary = "PROVIDER_DISPLAY_NAME_CANARY"
+    description_canary = "PROVIDER_DESCRIPTION_CANARY"
+    uncatalogued_canary = "PROVIDER_UNCATALOGUED_ID_CANARY"
     listed_models = [
         gemini_types.Model(
             name="models/gemini-2.5-flash",
-            display_name="Catalogued without legacy actions",
+            display_name=display_canary,
+            description=description_canary,
             supported_actions=[],
         ),
         gemini_types.Model(
-            name="models/gemini-future-uncatalogued",
+            name=f"models/{uncatalogued_canary}",
             display_name="Uncatalogued with legacy action",
             supported_actions=["generateContent"],
         ),
     ]
     fetch = AsyncMock(return_value=listed_models)
+    captured: list[str] = []
+    handler_id = gemini_manifold_module.log.add(
+        lambda message: captured.append(str(message)), format="{message}"
+    )
+
+    try:
+        with (
+            patch.object(
+                pipe,
+                "_get_or_create_genai_client",
+                return_value=_developer_discovery_binding(),
+            ),
+            patch.object(pipe, "_fetch_models_from_client_internal", new=fetch),
+        ):
+            models = await pipe._get_genai_models(free_api_key="developer-key")
+    finally:
+        gemini_manifold_module.log.remove(handler_id)
+
+    assert models == [
+        {
+            "id": "gemini-2.5-flash",
+            "name": "gemini-2.5-flash",
+            "description": "Catalog-validated Gemini model.",
+        }
+    ]
+    observable = repr(models) + "\n".join(captured)
+    assert display_canary not in observable
+    assert description_canary not in observable
+    assert uncatalogued_canary not in observable
+    fetch.assert_awaited_once()
+    await _clear_model_discovery_cache(pipe)
+
+
+@pytest.mark.asyncio
+async def test_developer_discovery_surfaces_all_retained_and_no_excluded_targets(
+    pipe_instance_fixture,
+) -> None:
+    pipe, _ = pipe_instance_fixture
+    await _clear_model_discovery_cache(pipe)
+    provenance_path = (
+        Path(__file__).parents[1] / "docs" / "development" / "gemini-model-provenance-v1.yaml"
+    )
+    provenance = yaml.safe_load(provenance_path.read_text(encoding="utf-8"))
+    provider_ids = provenance["interactions_supported_ids"]
+    excluded = set(provenance["product_scope_exclusions"])
+    removed = {
+        model_id
+        for model_id, decision in provenance["current_catalog_reconciliation"].items()
+        if decision["disposition"] == "remove"
+    }
+    listed_ids = list(provider_ids["models"]) + list(provider_ids["agents"]) + sorted(removed)
+    fetch = AsyncMock(
+        return_value=[gemini_types.Model(name=f"models/{model_id}") for model_id in listed_ids]
+    )
 
     with (
         patch.object(
@@ -3424,15 +4113,11 @@ async def test_developer_discovery_uses_catalog_not_legacy_supported_actions(
         ),
         patch.object(pipe, "_fetch_models_from_client_internal", new=fetch),
     ):
-        models = await pipe._get_genai_models(free_api_key="developer-key")
+        models = await pipe._get_genai_models(free_api_key="developer-key-all-models")
 
-    assert models == [
-        {
-            "id": "gemini-2.5-flash",
-            "name": "Catalogued without legacy actions",
-            "description": None,
-        }
-    ]
+    discovered = {model["id"] for model in models}
+    assert discovered == CATALOG_MODEL_IDS
+    assert discovered.isdisjoint(excluded | removed)
     fetch.assert_awaited_once()
     await _clear_model_discovery_cache(pipe)
 
@@ -3520,8 +4205,8 @@ async def test_combined_discovery_deduplicates_developer_models_before_merge(
     assert models == [
         {
             "id": "gemini-2.5-flash",
-            "name": "First Developer listing",
-            "description": None,
+            "name": "gemini-2.5-flash",
+            "description": "Catalog-validated Gemini model.",
         }
     ]
     await _clear_model_discovery_cache(pipe)
@@ -3574,9 +4259,10 @@ async def test_enterprise_discovery_hides_unverified_catalog_models(pipe_instanc
             new=AsyncMock(
                 return_value=[
                     gemini_types.Model(
-                        name="publishers/google/models/gemini-2.5-flash",
-                        display_name="Gemini 2.5 Flash",
+                        name=f"publishers/google/models/{model_id}",
+                        display_name=model_id,
                     )
+                    for model_id in CATALOG_MODEL_IDS
                 ]
             ),
         ),
@@ -3894,14 +4580,14 @@ async def test_files_public_state_policy_processing_failed_and_expired():
     failed = gemini_types.File(
         name="files/failed",
         state=gemini_types.FileState.FAILED,
-        error=gemini_types.FileStatus(code=13, message="decode failed"),
+        error=gemini_types.FileStatus(code=13, message="FILES_PROVIDER_CANARY"),
     )
     client.aio.files.get = AsyncMock(return_value=failed)
-    with pytest.raises(FilesAPIError, match="decode failed"):
+    with pytest.raises(FilesAPIError, match="could not process an uploaded file") as error_info:
         await manager._poll_for_active_state("files/failed", "owui-id")
-    emitter.emit_toast.assert_called_with(
-        "Google could not process 'owui-id'. Reason: decode failed", "error"
-    )
+    assert "FILES_PROVIDER_CANARY" not in str(error_info.value)
+    assert "FILES_PROVIDER_CANARY" not in str(emitter.emit_toast.call_args_list)
+    emitter.emit_toast.assert_called_with("Gemini could not process an uploaded file.", "error")
     assert manager._calculate_ttl(datetime.now(UTC) - timedelta(seconds=1)) == 0
 
 
@@ -3918,16 +4604,18 @@ async def test_get_file_source_resolves_open_webui_storage_path(tmp_path):
     file_model = MagicMock()
     file_model.path = "s3://bucket/uploads/stored.pdf"
     file_model.meta = {"content_type": "application/pdf"}
-    mock_files_module.Files.get_file_by_id = AsyncMock(return_value=file_model)
+    mock_files_module.Files.get_file_by_id_and_user_id = AsyncMock(return_value=file_model)
     mock_storage_module.Storage.get_file.return_value = str(local_path)
 
-    source = await GeminiContentBuilder._get_file_source("stored-file-id")
+    source = await GeminiContentBuilder._get_file_source("stored-file-id", "owner-user")
 
     assert source is not None
     assert source.file_path == str(local_path)
     assert source.file_bytes is None
     assert source.mime_type == "application/pdf"
-    mock_files_module.Files.get_file_by_id.assert_awaited_once_with("stored-file-id")
+    mock_files_module.Files.get_file_by_id_and_user_id.assert_awaited_once_with(
+        id="stored-file-id", user_id="owner-user"
+    )
     mock_storage_module.Storage.get_file.assert_called_once_with("s3://bucket/uploads/stored.pdf")
 
 
@@ -3941,17 +4629,49 @@ async def test_get_file_data_resolves_open_webui_storage_path(tmp_path):
     file_model = MagicMock()
     file_model.path = "https://account.blob.core.windows.net/container/history.pdf"
     file_model.meta = {"content_type": "application/pdf"}
-    mock_files_module.Files.get_file_by_id = AsyncMock(return_value=file_model)
+    mock_files_module.Files.get_file_by_id_and_user_id = AsyncMock(return_value=file_model)
     mock_storage_module.Storage.get_file.return_value = str(local_path)
 
-    data, mime_type = await GeminiContentBuilder._get_file_data("history-file-id")
+    data, mime_type = await GeminiContentBuilder._get_file_data("history-file-id", "owner-user")
 
     assert data == file_bytes
     assert mime_type == "application/pdf"
-    mock_files_module.Files.get_file_by_id.assert_awaited_once_with("history-file-id")
+    mock_files_module.Files.get_file_by_id_and_user_id.assert_awaited_once_with(
+        id="history-file-id", user_id="owner-user"
+    )
     mock_storage_module.Storage.get_file.assert_called_once_with(
         "https://account.blob.core.windows.net/container/history.pdf"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reader_name", ["_get_file_source", "_get_file_data"])
+async def test_local_file_read_denies_non_owner_before_storage_without_identifier_leak(
+    reader_name: str,
+) -> None:
+    file_canary = "TRANSPLANTED_FILE_IDENTIFIER_CANARY"
+    user_canary = "REQUESTING_USER_IDENTIFIER_CANARY"
+    mock_files_module.reset_mock()
+    mock_storage_module.reset_mock()
+    mock_files_module.Files.get_file_by_id_and_user_id = AsyncMock(return_value=None)
+    captured: list[str] = []
+    handler_id = gemini_manifold_module.log.add(
+        lambda message: captured.append(str(message)), format="{message}"
+    )
+    try:
+        reader = getattr(GeminiContentBuilder, reader_name)
+        with pytest.raises(LocalFileAccessError, match="file access was denied"):
+            await reader(file_canary, user_canary)
+    finally:
+        gemini_manifold_module.log.remove(handler_id)
+
+    mock_files_module.Files.get_file_by_id_and_user_id.assert_awaited_once_with(
+        id=file_canary, user_id=user_canary
+    )
+    mock_storage_module.Storage.get_file.assert_not_called()
+    emitted = "\n".join(captured)
+    assert file_canary not in emitted
+    assert user_canary not in emitted
 
 
 @pytest.mark.asyncio
@@ -4307,7 +5027,7 @@ async def test_builder_build_contents_user_text_with_pdf(pipe_instance_fixture):
 
         # Assert
         mock_get_chat.assert_called_once_with(id="test_chat_id", user_id="test_user_id")
-        mock_get_file_source.assert_awaited_once_with(pdf_file_id)
+        mock_get_file_source.assert_awaited_once_with(pdf_file_id, "test_user_id")
 
         mock_files_api_manager.get_or_upload_file.assert_awaited_once_with(
             file_bytes=fake_pdf_bytes,
@@ -4458,8 +5178,8 @@ async def test_builder_build_contents_with_multiple_pdf_attachments(
         }
     ]
     assert mock_get_file_source.await_args_list == [
-        call(first_pdf_id),
-        call(second_pdf_id),
+        call(first_pdf_id, "test_user_id"),
+        call(second_pdf_id, "test_user_id"),
     ]
     assert mock_files_api_manager.get_or_upload_file.await_count == 2
     assert [
@@ -4767,7 +5487,7 @@ async def test_builder_rehydrates_generated_local_image_for_exact_replay(
             ],
         }
     ]
-    get_file_data.assert_awaited_once_with("generated-image")
+    get_file_data.assert_awaited_once_with("generated-image", "user")
 
 
 def test_builder_rejects_request_over_100_mib_preflight(pipe_instance_fixture):
@@ -5072,10 +5792,14 @@ async def test_build_contents_raises_content_build_error(pipe_instance_fixture):
 # endregion Test GeminiContentBuilder
 
 
-def _installed_model_catalog() -> dict[str, dict[str, object]]:
+def _installed_model_catalog() -> dict:
     catalog_path = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
-    payload = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
-    return cast(dict[str, dict[str, object]], payload["models"])
+    catalog = CompanionModelCatalog.model_validate(
+        yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    )
+    return CompanionCatalogEnvelope.from_catalog(catalog).model_dump(
+        mode="json", exclude_none=False
+    )
 
 
 def _public_pipe_harness(
@@ -5083,12 +5807,7 @@ def _public_pipe_harness(
 ) -> tuple[Body, dict[str, object], MagicMock, GenAIClientBinding]:
     model_id = "gemini-2.5-flash"
     app = FastAPI()
-    app.state._state.update(
-        {
-            "gemini_model_config": _installed_model_catalog(),
-            "gemini_model_catalog_schema_version": 2,
-        }
-    )
+    app.state._state["gemini_model_catalog"] = _installed_model_catalog()
     request = MagicMock()
     request.app = app
     body = cast(
@@ -5111,6 +5830,48 @@ def _public_pipe_harness(
     pipe.valves.GEMINI_FREE_API_KEY = "sanitized-test-key"
     pipe.valves.GEMINI_PAID_API_KEY = None
     return body, metadata, request, binding
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", sorted(CATALOG_MODEL_IDS))
+async def test_public_pipe_builds_canonical_request_for_every_developer_model(
+    pipe_instance_fixture,
+    model_id: str,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions([completed_interaction("catalog request")])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["model"] = f"gemini_manifold_google_genai.{model_id}"
+    body["stream"] = False
+    pipe.valves.GEMINI_PAID_API_KEY = "sanitized-paid-key"
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "catalog request"
+    assert len(scripted.requests) == 1
+    created = scripted.requests[0]
+    assert created.model == model_id
+    assert created.store is False
+    assert created.previous_interaction_id is None
+    assert created.tools == []
+    image_output = model_id in {"gemini-3-pro-image", "gemini-3.1-flash-image"}
+    assert created.response_format is not None
+    expected_format = (
+        interaction_types.ImageResponseFormat
+        if image_output
+        else interaction_types.TextResponseFormat
+    )
+    assert isinstance(created.response_format, expected_format)
+    scripted.assert_exhausted()
 
 
 @pytest.mark.asyncio
@@ -5169,7 +5930,8 @@ async def test_public_pipe_retries_only_retryable_free_failures(
     if expect_success:
         assert content == "paid success"
     else:
-        assert "Gemini request failed" in content
+        assert content == "Gemini rejected the request configuration."
+        assert "PUBLIC_PROVIDER_CANARY" not in content
 
 
 @pytest.mark.asyncio
@@ -5225,6 +5987,43 @@ async def test_public_pipe_reaches_strict_developer_interactions_only(
     assert isinstance(request_model.input[0], interaction_types.UserInputStep)
     assert request_model.input[0].type == "user_input"
     assert not hasattr(binding.client, "models")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "automatic_function_calling",
+        "automatic_function_calling_config",
+        "cached_content",
+        "batch",
+        "batch_api",
+        "batch_config",
+        "video_metadata",
+    ],
+)
+async def test_public_pipe_rejects_unsupported_interactions_fields_before_create(
+    pipe_instance_fixture,
+    field_name: str,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions([])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    cast(dict[str, object], body)[field_name] = {"enabled": True}
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "Gemini request failed unexpectedly."
+    assert scripted.raw_requests == []
 
 
 @pytest.mark.asyncio
@@ -5363,7 +6162,6 @@ async def test_public_pipe_multimodal_storage_input_and_generated_image_output(
     local_image.write_bytes(input_image)
     interaction = interaction_types.Interaction(
         id="media-interaction",
-        model="gemini-3.1-flash-image-preview",
         status="completed",
         steps=[
             interaction_types.ModelOutputStep(
@@ -5381,7 +6179,7 @@ async def test_public_pipe_multimodal_storage_input_and_generated_image_output(
     )
     scripted = FakeInteractions([interaction])
     body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
-    body["model"] = "gemini_manifold_google_genai.gemini-3.1-flash-image-preview"
+    body["model"] = "gemini_manifold_google_genai.gemini-3.1-flash-image"
     body["stream"] = False
     pipe.valves.GEMINI_PAID_API_KEY = "sanitized-paid-key"
     pipe.valves.USE_FILES_API = False
@@ -5408,7 +6206,7 @@ async def test_public_pipe_multimodal_storage_input_and_generated_image_output(
         current_message_id="assistant-media",
     )
     file_model = MagicMock(path="s3://sanitized/input.png", meta={"content_type": "image/png"})
-    mock_files_module.Files.get_file_by_id = AsyncMock(return_value=file_model)
+    mock_files_module.Files.get_file_by_id_and_user_id = AsyncMock(return_value=file_model)
     mock_storage_module.Storage.get_file.reset_mock()
     mock_storage_module.Storage.get_file.return_value = str(local_image)
     mock_storage_module.Storage.upload_file.return_value = (
@@ -5444,7 +6242,9 @@ async def test_public_pipe_multimodal_storage_input_and_generated_image_output(
     assert len(image_parts) == 1
     assert base64.b64decode(image_parts[0].data or "") == input_image
     assert image_parts[0].uri is None
-    mock_files_module.Files.get_file_by_id.assert_awaited_once_with("input-file")
+    mock_files_module.Files.get_file_by_id_and_user_id.assert_awaited_once_with(
+        id="input-file", user_id="user-harness"
+    )
     mock_storage_module.Storage.get_file.assert_called_once_with("s3://sanitized/input.png")
     mock_storage_module.Storage.upload_file.assert_called_once()
     mock_files_module.Files.insert_new_file.assert_awaited_once()
@@ -5513,7 +6313,210 @@ async def test_public_pipe_rejects_foreign_endpoint_uri_before_create(
         )
 
     assert isinstance(result, dict)
-    assert "URI from a different endpoint identity" in result["choices"][0]["message"]["content"]
+    assert result["choices"][0]["message"]["content"] == "Gemini request failed unexpectedly."
+    assert scripted.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replay_path", ["user_attachment", "assistant_history"])
+async def test_public_pipe_denies_transplanted_local_file_before_storage_or_provider(
+    pipe_instance_fixture,
+    replay_path: str,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions([])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = False
+    file_canary = "TRANSPLANTED_PUBLIC_FILE_CANARY"
+    user_canary = "REQUESTING_PUBLIC_USER_CANARY"
+    metadata.update(
+        {
+            "chat_id": "chat-owned-file",
+            "message_id": "assistant-local-file-owner",
+            "features": {
+                "gemini_manifold_companion_version": "3.0.0",
+                "upload_documents": True,
+            },
+        }
+    )
+    if replay_path == "user_attachment":
+        body["messages"] = [{"role": "user", "content": "inspect"}]
+        history = [
+            {
+                "id": "user-file",
+                "parentId": None,
+                "role": "user",
+                "content": "inspect",
+                "files": [
+                    {
+                        "id": file_canary,
+                        "name": "attachment.png",
+                        "content_type": "image/png",
+                    }
+                ],
+            }
+        ]
+    else:
+        body["messages"] = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "parent answer"},
+            {"role": "user", "content": "next"},
+        ]
+        history = [
+            {"id": "user-first", "parentId": None, "role": "user", "content": "first"},
+            {
+                "id": "assistant-parent",
+                "parentId": "user-first",
+                "role": "assistant",
+                "content": "parent answer",
+                "gemini_interaction": _interaction_envelope(
+                    endpoint_scope=binding.identity.for_model("gemini-2.5-flash").scope,
+                    model_id="gemini-2.5-flash",
+                    steps=[
+                        {
+                            "type": "model_output",
+                            "content": [
+                                {"type": "text", "text": "parent answer"},
+                                {
+                                    "type": "image",
+                                    "uri": f"/api/v1/files/{file_canary}/content",
+                                    "mime_type": "image/png",
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            },
+            {
+                "id": "user-next",
+                "parentId": "assistant-parent",
+                "role": "user",
+                "content": "next",
+            },
+        ]
+    _install_public_chat_history(history, current_message_id="assistant-local-file-owner")
+    mock_files_module.Files.get_file_by_id_and_user_id = AsyncMock(return_value=None)
+    mock_storage_module.Storage.get_file.reset_mock()
+    captured: list[str] = []
+    handler_id = gemini_manifold_module.log.add(
+        lambda message: captured.append(str(message)), format="{message}"
+    )
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    try:
+        with toggle_patch, client_patch:
+            result = await pipe.pipe(
+                body=body,
+                __user__={"id": user_canary, "email": "user@example.test"},
+                __request__=request,
+                __event_emitter__=None,
+                __metadata__=cast(Metadata, metadata),
+            )
+    finally:
+        gemini_manifold_module.log.remove(handler_id)
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "Gemini request failed unexpectedly."
+    assert scripted.requests == []
+    mock_files_module.Files.get_file_by_id_and_user_id.assert_awaited_once_with(
+        id=file_canary, user_id=user_canary
+    )
+    mock_storage_module.Storage.get_file.assert_not_called()
+    emitted = "\n".join(captured)
+    assert file_canary not in emitted
+    assert user_canary not in emitted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_type", "mime_type"),
+    [
+        ("image", "image/png"),
+        ("audio", "audio/wav"),
+        ("video", "video/mp4"),
+        ("document", "application/pdf"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("identity_case", "prior_model_id"),
+    [
+        ("cross_model", "gemini-3.1-flash-image"),
+        ("cross_service", "gemini-2.5-flash"),
+    ],
+)
+async def test_public_pipe_rejects_incompatible_cross_identity_output_before_create(
+    pipe_instance_fixture,
+    content_type: str,
+    mime_type: str,
+    identity_case: str,
+    prior_model_id: str,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions([])
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["stream"] = False
+    body["messages"] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "parent answer"},
+        {"role": "user", "content": "next"},
+    ]
+    metadata.update({"chat_id": "chat-modality", "message_id": "assistant-modality"})
+    envelope = cast(dict, request.app.state._state["gemini_model_catalog"])
+    claim = envelope["payload"]["provider_claims"]["gemini-2.5-flash"]
+    claim["content"]["inputs"] = ["text"]
+    claim["pricing"]["input"] = {"text": claim["pricing"]["input"]["text"]}
+    claim["pricing"]["cached_input"] = {"text": claim["pricing"]["cached_input"]["text"]}
+    validated_payload = AppStateModelCatalog.model_validate(envelope["payload"])
+    envelope["canonical_digest"] = (
+        "sha256:" + hashlib.sha256(pipe_canonical_catalog_bytes(validated_payload)).hexdigest()
+    )
+    _install_public_chat_history(
+        [
+            {"id": "user-first", "parentId": None, "role": "user", "content": "first"},
+            {
+                "id": "assistant-parent",
+                "parentId": "user-first",
+                "role": "assistant",
+                "content": "parent answer",
+                "gemini_interaction": _interaction_envelope(
+                    endpoint_scope=f"prior-{identity_case}-scope",
+                    model_id=prior_model_id,
+                    steps=[
+                        {
+                            "type": "model_output",
+                            "content": [
+                                {"type": "text", "text": "parent answer"},
+                                {
+                                    "type": content_type,
+                                    "data": base64.b64encode(b"prior output").decode("ascii"),
+                                    "mime_type": mime_type,
+                                },
+                            ],
+                        }
+                    ],
+                ),
+            },
+            {
+                "id": "user-next",
+                "parentId": "assistant-parent",
+                "role": "user",
+                "content": "next",
+            },
+        ],
+        current_message_id="assistant-modality",
+    )
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__={"id": "user-harness", "email": "user@example.test"},
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+        )
+
+    assert isinstance(result, dict)
+    assert result["choices"][0]["message"]["content"] == "Gemini request failed unexpectedly."
     assert scripted.requests == []
 
 
@@ -5555,15 +6558,17 @@ def _public_pipe_patches(pipe: Pipe, binding: GenAIClientBinding):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_state", ["expired", "deleted"])
 async def test_public_pipe_same_scope_continuation_404_replays_and_persists_once(
     pipe_instance_fixture,
+    missing_state: str,
 ) -> None:
-    class MissingInteractionError(Exception):
-        status_code = 404
-
     pipe, _constructor = pipe_instance_fixture
     scripted = FakeInteractions(
-        [MissingInteractionError("expired"), completed_interaction(interaction_id="replayed-id")]
+        [
+            _client_error(404, "NOT_FOUND", f"Interaction is {missing_state}"),
+            completed_interaction(interaction_id="replayed-id"),
+        ]
     )
     body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
     model_id = "gemini-2.5-flash"
@@ -5620,6 +6625,14 @@ async def test_public_pipe_same_scope_continuation_404_replays_and_persists_once
     assert isinstance(continued.input, list) and len(continued.input) == 1
     assert replayed.previous_interaction_id is None
     assert isinstance(replayed.input, list) and len(replayed.input) == 3
+    assert continued.store is True and replayed.store is True
+    assert continued.model == replayed.model
+    assert continued.tools == replayed.tools
+    assert continued.system_instruction == replayed.system_instruction
+    assert continued.generation_config == replayed.generation_config
+    assert continued.response_format == replayed.response_format
+    assert all(raw["store"] is True for raw in scripted.raw_requests)
+    assert all("background" not in raw for raw in scripted.raw_requests)
     upsert.assert_awaited_once()
     awaited_upsert = upsert.await_args
     assert awaited_upsert is not None
@@ -5659,7 +6672,15 @@ async def test_public_pipe_custom_function_round_trip_uses_result_continuation_o
     function = AsyncMock(return_value={"value": "sanitized"})
 
     toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
-    with toggle_patch, client_patch:
+    with (
+        toggle_patch,
+        client_patch,
+        patch.object(
+            pipe,
+            "_run_custom_function_loop",
+            wraps=pipe._run_custom_function_loop,
+        ) as explicit_loop,
+    ):
         result = await pipe.pipe(
             body=body,
             __user__={"id": "user-harness", "email": "user@example.test"},
@@ -5677,7 +6698,9 @@ async def test_public_pipe_custom_function_round_trip_uses_result_continuation_o
         assert isinstance(result, dict)
         assert result["choices"][0]["message"]["content"] == "tool finished"
     function.assert_awaited_once_with(query="value")
+    explicit_loop.assert_awaited_once()
     assert len(scripted.requests) == 2
+    _assert_explicit_function_requests(scripted.raw_requests)
     first, second = scripted.requests
     assert first.previous_interaction_id is None
     assert [tool.type for tool in first.tools or []] == ["function"]
@@ -5687,6 +6710,84 @@ async def test_public_pipe_custom_function_round_trip_uses_result_continuation_o
     assert isinstance(second.input[0], interaction_types.FunctionResultStep)
     assert second.input[0].call_id == "call-1"
     assert second.input[0].result == '{"value":"sanitized"}'
+    scripted.assert_exhausted()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_streaming", [False, True])
+@pytest.mark.parametrize("stateless_mode", ["temporary", "task", "privacy_opt_out"])
+async def test_public_pipe_custom_function_round_trip_uses_full_stateless_replay(
+    pipe_instance_fixture,
+    is_streaming,
+    stateless_mode,
+) -> None:
+    pipe, _constructor = pipe_instance_fixture
+    scripted = FakeInteractions(
+        [
+            _tool_stream("tool-round-1", _function_call("call-1")),
+            _final_stream("stateless tool finished"),
+        ]
+        if is_streaming
+        else [
+            _tool_interaction("tool-round-1", _function_call("call-1")),
+            completed_interaction("stateless tool finished", interaction_id="tool-final"),
+        ]
+    )
+    body, metadata, request, binding = _public_pipe_harness(pipe, scripted)
+    body["model"] = "gemini_manifold_google_genai.gemini-3.5-flash"
+    body["stream"] = is_streaming
+    cast(dict[str, object], body)["background"] = True
+    metadata.update({"chat_id": "chat-stateless-tool", "message_id": "assistant-tool"})
+    if stateless_mode == "temporary":
+        metadata["chat_id"] = "local:stateless-tool"
+    elif stateless_mode == "task":
+        metadata["task"] = "title_generation"
+    _install_public_chat_history(
+        [{"id": "user-tool", "parentId": None, "role": "user", "content": "Hello"}],
+        current_message_id="assistant-tool",
+    )
+    function = AsyncMock(return_value={"value": "private"})
+    user: dict[str, object] = {"id": "user-harness", "email": "user@example.test"}
+    if stateless_mode == "privacy_opt_out":
+        user["valves"] = Pipe.UserValves(STORE_INTERACTIONS=False)
+
+    toggle_patch, client_patch = _public_pipe_patches(pipe, binding)
+    with toggle_patch, client_patch:
+        result = await pipe.pipe(
+            body=body,
+            __user__=cast(UserData, user),
+            __request__=request,
+            __event_emitter__=None,
+            __metadata__=cast(Metadata, metadata),
+            __tools__={"lookup": _authorized_tool(function)},
+        )
+
+    if is_streaming:
+        assert not isinstance(result, dict)
+        chunks = [chunk async for chunk in result]
+        assert _stream_text(chunks) == "stateless tool finished"
+    else:
+        assert isinstance(result, dict)
+        assert result["choices"][0]["message"]["content"] == "stateless tool finished"
+    function.assert_awaited_once_with(query="value")
+    assert len(scripted.requests) == 2
+    _assert_explicit_function_requests(scripted.raw_requests)
+    first, second = scripted.requests
+    assert first.store is False and second.store is False
+    assert first.previous_interaction_id is None and second.previous_interaction_id is None
+    assert all(raw["store"] is False for raw in scripted.raw_requests)
+    assert all("previous_interaction_id" not in raw for raw in scripted.raw_requests)
+    assert all("background" not in raw for raw in scripted.raw_requests)
+    assert [step.type for step in cast(list, first.input)] == ["user_input"]
+    assert [step.type for step in cast(list, second.input)] == [
+        "user_input",
+        "function_call",
+        "function_result",
+    ]
+    assert first.tools == second.tools
+    assert first.system_instruction == second.system_instruction
+    assert first.generation_config == second.generation_config
+    assert first.response_format == second.response_format
     scripted.assert_exhausted()
 
 

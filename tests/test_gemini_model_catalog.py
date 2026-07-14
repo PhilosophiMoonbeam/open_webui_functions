@@ -1,110 +1,179 @@
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
-from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
-# The companion is a standalone Open WebUI plugin. Catalog tests only need its
-# pure validation models, so provide the one host module required at import.
 sys.modules.setdefault("open_webui.models.chats", MagicMock())
 
 from plugins.filters.gemini_manifold_companion import (
     MODEL_CATALOG_SCHEMA_VERSION,
+    CatalogAppStateEnvelope,
+    CatalogPricedRate,
+    CatalogUnpricedRate,
     Filter,
     ModelCatalog,
     ModelCatalogError,
+    _UniqueKeyLoader,
+    canonical_catalog_bytes,
 )
-from pydantic import ValidationError
 
 CATALOG_PATH = Path(__file__).parents[1] / "plugins" / "pipes" / "gemini_models.yaml"
+EXPECTED_IDS = {
+    "gemini-3.5-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3-pro-image",
+    "gemini-3.1-flash-image",
+}
 
 
 def _raw_catalog() -> dict[str, object]:
-    loaded = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+    loaded = yaml.load(CATALOG_PATH.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
     assert isinstance(loaded, dict)
     return loaded
 
 
-def _service_policy(raw: dict[str, object], model_id: str, service: str) -> dict[str, object]:
-    models = cast(dict[str, object], raw["models"])
-    model = cast(dict[str, object], models[model_id])
-    services = cast(dict[str, object], model["services"])
-    return cast(dict[str, object], services[service])
-
-
-def test_catalog_schema_is_the_expected_protocol() -> None:
+def test_protocol_3_catalog_is_evidence_bound_and_actionable() -> None:
     catalog = ModelCatalog.model_validate(_raw_catalog())
 
-    assert catalog.schema_version == MODEL_CATALOG_SCHEMA_VERSION == 2
-    assert len(catalog.models) == 11
-    assert all(
-        model.services.developer.availability == "supported" for model in catalog.models.values()
-    )
-    assert all(
-        model.services.enterprise.availability == "unverified" for model in catalog.models.values()
+    assert catalog.schema_version == MODEL_CATALOG_SCHEMA_VERSION == 3
+    assert set(catalog.provider_claims) == EXPECTED_IDS
+    assert set(catalog.product_authorizations) == EXPECTED_IDS
+    assert set(catalog.runtime_models()) == EXPECTED_IDS
+    assert catalog.provenance_sha256 == (
+        "9ac80b5e8fdb19e969d1684079376fc240f26ea544aa599c4e0bc6ff2566fe10"
     )
 
 
-def test_catalog_semantics_cover_media_tools_thinking_and_pricing() -> None:
+def test_pricing_is_explicit_by_modality_cache_state_and_whole_prompt_threshold() -> None:
     catalog = ModelCatalog.model_validate(_raw_catalog())
+    flash_lite = catalog.provider_claims["gemini-3.1-flash-lite"].pricing
+    pro = catalog.provider_claims["gemini-3.1-pro-preview"].pricing
+    image = catalog.provider_claims["gemini-3-pro-image"].pricing
 
-    for model_id, model in catalog.models.items():
-        developer = model.services.developer
-        assert developer.availability == "supported"
-        assert developer.limits.input_tokens > 0
-        assert developer.limits.output_tokens > 0
-        assert developer.content.inputs
-        assert developer.content.outputs
-        assert developer.pricing.input[-1].up_to_tokens is None
-        assert developer.pricing.output[-1].up_to_tokens is None
-        assert developer.interactions.thinking.supported == bool(
-            developer.interactions.thinking.levels
-        )
-        assert ("image" in developer.content.outputs) == (
-            developer.pricing.image_output is not None
-        )
-        # The audited Interactions function-calling guide uses this exact model.
-        assert developer.interactions.custom_function_calling is (model_id == "gemini-3.5-flash")
-        assert developer.interactions.tools.file_search is False
-        assert model.services.enterprise.model_dump() == {
-            "availability": "unverified",
-            "reason": "No credential-backed Enterprise Interactions model and capability evidence is recorded.",
-        }
+    audio_input = flash_lite.input["audio"]
+    audio_cache = flash_lite.cached_input["audio"]
+    pro_text = pro.input["text"]
+    assert isinstance(audio_input, CatalogPricedRate)
+    assert isinstance(audio_cache, CatalogPricedRate)
+    assert isinstance(pro_text, CatalogPricedRate)
+    assert audio_input.tiers[0].price_per_million == 0.5
+    assert audio_cache.tiers[0].price_per_million == 0.05
+    assert isinstance(flash_lite.input["document"], CatalogUnpricedRate)
+    assert pro_text.tiers[0].up_to_prompt_tokens == 200_000
+    assert pro_text.tiers[1].price_per_million == 4.0
+    assert isinstance(image.cached_input["image"], CatalogUnpricedRate)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "schema_version: 3\nschema_version: 3\n",
+        "schema_version: 3\nnested:\n  claim: one\n  claim: two\n",
+        "base: &base\n  claim: one\nmerged:\n  <<: *base\n",
+    ],
+)
+def test_yaml_loader_rejects_duplicate_and_merge_keys_before_parsing(text: str) -> None:
+    with pytest.raises(ModelCatalogError, match="duplicate|merge"):
+        yaml.load(text, Loader=_UniqueKeyLoader)
 
 
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda raw: raw.update(schema_version=1), "schema_version"),
+        (lambda raw: raw.update(schema_version=2), "schema_version"),
         (
-            lambda raw: raw["models"]["gemini-2.5-flash"]["services"]["developer"]["interactions"][
-                "thinking"
-            ].update(supported=False),
-            "thinking levels",
+            lambda raw: raw["evidence"]["developer_pricing"].update(
+                content_digest="sha256:" + "0" * 64
+            ),
+            "digest mismatch",
         ),
         (
-            lambda raw: raw["models"]["gemini-2.5-flash"]["services"]["developer"]["pricing"][
-                "input"
-            ].__setitem__(-1, {"up_to_tokens": 100, "price_per_million": 0.3}),
-            "unbounded tier",
+            lambda raw: raw["provider_claims"]["gemini-2.5-flash"]["evidence"].update(
+                pricing="thinking_controls"
+            ),
+            "wrong evidence kind",
+        ),
+        (
+            lambda raw: raw["provider_claims"]["gemini-2.5-flash"]["evidence"].update(
+                pricing="missing_evidence"
+            ),
+            "unknown evidence",
+        ),
+        (
+            lambda raw: raw["sources"]["developer_pricing"].update(retrieved_at="2026-07-13"),
+            "stale",
+        ),
+        (
+            lambda raw: raw["provider_claims"]["gemini-2.5-flash"].update(
+                model_id="gemini-2.5-flash-alias"
+            ),
+            "exact claim model IDs",
+        ),
+        (
+            lambda raw: raw["freshness"].update(expires_after="2026-07-15"),
+            "catalog expiry",
+        ),
+        (lambda raw: raw.update(unexpected=True), "extra_forbidden"),
+        (
+            lambda raw: raw["provider_claims"]["gemini-2.5-flash"]["pricing"]["cached_input"].pop(
+                "audio"
+            ),
+            "cached pricing",
+        ),
+        (
+            lambda raw: raw["provider_claims"]["gemini-2.5-flash"]["capabilities"].update(
+                google_search=False
+            ),
+            "exceeds provider capability",
+        ),
+        (
+            lambda raw: raw["product_authorizations"]["gemini-2.5-flash"]["interactions"].update(
+                thinking={
+                    "supported": True,
+                    "control": "known",
+                    "levels": ["low"],
+                    "summaries": True,
+                }
+            ),
+            "contradict",
         ),
     ],
 )
-def test_catalog_rejects_protocol_and_semantic_mismatches(mutation, message: str) -> None:
-    raw = _raw_catalog()
+def test_catalog_mutations_fail_closed(mutation, message: str) -> None:
+    raw = copy.deepcopy(_raw_catalog())
     mutation(raw)
 
     with pytest.raises(ValidationError, match=message):
         ModelCatalog.model_validate(raw)
 
 
-def test_companion_loader_validates_and_flattens_catalog_for_both_plugins() -> None:
-    Filter._load_model_config.cache_clear()
+def test_canonical_digest_is_order_independent_and_semantic_mutations_change_it() -> None:
+    raw = _raw_catalog()
+    catalog = ModelCatalog.model_validate(raw)
+    reordered = {key: raw[key] for key in reversed(raw)}
+    reordered_catalog = ModelCatalog.model_validate(reordered)
 
+    assert canonical_catalog_bytes(catalog) == canonical_catalog_bytes(reordered_catalog)
+    envelope = CatalogAppStateEnvelope.from_catalog(catalog)
+    mutated = envelope.model_dump(mode="json", exclude_none=False)
+    mutated["payload"]["provider_claims"]["gemini-2.5-flash"]["limits"]["output_tokens"] += 1
+    with pytest.raises(ValidationError, match="canonical digest mismatch"):
+        CatalogAppStateEnvelope.model_validate(mutated)
+
+
+def test_companion_loader_publishes_atomic_full_catalog_envelope() -> None:
+    Filter._load_model_config.cache_clear()
     with (
         CATALOG_PATH.open("rb") as catalog_file,
         patch(
@@ -112,49 +181,16 @@ def test_companion_loader_validates_and_flattens_catalog_for_both_plugins() -> N
             return_value=catalog_file,
         ),
     ):
-        models = Filter._load_model_config("https://example.test/gemini_models.yaml")
+        envelope = Filter._load_model_config("https://example.test/gemini_models.yaml")
 
-    assert len(models) == 11
-    assert Filter._check_model_capability("gemini-2.5-flash", models, "search_grounding") is True
-    assert (
-        Filter._check_model_capability(
-            "gemini-2.5-flash", models, "search_grounding", service="enterprise"
-        )
-        is False
-    )
-    assert Filter._check_model_capability("gemini-future-unknown", models, "thinking") is False
-    assert Filter._check_model_capability("gemini-2.5-flash", models, "future_tool") is False
+    assert envelope.schema_version == 3
+    assert set(envelope.payload.runtime_models()) == EXPECTED_IDS
+    assert envelope.canonical_digest.startswith("sha256:")
 
 
-def test_unverified_service_cannot_carry_capabilities_or_pricing() -> None:
-    raw = _raw_catalog()
-    enterprise = _service_policy(raw, "gemini-2.5-flash", "enterprise")
-    enterprise["interactions"] = {"store": True}
-
-    with pytest.raises(ValidationError, match="extra_forbidden"):
-        ModelCatalog.model_validate(raw)
-
-
-def test_supported_service_requires_complete_policy_and_known_source_refs() -> None:
-    raw = _raw_catalog()
-    developer = _service_policy(raw, "gemini-2.5-flash", "developer")
-    developer.pop("pricing")
-    with pytest.raises(ValidationError, match="pricing"):
-        ModelCatalog.model_validate(raw)
-
-    raw = _raw_catalog()
-    developer = _service_policy(raw, "gemini-2.5-flash", "developer")
-    source_refs = cast(list[str], developer["source_refs"])
-    source_refs.append("enterprise_only_source")
-    with pytest.raises(ValidationError, match="unknown sources"):
-        ModelCatalog.model_validate(raw)
-
-
-def test_companion_loader_fails_visibly_instead_of_returning_empty_policy() -> None:
+def test_companion_loader_fails_visibly() -> None:
     Filter._load_model_config.cache_clear()
-
     with pytest.raises(ModelCatalogError, match="must not be empty"):
         Filter._load_model_config("")
-
     with pytest.raises(ModelCatalogError, match=r"HTTP\(S\) URL"):
         Filter._load_model_config(str(CATALOG_PATH))

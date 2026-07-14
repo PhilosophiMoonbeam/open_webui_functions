@@ -49,9 +49,14 @@ def test_manifest_hashes_every_coordinated_artifact() -> None:
     assert cast(dict[str, object], raw["protocols"]) == {
         "google_genai": "2.11.0",
         "grounding_envelope": 1,
-        "model_catalog": 2,
+        "model_catalog": 3,
     }
-    assert {artifact["role"] for artifact in artifacts} >= {"pipe", "companion", "catalog"}
+    assert {artifact["role"] for artifact in artifacts} >= {
+        "pipe",
+        "companion",
+        "catalog",
+        "provenance",
+    }
     for artifact in artifacts:
         content = (ROOT / cast(str, artifact["path"])).read_bytes()
         assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
@@ -85,13 +90,26 @@ def test_release_workflow_forbids_individual_v3_suite_member_tags() -> None:
     deployable_basenames = {
         Path(cast(str, artifact["path"])).stem
         for artifact in artifacts
-        if artifact["role"] not in {"catalog", "release_notes"}
+        if artifact["role"] not in {"catalog", "provenance", "release_notes"}
     }
     for basename in deployable_basenames:
         assert basename in workflow
         assert basename in helper
     assert "gemini-suite/v3.0.0" in workflow
     assert "build_gemini_suite.py" in workflow
+
+
+def test_release_loader_rejects_duplicate_and_merge_keys(tmp_path: Path) -> None:
+    builder = _load_builder()
+    duplicate = tmp_path / "duplicate.yaml"
+    duplicate.write_text("schema_version: 1\nschema_version: 1\n", encoding="utf-8")
+    merged = tmp_path / "merged.yaml"
+    merged.write_text("base: &base\n  value: 1\ncopy:\n  <<: *base\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        builder.load_yaml(duplicate)
+    with pytest.raises(ValueError, match="merge"):
+        builder.load_yaml(merged)
 
 
 def test_generate_content_archive_is_explicitly_excluded_from_suite() -> None:

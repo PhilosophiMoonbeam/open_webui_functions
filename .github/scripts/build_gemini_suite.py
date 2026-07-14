@@ -19,7 +19,7 @@ class Artifact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     id: str
-    role: Literal["pipe", "companion", "catalog", "toggle", "release_notes"]
+    role: Literal["pipe", "companion", "catalog", "provenance", "toggle", "release_notes"]
     version: str | int
     path: str
     sha256: str
@@ -61,13 +61,45 @@ class Manifest(BaseModel):
         if len(ids) != len(set(ids)) or len(paths) != len(set(paths)):
             raise ValueError("artifact ids and paths must be unique")
         roles = {artifact.role for artifact in artifacts}
-        if not {"pipe", "companion", "catalog"} <= roles:
-            raise ValueError("manifest must contain a pipe, companion, and catalog")
+        if not {"pipe", "companion", "catalog", "provenance"} <= roles:
+            raise ValueError("manifest must contain pipe, companion, catalog, and provenance")
         return artifacts
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Reject duplicate and merge keys before release inputs are parsed."""
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        if any(key.tag == "tag:yaml.org,2002:merge" for key, _ in node.value):
+            raise ValueError("YAML merge keys are forbidden in release inputs")
+        super().flatten_mapping(node)
+
+
+def construct_unique_mapping(
+    loader: UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError(f"duplicate YAML key is forbidden: {key!r}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    construct_unique_mapping,
+)
+
+
+def load_yaml(path: Path) -> object:
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=UniqueKeyLoader)
+
+
 def load_manifest(path: Path) -> Manifest:
-    return Manifest.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    return Manifest.model_validate(load_yaml(path))
 
 
 def repository_root(manifest_path: Path) -> Path:
@@ -179,12 +211,21 @@ def verify_suite_contract(root: Path, manifest: Manifest) -> None:
     ):
         raise ValueError("locked SDK version does not match manifest")
     catalog_path = artifact_path(root, artifacts["gemini_model_catalog"])
-    catalog = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    catalog = load_yaml(catalog_path)
     if (
         not isinstance(catalog, dict)
         or catalog.get("schema_version") != manifest.protocols.model_catalog
     ):
         raise ValueError("catalog schema does not match manifest")
+    provenance_artifact = artifacts.get("gemini_model_provenance")
+    if provenance_artifact is None:
+        raise ValueError("manifest is missing the catalog provenance trust root")
+    provenance_path = artifact_path(root, provenance_artifact)
+    provenance = load_yaml(provenance_path)
+    if not isinstance(provenance, dict) or provenance.get("schema_version") != 1:
+        raise ValueError("catalog provenance artifact is invalid")
+    if catalog.get("provenance_sha256") != provenance_artifact.sha256:
+        raise ValueError("catalog is not bound to the manifest provenance digest")
 
     release_notes = artifact_path(root, artifacts["gemini_suite_release_notes"]).read_text(
         encoding="utf-8"
@@ -204,7 +245,7 @@ def verify_manifest(manifest_path: Path, *, expected_tag: str | None = None) -> 
     deployable_ids = {
         artifact.id
         for artifact in manifest.artifacts
-        if artifact.role not in {"catalog", "release_notes"}
+        if artifact.role not in {"catalog", "provenance", "release_notes"}
     }
     if len(manifest.install_order) != len(set(manifest.install_order)):
         raise ValueError("install_order must not contain duplicates")
