@@ -17,3 +17,6 @@ docs/knowledge_for_llms/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Beads runtime gate locks
+*.gate.lock*
